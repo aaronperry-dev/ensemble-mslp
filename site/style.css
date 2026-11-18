@@ -60,7 +60,7 @@ h1{margin:0;font-size:20px;font-weight:700;letter-spacing:.01em;white-space:nowr
 .tgroup:first-child{border-left:0;padding-left:0}
 .tright{margin-left:auto}
 .seg{display:flex;gap:0}
-.seg button{border:1px solid var(--line);background:var(--btn);padding:4px 16px;cursor:pointer;text-align:left;display:flex;flex-direction:column;line-height:1.2;margin-left:-1px}
+.seg button{border:1px solid var(--line);background:var(--btn);padding:4px 11px;cursor:pointer;text-align:left;display:flex;flex-direction:column;line-height:1.2;margin-left:-1px}
 .seg button:first-child{margin-left:0;border-radius:3px 0 0 3px}
 .seg button:last-child{border-radius:0 3px 3px 0}
 .seg button:hover{background:var(--btn-h)}
@@ -179,7 +179,11 @@ dialog td:first-child{white-space:nowrap;width:1%;padding-right:18px}
 dialog p{margin:6px 0;color:var(--ink-2)}
 .dlg-actions{text-align:right;margin-top:12px}
 
+/* the attribution line wraps on narrower windows; keep the legend clear of it */
+@media (max-width:1280px){.legend{bottom:36px}}
 @media (max-width:720px){
+  .blendbar{max-width:calc(100% - 64px);flex-wrap:wrap;row-gap:6px}.chip{padding:4px 8px;font-size:14px}.chips{flex-wrap:wrap}
+  .lg-lows{flex-wrap:wrap;row-gap:4px}
   h1{font-size:17px}#runline{display:none}
   .titlebar{padding:6px 10px}
   .mb{padding:7px 12px}
@@ -194,7 +198,7 @@ dialog p{margin:6px 0;color:var(--ink-2)}
   .blendbar{top:82px;left:6px;padding:4px 6px}.blendbar .tlabel{display:inline}
   .chip{padding:4px 8px;font-size:13.5px}
   .cave-legend{font-size:11.5px;left:6px;top:6px;padding:4px 8px;max-width:calc(100% - 60px)}
-  .legend{left:6px;bottom:8px;width:calc(100% - 12px);padding:7px 10px}
+  .legend{left:6px;bottom:54px;width:calc(100% - 12px);padding:7px 10px}
   .dock{flex-wrap:wrap;gap:6px;padding:6px 10px calc(6px + env(safe-area-inset-bottom))}
   .timeline{flex-basis:100%}
   .sb{padding:6px 8px}.sb-low,#vGrid{display:none}

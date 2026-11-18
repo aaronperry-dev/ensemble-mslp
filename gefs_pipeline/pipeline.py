@@ -39,7 +39,7 @@ def make_http(cfg, **over) -> Http:
     if os.environ.get("GITHUB_REPOSITORY"):          # identify ourselves properly when running in Actions
         ua = ua.replace("YOUR-USER/gefs-mslp-viewer", os.environ["GITHUB_REPOSITORY"])
     return Http(user_agent=ua, rps=over.get("rps", f.requests_per_second),
-                host_rps={h: float(getattr(cfg, sec).requests_per_second) for h, sec in (("ecmwf-forecasts", "ifs"), ("weather.gc.ca", "geps")) if hasattr(cfg, sec)},
+                host_rps={h: float(getattr(cfg, sec).requests_per_second) for h, sec in (("ecmwf-forecasts", "ifs"), ("weather.gc.ca", "geps"), ("graphcastgfs", "aigefs")) if hasattr(cfg, sec)},
                 max_retries=f.max_retries,
                 backoff_base=f.backoff_base_s, backoff_max=f.backoff_max_s,
                 timeout=(f.timeout_connect_s, f.timeout_read_s))
@@ -120,7 +120,7 @@ def _to_grid(lats, lons, f: SimpleNamespace, field: np.ndarray, nearest: bool = 
 # writing one view
 # ---------------------------------------------------------------------------------------------------
 def _emit(cfg, out_dir: Path, run_id: str, view: str, fh: int, scales: dict, meta: dict, lats, lons,
-          mean, mn, lows, mlows, per_family: dict | None = None) -> None:
+          mean, mn, lows, mlows) -> None:
     d = cfg.domain
     dom = (d.west, d.east, d.south, d.north)
     prec = int(cfg.contours.precision)
@@ -130,20 +130,41 @@ def _emit(cfg, out_dir: Path, run_id: str, view: str, fh: int, scales: dict, met
         la, lo, z = upsample(lats, lons, field, float(cfg.contours.upsample_to_deg))
         feats = contour_bands(la, lo, z, scales[prod][0], prec)
         grid = sample_grid(lats, lons, field, domain=dom, step_deg=tip)
-        if per_family:                                  # blend: also ship each family's own value for the read-out
-            grid["fam"] = {k: sample_grid(lats, lons, v[prod], domain=dom, step_deg=tip)["v"] for k, v in per_family.items()}
         write_json(out_dir / run_id / view / prod / f"{f3}.json",
                    {"type": "FeatureCollection", "features": feats, "meta": meta, "lows": lw, "grid": grid})
 
 
+def _emit_tips(cfg, out_dir: Path, run_id: str, fh: int, fields: dict) -> None:
+    """One small sidecar per product and hour with every system's own cursor read-out grid (native grid, decimated).
+
+    Blend views need each system's value next to the blended one; keeping these here instead of inside every
+    blend file (there can be a dozen blend views) shrinks the site considerably."""
+    d = cfg.domain
+    dom = (d.west, d.east, d.south, d.north)
+    tip = float(cfg.tooltip.grid_deg)
+    for prod in ("mean", "min"):
+        write_json(out_dir / run_id / "tip" / prod / f"f{fh:03d}.json",
+                   {k: sample_grid(f.lats, f.lons, getattr(f, prod), domain=dom, step_deg=tip) for k, f in fields.items()})
+
+
 def blend_sets(cfg, order: list[str]) -> list[list[str]]:
-    """Family combinations to blend, largest first, each in `order` (e.g. [gefs,ifs,geps], [gefs,ifs], ...)."""
+    """Family combinations to blend, largest first, each in `order` (e.g. [gefs,ifs,geps], [gefs,ifs], ...).
+
+    [blend] sets: "all" (every combination of two or more), "full" (only everything), or an explicit list of
+    "a+b+c" strings (members not present in this build are skipped)."""
     if len(order) < 2:
         return []
-    if not getattr(cfg.blend, "subsets", True):
+    spec = getattr(cfg.blend, "sets", "all")
+    if spec == "full":
         return [list(order)]
-    sets = [list(c) for n in range(len(order), 1, -1) for c in combinations(order, n)]
-    return sets
+    if isinstance(spec, list):
+        out = []
+        for item in spec:
+            parts = [k for k in order if k in {x.strip() for x in str(item).split("+")}]
+            if len(parts) >= 2 and parts not in out and len(parts) == len([x for x in str(item).split("+") if x.strip()]):
+                out.append(parts)
+        return out
+    return [list(c) for n in range(len(order), 1, -1) for c in combinations(order, n)]
 
 
 def blend_key(parts: list[str]) -> str:
@@ -158,9 +179,11 @@ def build_frame(cfg, frames: dict[str, FamilyFrame], order: list[str], fh: int, 
     for k, f in fields.items():
         meta = {"fh": fh, "valid": f.valid, "grid_deg": f.res, "members": f.n, "source": f.source, "family": k}
         _emit(cfg, out_dir, run_id, k, fh, scales, meta, f.lats, f.lons, f.mean, f.min, f.lows,
-              _min_lows(cfg, f.lats, f.lons, f.min, f.owner), None)
+              _min_lows(cfg, f.lats, f.lons, f.min, f.owner))
         avail[k] = {"members": f.n, "grid_deg": f.res, "source": f.source}
     valid = next(iter(fields.values())).valid
+    if len(fields) > 1 and blend_sets(cfg, order):
+        _emit_tips(cfg, out_dir, run_id, fh, fields)     # per-system read-out grids shared by every blend view
 
     # ---- blends: a combination is built only when every family in it has this hour -----------------------
     todo = [p for p in blend_sets(cfg, order) if all(k in fields for k in p)]
@@ -201,8 +224,7 @@ def build_frame(cfg, frames: dict[str, FamilyFrame], order: list[str], fh: int, 
         meta = {"fh": fh, "valid": valid, "grid_deg": ref.res, "members": n, "family": view,
                 "source": "+".join(fields[k].source for k in parts)}
         _emit(cfg, out_dir, run_id, view, fh, scales, meta, ref.lats, ref.lons, bmean, bmin, blows,
-              _min_lows(cfg, ref.lats, ref.lons, bmin, bowner),
-              {k: {"mean": means[k], "min": mins[k]} for k in parts})
+              _min_lows(cfg, ref.lats, ref.lons, bmin, bowner))
         avail[view] = {"members": n, "grid_deg": ref.res, "parts": {k: fields[k].n for k in parts}}
     return {"fh": fh, "valid": valid, "avail": avail}
 
@@ -304,6 +326,7 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
                    "initial": list(cfg.domain.initial_view)},
         "families": fam_meta,
         "views": views,
+        "tips": any(f.get("parts") for f in fam_meta.values()),      # blend views read per-system values from data/<run>/tip/
         "lows_threshold_hpa": cfg.lows.threshold_hpa,
         "products": {
             k: {"title": getattr(cfg.products, k).title, "short": getattr(cfg.products, k).short,
@@ -321,4 +344,8 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
             shutil.rmtree(p, ignore_errors=True)
     log.info("built %d frames in %.0fs  (%d HTTP requests, %.0f MB transferred, %d retries)",
              len(frames), time.time() - t0, http.stats.requests, http.stats.bytes / 1e6, http.stats.retries)
+    site_mb = sum(f.stat().st_size for f in out.rglob("*") if f.is_file()) / 1e6
+    (log.warning if site_mb > 850 else log.info)(
+        "site size %.0f MB%s", site_mb,
+        "  - close to GitHub Pages' 1 GB limit: set [blend] sets = \"full\" or drop a family" if site_mb > 850 else "")
     return manifest

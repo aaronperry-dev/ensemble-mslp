@@ -1,14 +1,14 @@
-# Ensemble MSLP Viewer — NOAA GEFS · ECMWF IFS ENS · Canadian GEPS · Blends
+# Ensemble MSLP Viewer — NOAA GEFS · ECMWF IFS ENS · Canadian GEPS · NOAA AIGEFS · Blends
 
-A static, GitHub-Pages-hosted web map of **ensemble mean sea-level pressure (MSLP)** from three ensemble families — **NOAA GEFS (31 members)**, **ECMWF IFS ENS (51 members)** and the **Canadian GEPS (21 members)** — viewable **per family or as a blend of any two or all three**, rebuilt automatically every model cycle by a GitHub Action.
+A static, GitHub-Pages-hosted web map of **ensemble mean sea-level pressure (MSLP)** from four ensemble systems — **NOAA GEFS (31 members)**, **ECMWF IFS ENS (51 members)**, the **Canadian GEPS (21 members)** and **NOAA AIGEFS (31 members, AI-based)** — viewable **per system or as a blend of any two or more**, rebuilt automatically every model cycle by a GitHub Action.
 
 | | |
 |---|---|
-| **Ensemble families** | **GEFS** (31), **ECMWF IFS ENS** (51), **CMC GEPS** (21), and **Blend**. Switch with the *Ensemble* toolbar buttons / menu, or keys **G**, **E**, **C**, **B**. Choosing *Blend* shows tick-boxes on the map to pick which systems are blended (any two, or all three = 103 members). Every product below exists for every view. |
-| **Product 1 – Ensemble mean + member lows** | Filled contours of the ensemble-mean MSLP, with an **“L” at every low-pressure centre (< 1005 hPa) of every ensemble member** (GEFS `gec00` + `gep01`…`gep30`; ECMWF `ec00` + `ep01`…`ep50`; GEPS `cc00` + `cp01`…`cp20`). Each L is labelled with its central pressure in hPa. |
+| **Ensemble families** | **GEFS** (31), **ECMWF IFS ENS** (51), **CMC GEPS** (21), **NOAA AIGEFS** (31) and **Blend**. Switch with the *Ensemble* toolbar buttons / menu, or keys **G**, **E**, **C**, **A**, **B**. Choosing *Blend* shows tick-boxes on the map to pick which systems are blended (any two or more; all four = 134 members). Every product below exists for every view. |
+| **Product 1 – Ensemble mean + member lows** | Filled contours of the ensemble-mean MSLP, with an **“L” at every low-pressure centre (< 1005 hPa) of every ensemble member** (GEFS `gec00` + `gep01`…`gep30`; ECMWF `ec00` + `ep01`…`ep50`; GEPS `cc00` + `cp01`…`cp20`; AIGEFS `ai00` = `mem000`, `ai01`…`ai30`). Each L is labelled with its central pressure in hPa. |
 | **Product 2 – Member-wise minimum** | Filled contours of the *lowest* MSLP forecast by any member at each grid point (the “deepest-low envelope”), with an **L + hPa value at each local minimum** of that envelope. |
 | **Viewer** | Pan / zoom (mouse, touch, keyboard), ensemble-family and product switches, forecast-hour slider + animation, opacity, lat/lon grid, state/province and lake toggles, scale bar, shareable URL (`#e=gefs_ifs_geps&p=min&f=132&v=lat,lon,zoom`; `e` is `gefs`, `ifs`, `geps`, or a blend such as `gefs_ifs`). |
-| **Data** | NOAA GEFS on AWS Open Data (`s3://noaa-gefs-pds`), ECMWF open data on AWS (`s3://ecmwf-forecasts`) and the Canadian GEPS on ECCC's MSC Datamart (`dd.weather.gc.ca`); all public, no credentials. |
+| **Data** | NOAA GEFS on AWS Open Data (`s3://noaa-gefs-pds`), ECMWF open data on AWS (`s3://ecmwf-forecasts`) the Canadian GEPS on ECCC's MSC Datamart (`dd.weather.gc.ca`) and NOAA AIGEFS on AWS (`s3://noaa-nws-graphcastgfs-pds`); all public, no credentials. |
 
 ```
 .
@@ -17,7 +17,7 @@ A static, GitHub-Pages-hosted web map of **ensemble mean sea-level pressure (MSL
 ├── gefs_pipeline/               # the backend (python -m gefs_pipeline ...)
 │   ├── fetcher.py               #   polite HTTP client: rate limit, backoff+jitter, Range requests, .idx parsing
 │   ├── gefs.py                  #   GEFS bucket layout, 0.25°→0.5° fallback
-│   ├── sources.py               #   ensemble families (GEFS, ECMWF IFS ENS, CMC GEPS): members, schedule, fetch, cycle readiness
+│   ├── sources.py               #   ensemble families (GEFS, ECMWF IFS ENS, CMC GEPS, NOAA AIGEFS): members, schedule, fetch, cycle readiness
 │   ├── decode.py                #   in-memory GRIB2 decode (ecCodes) + domain subset
 │   ├── products.py              #   mean / min, low detection, filled-contour GeoJSON
 │   ├── palette.py               #   ColorBrewer ramps, OKLab interpolation
@@ -41,7 +41,7 @@ python -m pytest -q                                     # 26 tests, no network n
 # quick smoke test: 6 members, first 24 h (≈ 65 requests, ≈ 16 MB)
 python -m gefs_pipeline build --out dist --max-fh 24 --members 6        # --families gefs  (or ifs) to build one system only
 
-# full production build: GEFS 31 + ECMWF 51 + GEPS 21 members, f000-f240 = 10 days (≈ 6 400 requests, ≈ 1.9 GB downloaded, ~15 min; site ≈ 400 MB with all blend combinations, ≈ 230 MB with `[blend] subsets = false`)
+# full production build: GEFS 31 + ECMWF 51 + GEPS 21 + AIGEFS 31 members, f000-f240 = 10 days (≈ 8 000 requests, ≈ 3.5 GB downloaded, ~25 min; site size depends on `[blend] sets` – see *Blends* below)
 python -m gefs_pipeline build --out dist
 
 python -m http.server 8000 --directory dist             # open http://localhost:8000
@@ -52,7 +52,7 @@ Useful flags: `--cycle 2026111806` (pin a run), `--max-fh`, `--members N`, `--rp
 
 ## 2. What the pipeline does
 
-1. **Pick the cycle.** Starting at the current time, step back through the cycles in `[run] cycles` (default **00Z and 12Z** – the ECMWF runs that reach day 15) until one is *complete for every family* (GEFS: last forecast hour exists for all 31 members; ECMWF: last step of the ensemble and control streams is published; GEPS: the first and last all-member files exist), so a half-published run is never shown and both systems always share the same initialisation time. Add 06/18Z to `cycles` for a GEFS-led site; ECMWF then ends at F144 for those cycles (the viewer shows exactly the hours each system has).
+1. **Pick the cycle.** Starting at the current time, step back through the cycles in `[run] cycles` (default **00Z and 12Z** – the ECMWF runs that reach day 15) until one is *complete for every family* (GEFS: last forecast hour exists for all 31 members; ECMWF: last step of the ensemble and control streams is published; GEPS: the first and last all-member files exist; AIGEFS is *optional*, see below), so a half-published run is never shown and both systems always share the same initialisation time. Add 06/18Z to `cycles` for a GEFS-led site; ECMWF then ends at F144 for those cycles (the viewer shows exactly the hours each system has).
 2. **Pick the grid per forecast hour – highest resolution first.**
    `pgrb2sp25` (**0.25°**) is probed first; if the object does not exist, `pgrb2ap5` (0.5°) is used.
    Verified against the bucket: **0.25° exists for f000–f240, exactly the 10-day window this project is configured for (`[forecast] stop = 240`)**, so every frame is 0.25°. The 0.5° product is only a safety net if a 0.25° object is missing; it can also serve longer runs (raise `stop` up to 384: f246+ exist only at 0.5° and are cubic-spline-upsampled for contouring). The viewer labels every frame with its grid.
@@ -69,12 +69,17 @@ Environment and Climate Change Canada's Global Ensemble Prediction System, from 
 
 *Disable a system* by removing it from `[run] families` (e.g. `["gefs", "ifs"]`); the viewer adapts to whatever the manifest contains. If a system fails for an hour (e.g. fewer than 80 % of its members arrive) that hour is built without it, and the viewer simply omits it there.
 
+### NOAA AIGEFS data
+NOAA's AI-based ensemble (a GraphCast model fine-tuned on GDAS, run from GEFS initial conditions), on AWS Open Data: `https://noaa-nws-graphcastgfs-pds.s3.amazonaws.com/EAGLE_ensemble/aigefs.<YYYYMMDD>/<HH>/mem<NNN>/model/atmos/grib2/aigefs.t<HH>z.sfc.f<FFF>.grib2` plus a `.idx` file. 31 members (`mem000`…`mem030`; shown as `ai00`…`ai30`), 0.25°, 6-hourly to 384 h, all four cycles (only 00/12Z are used, like the others). Each member file holds many surface fields; the pipeline reads the `.idx` and fetches only the `PRMSL:mean sea level` message (~1.3 MB) with an HTTP byte range, exactly as for GEFS. The data are CC0.
+* **Optional system.** AIGEFS is published irregularly (from about 7.5 hours to more than a day after cycle time), so it does not gate the cycle (`[run] optional = ["aigefs"]`). A build includes it only when every member is complete for the cycle. If it appears later, the next scheduled attempt sees that the live site lacks it and rebuilds the same cycle with it.
+* **Not independent of GEFS.** AIGEFS starts from GEFS initial conditions, so a blend containing both is not a blend of independent ensembles; the Help dialog says so. `mem000` is treated as member 0 (NOAA does not label it as a control in the file metadata).
+
 ### Blends (any combination of the systems)
-Every combination of two or more systems is built — GEFS + ECMWF + GEPS, and each pair (`[blend] subsets = true`; set `false` to build only the all-system blend and roughly halve the site size). In the viewer, choose *Blend* and tick the systems to include.
+Blend views are chosen with `[blend] sets`: `"all"` (every combination of two or more systems – with four systems that is 11 blends, ≈ 40 MB each per cycle), `"full"` (only the blend of all systems), or an explicit list such as `["gefs+ifs", "gefs+ifs+geps+aigefs"]`. GitHub Pages allows 1 GB per site; the pipeline logs the site size and warns above 850 MB. Per-system values for the cursor read-out are stored once per system in `data/<run>/tip/` (native grids, 0.5° spacing) instead of inside every blend file. In the viewer, choose *Blend* and tick the systems to include.
 * **Blended ensemble mean** – by default the **equal-weight average of the system means** (`[blend] weighting = "equal"`), so each system counts once regardless of member count. `"members"` instead averages all members pooled (a 51-member ensemble then outweighs a 21-member one).
 * **Blended member minimum** – the lowest MSLP over **all members of the chosen systems** at each grid point; each low centre of that envelope is credited to the member that supplies the minimum.
-* **Blend lows** – every low centre of every member of the chosen systems, drawn in a colour per system (red GEFS, yellow ECMWF, teal GEPS; toggle: *View ▸ Colour blend lows by system*).
-* **Cursor read-out** – the blended value together with each system's own value and, for two systems, their difference (for three: the spread max − min).
+* **Blend lows** – every low centre of every member of the chosen systems, drawn in a colour per system (red GEFS, yellow ECMWF, teal GEPS, violet AIGEFS; toggle: *View ▸ Colour blend lows by system*).
+* **Cursor read-out** – the blended value together with each system's own value and, for two systems, their difference (for three or more: the spread max − min).
 * A blend frame exists for an hour only when every system in it has that hour (on a 06/18Z cycle, to F144). Systems are combined on the first listed system's grid; when grids differ (GEPS 0.5° vs 0.25°) the coarser one is interpolated, and the status bar says so.
 
 ### Low-pressure centres
@@ -93,7 +98,7 @@ For every member, MSLP is lightly Gaussian-smoothed (0.5°) *only to locate* min
 
 ### Interface
 
-A flat, operational-workstation layout: title bar, **menu bar** (File · View · Ensemble · Products · Help), **toolbar** (ensemble-family switch GEFS / ECMWF IFS ENS / CMC GEPS / Blend, product switch, data opacity, reset view, theme), map with a CAVE-style three-line header legend (run · product · forecast hour/valid time), a flat colour bar, a time bar, and a **status bar** showing the cursor's lat/lon, pressure and nearest low. A cursor-following pop-up gives the same read-out on the map; in a blend, tick-boxes on the map choose the systems.
+A flat, operational-workstation layout: title bar, **menu bar** (File · View · Ensemble · Products · Help), **toolbar** (ensemble-system switch GEFS / ECMWF IFS ENS / CMC GEPS / NOAA AIGEFS / Blend, product switch, data opacity, reset view, theme), map with a CAVE-style three-line header legend (run · product · forecast hour/valid time), a flat colour bar, a time bar, and a **status bar** showing the cursor's lat/lon, pressure and nearest low. A cursor-following pop-up gives the same read-out on the map; in a blend, tick-boxes on the map choose the systems.
 
 **Dark / light theme:** View ▸ Theme, the toolbar button, or the **T** key. Dark is the default; the choice is remembered in the browser. Map colours per theme (land, borders, graticule, L markers) live in `THEMES` at the top of `site/app.js`; page chrome colours are CSS variables at the top of `site/style.css`.
 
@@ -141,7 +146,7 @@ gh repo create <YOUR-REPO> --public --source=. --remote=origin --push
 5. Your viewer is at **`https://<YOUR-USER>.github.io/<YOUR-REPO>/`**.
 
 ### Afterwards
-* Runs automatically at 08:35 and 20:35 UTC, with a second attempt at 09:35 / 21:35 (ECMWF open data for the 00Z/12Z runs completes ≈ 7.5–9 h after cycle time; GEFS and GEPS are done earlier). A run whose cycle is already live is skipped. Edit the `cron` line to change.
+* Runs automatically at 08:35, 09:35, 10:35, 11:35 and 20:35, 21:35, 22:35, 23:35 UTC (ECMWF open data for the 00Z/12Z runs completes ≈ 7.5–9 h after cycle time; GEFS and GEPS are done earlier; AIGEFS is the most irregular). A run whose cycle is already live *with every system that is ready now* is skipped; a late AIGEFS therefore triggers a rebuild of that cycle. Edit the `cron` line to change. A build downloads ≈ 3.5 GB, which fits comfortably in the hosted runner's time and disk limits.
 * **Run it by hand:** Actions → *Build & deploy* → *Run workflow* (options: pin a `cycle`, limit `max_fh`, `force`).
 * Change `config.toml` (domain, hours, palettes…) and push – the site rebuilds.
 * GitHub disables scheduled workflows after 60 days without repository activity (public repos) – push any commit or re-enable them in the Actions tab.
@@ -150,6 +155,6 @@ gh repo create <YOUR-REPO> --public --source=. --remote=origin --push
 * Pages keeps **only the latest cycle** (each deploy replaces the site). Archive older cycles if you need them.
 
 ## 5. Credits & licences
-Forecast data: NOAA/NCEP GEFS via the [NOAA Open Data Dissemination](https://registry.opendata.aws/noaa-gefs/) programme (public domain). **CMC GEPS** data: *Data Source: Environment and Climate Change Canada*, used under the [ECCC Data Server End-use Licence](https://eccc-msc.github.io/open-data/licence/readme_en/) (commercial use allowed; attribution required; no endorsement implied; shown in the map and Help dialog). **ECMWF IFS ENS** open data © European Centre for Medium-Range Weather Forecasts ([ECMWF](https://www.ecmwf.int)), published under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) – attribution is shown in the map and Help dialog; keep it if you re-host. The data here have been **modified** (decoded, subset, contoured, averaged, regridded and blended); neither ECCC nor ECMWF endorses this site, and ECMWF does not accept liability for errors or omissions in the data or this processing. See ECMWF's [open data terms](https://www.ecmwf.int/en/forecasts/datasets/open-data). Basemap: [Natural Earth](https://www.naturalearthdata.com/) (public domain). Colour schemes: [ColorBrewer](https://colorbrewer2.org) © Cynthia Brewer, Mark Harrower & Penn State (Apache-2.0). Map engine: [Leaflet](https://leafletjs.com) 1.9.4 (BSD-2-Clause, vendored in `site/vendor/leaflet/`). Add a `LICENSE` of your choice for your own code.
+Forecast data: NOAA/NCEP GEFS via the [NOAA Open Data Dissemination](https://registry.opendata.aws/noaa-gefs/) programme (public domain). **NOAA AIGEFS** data: NOAA/NCEP via the NOAA Open Data Dissemination programme (CC0). **CMC GEPS** data: *Data Source: Environment and Climate Change Canada*, used under the [ECCC Data Server End-use Licence](https://eccc-msc.github.io/open-data/licence/readme_en/) (commercial use allowed; attribution required; no endorsement implied; shown in the map and Help dialog). **ECMWF IFS ENS** open data © European Centre for Medium-Range Weather Forecasts ([ECMWF](https://www.ecmwf.int)), published under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) – attribution is shown in the map and Help dialog; keep it if you re-host. The data here have been **modified** (decoded, subset, contoured, averaged, regridded and blended); neither ECCC nor ECMWF endorses this site, and ECMWF does not accept liability for errors or omissions in the data or this processing. See ECMWF's [open data terms](https://www.ecmwf.int/en/forecasts/datasets/open-data). Basemap: [Natural Earth](https://www.naturalearthdata.com/) (public domain). Colour schemes: [ColorBrewer](https://colorbrewer2.org) © Cynthia Brewer, Mark Harrower & Penn State (Apache-2.0). Map engine: [Leaflet](https://leafletjs.com) 1.9.4 (BSD-2-Clause, vendored in `site/vendor/leaflet/`). Add a `LICENSE` of your choice for your own code.
 
 *This is an unofficial display of model guidance, not an official NOAA product; do not use it for life-safety decisions.*

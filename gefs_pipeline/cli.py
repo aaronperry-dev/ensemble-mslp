@@ -12,7 +12,7 @@ from pathlib import Path
 from .config import ROOT, load_config
 from .gefs import forecast_hours, parse_cycle
 from .pipeline import build, make_http
-from .sources import make_families, resolve_cycle
+from .sources import make_families, resolve_cycle, select_families
 
 
 def _common(p: argparse.ArgumentParser):
@@ -22,6 +22,8 @@ def _common(p: argparse.ArgumentParser):
     p.add_argument("--members", type=int, default=None, help="use only the first N members of each family (testing)")
     p.add_argument("--families", default=None, help="comma-separated ensemble families to build, e.g. gefs,ifs (default: config [run].families)")
     p.add_argument("--base-url", default=None, help="override the GEFS bucket URL (testing / mirrors)")
+    p.add_argument("--geps-base-url", default=None, help="override the GEPS (MSC Datamart) URL template (testing / mirrors)")
+    p.add_argument("--aigefs-base-url", default=None, help="override the AIGEFS bucket URL (testing / mirrors)")
     p.add_argument("--ifs-base-url", default=None, help="override the ECMWF bucket URL (testing / mirrors)")
     p.add_argument("--rps", type=float, default=None, help="override requests-per-second cap")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -35,6 +37,10 @@ def _setup(args):
         cfg.source.base_url = args.base_url.rstrip("/")
     if args.ifs_base_url:
         cfg.ifs.base_url = args.ifs_base_url.rstrip("/")
+    if args.geps_base_url:
+        cfg.geps.base_url = args.geps_base_url.rstrip("/")
+    if args.aigefs_base_url:
+        cfg.aigefs.base_url = args.aigefs_base_url.rstrip("/")
     families = make_families(cfg, [k.strip() for k in args.families.split(",")] if args.families else None)
     if args.members:
         for f in families:
@@ -44,13 +50,22 @@ def _setup(args):
     return cfg, families, http, fhs
 
 
-def _deployed_run(url: str) -> str | None:
+def _deployed_info(url: str) -> tuple[str | None, set[str]]:
+    """(run id, single-system families) of the manifest the live site serves."""
     import requests
     try:
         r = requests.get(url, timeout=15, headers={"Cache-Control": "no-cache"})
-        return r.json()["run"]["id"] if r.ok else None
+        if not r.ok:
+            return None, set()
+        m = r.json()
+        return m["run"]["id"], {k for k, v in m.get("families", {}).items() if not v.get("parts")}
     except Exception:
-        return None
+        return None, set()
+
+
+def should_skip(live_id: str | None, live_fams: set[str], run_id: str, ready: list[str]) -> bool:
+    """Skip the build when the same cycle is live AND already contains every system that is ready now."""
+    return live_id == run_id and set(ready) <= set(live_fams)
 
 
 def cmd_resolve(args) -> int:
@@ -58,17 +73,27 @@ def cmd_resolve(args) -> int:
     run = parse_cycle(args.cycle) if args.cycle else resolve_cycle(http, cfg, families, fhs)
     cyc = run.strftime("%Y%m%d%H")
     run_id = f"{run:%Y%m%d}_{run:%H}"
-    skip = bool(args.skip_if_deployed and _deployed_run(args.skip_if_deployed) == run_id)
-    print(f"cycle={cyc}\nrun_id={run_id}\nskip={'true' if skip else 'false'}")
+    ready = [f.key for f in select_families(http, cfg, families, run, fhs)]
+    skip = False
+    if args.skip_if_deployed:
+        live_id, live_fams = _deployed_info(args.skip_if_deployed)
+        # same cycle is live AND it already contains every system that is ready now (an optional system that arrived
+        # late - AIGEFS - triggers a rebuild of the live cycle)
+        skip = should_skip(live_id, live_fams, run_id, ready)
+        if live_id == run_id and not skip:
+            print(f"live site has {sorted(live_fams)}; now ready: {ready} -> rebuilding")
+    out = f"cycle={cyc}\nrun_id={run_id}\nfamilies={','.join(ready)}\nskip={'true' if skip else 'false'}"
+    print(out)
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-            fh.write(f"cycle={cyc}\nrun_id={run_id}\nskip={'true' if skip else 'false'}\n")
+            fh.write(out + "\n")
     return 0
 
 
 def cmd_build(args) -> int:
     cfg, families, http, fhs = _setup(args)
     run = parse_cycle(args.cycle) if args.cycle else resolve_cycle(http, cfg, families, fhs)
+    families = select_families(http, cfg, families, run, fhs)           # optional systems only when fully published
     logging.getLogger("gefs").info("building %s  |  %s  |  %d forecast hours (f%03d-f%03d)", run.strftime("%Y-%m-%d %HZ"),
                                    " + ".join(f"{f.label} ({len(f.members)})" for f in families), len(fhs), fhs[0], fhs[-1])
     cache = None if args.no_cache else Path(args.cache_dir)

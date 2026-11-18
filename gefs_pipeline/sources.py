@@ -15,6 +15,11 @@ ECMWF layout (verified against the bucket and ECMWF's open-data documentation, I
                   6-hourly to 384 h on 00/12Z.  One all-member GRIB2 file per step:
   <base>/<HH>/<hhh>/CMC_geps-raw_PRMSL_MSL_0_latlon0p5x0p5_<YYYYMMDDHH>_P<hhh>_allmbrs.grib2   (~2.2 MB)
   with <base> = https://dd.weather.gc.ca/<YYYYMMDD>/WXO-DD/ensemble/geps/grib2/raw  (a `today/` form also exists).
+
+  * AigefsFamily - NOAA AIGEFS (AI ensemble, GraphCast-based), s3://noaa-nws-graphcastgfs-pds  (31 members mem000..mem030),
+                  0.25 deg, 6-hourly to 384 h, all four cycles.  Same .idx + Range scheme as GEFS:
+  EAGLE_ensemble/aigefs.<YYYYMMDD>/<HH>/mem<NNN>/model/atmos/grib2/aigefs.t<HH>z.sfc.f<FFF>.grib2 (+ .idx; PRMSL:mean sea level)
+  Publication is irregular (7.5 h to > 24 h after cycle time), so it is configured as an *optional* family (see [run]).
 """
 from __future__ import annotations
 
@@ -249,7 +254,54 @@ class GepsFamily(Family):
 
 
 # =====================================================================================================
-FAMILIES = {"gefs": GefsFamily, "ifs": IfsFamily, "geps": GepsFamily}
+class AigefsFamily(Family):
+    """NOAA's AI Global Ensemble Forecast System (GraphCast-derived, initialised from the GEFS analyses)."""
+    key, label, name, org = "aigefs", "NOAA AIGEFS", "NOAA AIGEFS (AI)", "NOAA/NCEP"
+    note = "AI-based 31-member ensemble; mem000 is member 0 (ai00), mem001-mem030 are ai01-ai30"
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.members = [f"ai{i:02d}" for i in range(0, int(cfg.aigefs.n_members))]
+
+    def max_fh(self, run):
+        return int(self.cfg.aigefs.max_fh)
+
+    def _url(self, run: datetime, member: str, fh: int) -> str:
+        c = self.cfg.aigefs
+        mem = f"mem{int(member[2:]):03d}"
+        return (f"{c.base_url.rstrip('/')}/{c.prefix}.{run:%Y%m%d}/{run:%H}/{mem}/model/atmos/grib2/"
+                f"aigefs.t{run:%H}z.{c.product}.f{fh:03d}.grib2")
+
+    def plan(self, http, run, fh):
+        url = self._url(run, self.members[0], fh)
+        return url if http.exists(url + ".idx") else None
+
+    def plan_tag(self, plan):
+        return self.cfg.aigefs.product
+
+    def cycle_ready(self, http, run, fhs):
+        hrs = self.hours(run, fhs)
+        if not hrs:
+            return False
+        fh = hrs[-1]
+        if not http.exists(self._url(run, self.members[-1], fh) + ".idx"):       # cheap sentinel: last member, last hour
+            return False
+        return all(http.exists(self._url(run, m, fh) + ".idx") for m in self.members)
+
+    def fetch_grid(self, http, run, plan, member, fh, cache_dir):
+        url = self._url(run, member, fh)
+        cache = cache_dir / f"{run:%Y%m%d%H}" / f"{member}.{self.cfg.aigefs.product}.f{fh:03d}.grib2" if cache_dir else None
+
+        def fetch():
+            entries = parse_idx(http.get_text(url + ".idx"))
+            start, end = find_message(entries, self.cfg.aigefs.variable, self.cfg.aigefs.level)
+            return http.get_range(url, start, end)
+
+        return decode_message(_cached(cache, fetch), *_bbox(self.cfg))
+
+
+# =====================================================================================================
+FAMILIES = {"gefs": GefsFamily, "ifs": IfsFamily, "geps": GepsFamily, "aigefs": AigefsFamily}
 
 
 def make_families(cfg, keys: list[str] | None = None) -> list[Family]:
@@ -260,10 +312,31 @@ def make_families(cfg, keys: list[str] | None = None) -> list[Family]:
     return [FAMILIES[k](cfg) for k in keys]
 
 
+def optional_keys(cfg) -> set[str]:
+    return set(getattr(cfg.run, "optional", []) or [])
+
+
+def select_families(http: Http, cfg, families: list[Family], run: datetime, fhs: list[int]) -> list[Family]:
+    """The families to build for `run`: every required one, plus each OPTIONAL one that is fully published by now."""
+    opt = optional_keys(cfg)
+    out = []
+    for f in families:
+        if f.key in opt and not f.cycle_ready(http, run, fhs):
+            log.warning("optional family %s is not fully published for %s yet - building without it", f.key, run.strftime("%Y%m%d%H"))
+            continue
+        out.append(f)
+    return out
+
+
 def resolve_cycle(http: Http, cfg, families: list[Family], fhs: list[int], now: datetime | None = None,
                   lookback: int = 8) -> datetime:
-    """Newest allowed cycle that every enabled family has fully published (up to its own last hour)."""
+    """Newest allowed cycle that every REQUIRED family has fully published (up to its own last hour).
+
+    Families listed in [run] optional never hold a cycle back (AIGEFS is published irregularly); they are added
+    to the build when they are ready (select_families) and trigger a rebuild of the live cycle when they arrive late."""
     now = now or datetime.now(timezone.utc)
+    optional = optional_keys(cfg)
+    families = [f for f in families if f.key not in optional] or families
     allowed = set(int(c) for c in cfg.run.cycles)
     run = now.replace(minute=0, second=0, microsecond=0)
     run -= timedelta(hours=run.hour % 6)

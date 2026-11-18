@@ -1,11 +1,11 @@
-/* Ensemble MSLP viewer (NOAA GEFS, ECMWF IFS ENS, Canadian GEPS, and blends of any two or all three) — Leaflet, no build step, no runtime deps.
+/* Ensemble MSLP viewer (NOAA GEFS, ECMWF IFS ENS, Canadian GEPS, NOAA AIGEFS, and blends of any two or more of them) — Leaflet, no build step, no runtime deps.
  *
  * Data contract (written by gefs_pipeline, manifest schema 2):
  *   data/manifest.json                         run info, families {gefs, ifs, geps, <blend views such as gefs_ifs_geps>} (+ member lists, blends carry `parts`), products
  *                                              (class edges + ColorBrewer colours), frames[{fh, valid, avail:{family:{..}}}]
  *   data/<run>/<family>/<product>/fNNN.json   GeoJSON FeatureCollection of filled contour bands, plus
  *                                              `lows`: [[lon, lat, hPa, memberIdx], ...]  (memberIdx -> families[f].members)
- *                                              `grid`: value grid for the cursor read-out (blend adds grid.fam per system)
+ *                                              `grid`: value grid for the cursor read-out of that view
  *   data/basemap/{land,lakes,coast,admin0,admin1}.json   Natural Earth vectors
  */
 (() => {
@@ -39,7 +39,7 @@
       a0: '#ffffff', a0Case: '#000000', a0CaseOp: 0.65, a0Sea: '#9aa7b6',
       lakeStroke: '#6ea6d9', lakeFill: '#000000', lakeFillOp: 0.18,
       grat: '#ffffff', gratOp: 0.22, gratText: '#d9e1ec', gratHalo: 'rgba(0,0,0,0.85)',
-      low: '#ff3a3a', sys: { gefs: '#ff3a3a', ifs: '#ffd23f', geps: '#37e8cf' }, halo: 'rgba(0,0,0,0.92)', dataOp: 100,
+      low: '#ff3a3a', sys: { gefs: '#ff3a3a', ifs: '#ffd23f', geps: '#37e8cf', aigefs: '#d79bff' }, halo: 'rgba(0,0,0,0.92)', dataOp: 100,
     },
     light: {
       land: '#e8ebe6', coast: '#222a36', coastOp: 0.85,
@@ -47,7 +47,7 @@
       a0: '#141922', a0Case: '#ffffff', a0CaseOp: 0.55, a0Sea: '#3b4452',
       lakeStroke: '#3d5f7e', lakeFill: '#ffffff', lakeFillOp: 0.22,
       grat: '#141922', gratOp: 0.3, gratText: '#2a3342', gratHalo: 'rgba(255,255,255,0.85)',
-      low: '#cb181d', sys: { gefs: '#cb181d', ifs: '#b85f00', geps: '#007a73' }, halo: 'rgba(255,255,255,0.96)', dataOp: 85,
+      low: '#cb181d', sys: { gefs: '#cb181d', ifs: '#b85f00', geps: '#007a73', aigefs: '#7b2cbf' }, halo: 'rgba(255,255,255,0.96)', dataOp: 85,
     },
   };
   const readTheme = () => {
@@ -57,7 +57,7 @@
   };
   let themeName = readTheme();
   let th = THEMES[themeName];
-  const state = { family: 'gefs', product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [], grid: null, lowSize: 24 };
+  const state = { family: 'gefs', product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [], grid: null, tipGrids: null, lowSize: 24 };
   const fmtCave = (iso) => {
     const d = new Date(iso);
     return `${DOW[d.getUTCDay()]} ${d.getUTCDate()} ${MON[d.getUTCMonth()]} ${d.getUTCFullYear()} ${iso.slice(11, 16)}Z`.toUpperCase();
@@ -86,7 +86,7 @@
     const isBlend = (k) => !!(fams[k] && fams[k].parts);
     const bases = availableViews.filter((k) => !isBlend(k));           // single systems, e.g. gefs, ifs, geps
     const blendViews = availableViews.filter(isBlend);                  // e.g. gefs_ifs_geps, gefs_ifs, ...
-    const shortOf = (k) => (isBlend(k) ? 'Blend' : ({ gefs: 'GEFS', ifs: 'ECMWF', geps: 'GEPS' }[k] || fams[k].label));
+    const shortOf = (k) => (isBlend(k) ? 'Blend' : ({ gefs: 'GEFS', ifs: 'ECMWF', geps: 'GEPS', aigefs: 'AIGEFS' }[k] || fams[k].label));
     const curParts = () => (isBlend(state.family) ? fams[state.family].parts : null);
     const SYS_FALLBACK = ['#ff3a3a', '#ffd23f', '#37e8cf', '#c792ea'];
     const sysColor = (k) => (th.sys && th.sys[k]) || SYS_FALLBACK[Math.max(0, bases.indexOf(k))];
@@ -118,7 +118,7 @@
     });
     map.attributionControl.setPrefix(false);
     map.attributionControl.addAttribution(
-      'GEFS: NOAA/NCEP via <a href="https://registry.opendata.aws/noaa-gefs/" target="_blank" rel="noopener">AWS Open Data</a> · ' +
+      'NOAA <a href="https://registry.opendata.aws/noaa-gefs/" target="_blank" rel="noopener">GEFS</a> &amp; <a href="https://registry.opendata.aws/noaa-nws-graphcastgfs-pds/" target="_blank" rel="noopener">AIGEFS</a> (AI, CC0) via AWS Open Data · ' +
       'IFS ENS: © <a href="https://www.ecmwf.int" target="_blank" rel="noopener">ECMWF</a>, <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a> (processed) · ' +
       'GEPS: Data Source: <a href="https://eccc-msc.github.io/open-data/licence/readme_en/" target="_blank" rel="noopener">Environment and Climate Change Canada</a> · ' +
       'Basemap: <a href="https://www.naturalearthdata.com/" target="_blank" rel="noopener">Natural Earth</a> · ' +
@@ -324,10 +324,10 @@
       ? (isBlend(state.family) ? 'Blended ensemble mean' : 'Ensemble-mean MSLP')
       : (isBlend(state.family) ? 'Lowest of all members' : 'Lowest member MSLP'));
     let lastPt = null;                                           // last pointer position {x, y, ll}
-    function valueAt(lat, lon, arr) {
-      const g = state.grid;
+    function valueAt(lat, lon, g) {                              // g = any {lon0, lat0, d, nx, ny, v} read-out grid (default: the view's own)
+      g = g || state.grid;
       if (!g) return null;
-      const a_ = arr || g.v;
+      const a_ = g.v;
       const fx = (lon - g.lon0) / g.d, fy = (lat - g.lat0) / g.d;
       if (fx < 0 || fy < 0 || fx > g.nx - 1 || fy > g.ny - 1) return null;
       const x0 = Math.min(Math.floor(fx), g.nx - 2), y0 = Math.min(Math.floor(fy), g.ny - 2);
@@ -356,8 +356,8 @@
       }
       const { x, y, ll } = lastPt;
       const v = valueAt(ll.lat, ll.lng);
-      const blendVals = (isBlend(state.family) && state.grid && state.grid.fam)
-        ? curParts().map((k) => [k, valueAt(ll.lat, ll.lng, state.grid.fam[k])]) : null;
+      const blendVals = (isBlend(state.family) && state.tipGrids)
+        ? curParts().filter((k) => state.tipGrids[k]).map((k) => [k, valueAt(ll.lat, ll.lng, state.tipGrids[k])]) : null;
       const hit = Math.max(16, state.lowSize * 0.75);
       const near = state.lowsPx.filter(([px, py]) => Math.hypot(px - x, py - y - state.lowSize * 0.15) < hit).sort((a, b) => a[2] - b[2]);
       let html = '';
@@ -420,6 +420,18 @@
       return p;
     }
 
+    // per-system read-out grids for blend views live in a sidecar (data/<run>/tip/<product>/fNNN.json = {system: grid})
+    const tipCache = new Map();
+    function loadTips(prod, fh) {
+      const key = `${prod}/${fh}`;
+      if (tipCache.has(key)) return tipCache.get(key);
+      const p = fetch(`data/${run.id}/tip/${prod}/f${pad3(fh)}.json`).then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
+      tipCache.set(key, p);
+      p.catch(() => tipCache.delete(key));
+      if (tipCache.size > 40) tipCache.delete(tipCache.keys().next().value);
+      return p;
+    }
+
     let dataLayer = null, token = 0;
     async function show() {
       const my = ++token;
@@ -441,10 +453,14 @@
         dataLayer = layer;
         state.lows = d.lows || [];
         state.grid = d.grid || null;
+        state.tipGrids = null;
         drawLows();
         updateTip();
         setStatus('');
         prefetch();
+        if (isBlend(fam) && manifest.tips) {                              // the per-system values arrive a moment later; not needed to draw
+          loadTips(prod, f.fh).then((t) => { if (my === token) { state.tipGrids = t; updateTip(); } }).catch(() => {});
+        }
       } catch (e) {
         if (my === token) setStatus(`Could not load F${pad3(f.fh)} (${e.message})`, true);
       } finally {
@@ -455,6 +471,7 @@
       for (let k = 1; k <= 2; k++) {
         const nf = vframes[(state.idx + k) % vframes.length];
         loadFrame(state.family, state.product, nf.fh).catch(() => {});
+        if (isBlend(state.family) && manifest.tips) loadTips(state.product, nf.fh).catch(() => {});
       }
     }
 
@@ -491,7 +508,7 @@
       const P = manifest.products[state.product];
       const F = fams[state.family];
       const ps = curParts();
-      const who = ps ? `BLEND: ${ps.map((k) => fams[k].label).join(' + ')}`.toUpperCase() : F.label.toUpperCase();
+      const who = ps ? `BLEND: ${ps.map((k) => (ps.length > 2 ? shortOf(k) : fams[k].label)).join(' + ')}`.toUpperCase() : F.label.toUpperCase();
       const nm = ps ? ps.map((k) => fams[k].members.length).join(' + ') : F.members.length;
       const suffix = ps && state.product === 'mean'
         ? ` — ${F.weighting === 'equal' ? 'EQUAL-WEIGHT' : 'POOLED MEMBERS'}` : '';
@@ -558,6 +575,7 @@
       else if (e.key === 'g' || e.key === 'G') setFamily('gefs');
       else if (e.key === 'e' || e.key === 'E') setFamily('ifs');
       else if (e.key === 'c' || e.key === 'C') setFamily('geps');
+      else if (e.key === 'a' || e.key === 'A') setFamily('aigefs');
       else if (e.key === 'b' || e.key === 'B') setFamily('blend');
       else if (e.key === 't' || e.key === 'T') applyTheme(themeName === 'dark' ? 'light' : 'dark', true);
       else if (e.key === 'Escape') closeMenus();
@@ -571,7 +589,7 @@
       });
     }
     // ---- ensemble family (GEFS / ECMWF IFS ENS / Blend) -------------------------------------------
-    const FAM_KEY = { gefs: 'G', ifs: 'E', geps: 'C', blend: 'B' };
+    const FAM_KEY = { gefs: 'G', ifs: 'E', geps: 'C', aigefs: 'A', blend: 'B' };
     const seg = bases.map((k) => ({ k, label: fams[k].label, name: fams[k].name, note: fams[k].note, key: FAM_KEY[k] || '' }));
     if (blendViews.length) seg.push({ k: 'blend', label: 'Blend', name: 'Blend of selected systems', note: 'Tick the systems to blend', key: 'B' });
     $('#famSeg').innerHTML = seg.map((e) =>
@@ -619,7 +637,7 @@
       syncFamilyUI();
       buildTicks();
       buildLegend();
-      state.lows = []; state.grid = null; drawLows(); updateTip();
+      state.lows = []; state.grid = null; state.tipGrids = null; drawLows(); updateTip();
       if (vframes[j].fh !== wantFh) {
         setStatus(`${shortOf(v)} has no F${pad3(wantFh)} on this cycle \u2014 showing F${pad3(vframes[j].fh)}`);
         setTimeout(() => setStatus(''), 3500);
@@ -640,7 +658,7 @@
       state.product = p;
       syncProductUI();
       buildLegend();
-      state.lows = []; state.grid = null; drawLows(); updateTip();
+      state.lows = []; state.grid = null; state.tipGrids = null; drawLows(); updateTip();
       show();
     }
 
