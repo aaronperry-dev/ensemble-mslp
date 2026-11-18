@@ -114,7 +114,8 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
     run_id = f"{run:%Y%m%d}_{run:%H}"
     shutil.rmtree(data_dir / run_id, ignore_errors=True)
 
-    scales = {k: build_scale(getattr(cfg.products, k)) for k in ("mean", "min")}
+    edges, colors, scale_segments = build_scale(cfg.scale)         # one scale, shared by both products
+    scales = {"mean": (edges, colors), "min": (edges, colors)}
     min_members = max(1, int(np.ceil(len(members) * float(cfg.fetch.min_member_fraction))))
     t0 = time.time()
 
@@ -165,11 +166,11 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
         "lows_threshold_hpa": cfg.lows.threshold_hpa,
         "products": {
             k: {"title": getattr(cfg.products, k).title, "short": getattr(cfg.products, k).short,
-                "palette": getattr(cfg.products, k).palette, "reverse": bool(getattr(cfg.products, k).reverse),
                 "has_lows": bool(getattr(cfg.products, k).has_lows), "units": "hPa",
-                "edges": scales[k][0], "colors": scales[k][1]}
+                "edges": edges, "colors": colors}
             for k in ("mean", "min")
         },
+        "scale": {"segments": scale_segments},
         "frames": frames,
     }
     write_json(data_dir / "manifest.json", manifest)

@@ -72,10 +72,13 @@ For every member, MSLP is lightly Gaussian-smoothed (0.5°) *only to locate* min
 ## 3. Cartography & colour
 
 * **Basemap**: Natural Earth 1:10m (public domain), clipped to the data domain and simplified at build time. Stacking order, bottom → top: land fill · **data** · lakes · coastline · state/province lines · international boundaries.
-* **Line hierarchy** (standard practice – weight and contrast follow administrative rank): international boundaries are the heaviest and darkest, with a light casing so they stay legible over both dark-red and dark-blue fills; disputed/indefinite boundaries are dashed; treaty/median maritime lines are fine grey dots; first-order divisions (states, provinces) are thinner mid-grey with a faint casing; coastlines are finest. **All widths scale ≈ 20 % per zoom level** so the map stays balanced from continental to local views. Lakes are drawn as water cut-outs above the data. Graticule density adapts to zoom (10° → 1°).
-* **Colour** (all ColorBrewer, interpolated in OKLab to one colour per 4 hPa class; official hex values are unit-tested against `palettable`):
-  * *Mean + lows* – sequential **YlOrRd** (as in your GEFS reference: warm = higher pressure). Low markers use ColorBrewer’s darkest blue with a white halo.
-  * *Member minimum* – diverging **RdBu**, reversed (blue = low, red = high) with the neutral mid-colour pinned to the 1012–1016 hPa class, so deep lows stand out as saturated blues.
+* **Line hierarchy** (standard practice – weight and contrast follow administrative rank): international boundaries are the heaviest and darkest, with a light casing so they stay legible over both dark and light fills; disputed/indefinite boundaries are dashed; treaty/median maritime lines are fine grey dots; first-order divisions (states, provinces) are thinner mid-grey with a faint casing; coastlines are finest. **All widths scale ≈ 20 % per zoom level.** Lakes are drawn as water cut-outs above the data. The lat/lon graticule is a thin dotted vector layer drawn *beneath* the coast/state/country lines (only its degree labels sit on top), with density adapting to zoom (10° → 1°). State/province lines use every Natural Earth admin-1 class (including "statistical" and "meta bounds" classes, which are real state borders for the US and Canada), so no border segments are dropped.
+* **Colour** – one shared 4 hPa-class scale for both products (edges and ramps are set in `config.toml` → `[scale]`; official hex values are unit-tested against `palettable`):
+  * **≥ 1000 hPa:** ColorBrewer diverging **RdYlBu (9-class)**, reversed so blue is just above 1000 hPa, pale yellow ≈ 1016–1020 and red ≥ 1032.
+  * **980–1000 hPa:** sequential **Blues**, darkening steadily as pressure falls (navy at 980).
+  * **< 980 hPa:** sequential **RdPu**, from bright pink at 976–980 to deep purple below 948, so deep lows read as a distinct, intense tier.
+  * Colours are interpolated in OKLab between the ColorBrewer anchors. The legend marks the 980 and 1000 hPa hinges.
+* **Low markers** – a bold red **L** (ColorBrewer Reds) with a white halo and the member's central pressure in hPa directly above it. Labels are de-cluttered (deepest lows labelled first; more appear as you zoom in); hover any L for the member name and exact value.
   Change `palette`, `reverse`, `edges`, `diverging_center` in `config.toml`; available ramps are listed in `gefs_pipeline/palette.py`.
 * Web-Mercator projection (the web-map standard). The projection of your reference images is not reproduced.
 

@@ -31,11 +31,8 @@
     mean: 'Filled: ensemble-mean MSLP. “L” marks every member’s low-pressure centre.',
     min: 'At each point, the lowest MSLP forecast by any member — the deepest-low envelope.',
   };
-  const PRODUCT_HINT = {
-    mean: 'warmer = higher pressure',
-    min: 'blue = lower, red = higher',
-  };
-
+  const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+  const LOW_RED = '#cb181d';          // ColorBrewer Reds (7): bold red "L"
   const state = { product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [] };
 
   // ---------------------------------------------------------------------------------------------
@@ -91,9 +88,9 @@
     new Home({ position: 'topleft' }).addTo(map);
 
     // Panes give a deterministic cartographic stacking order (bottom -> top):
-    //   land fill < DATA < lakes < coast < state casing < state lines < country casing < country lines
+    //   land fill < DATA < lakes < graticule < coast < state casing < state lines < country casing < country lines
     const pane = (name, z) => { const p = map.createPane(name); p.style.zIndex = z; p.style.pointerEvents = 'none'; return p; };
-    pane('land', 210); pane('data', 250); pane('lakes', 300); pane('coast', 320);
+    pane('land', 210); pane('data', 250); pane('lakes', 300); pane('grat', 310); pane('coast', 320);
     pane('admin1c', 335); pane('admin1', 340); pane('admin0c', 355); pane('admin0', 360);
 
     // The viewer is locked to the data domain: it cannot be panned or zoomed out past the data, so the
@@ -174,39 +171,40 @@
 
     const opts = { graticule: true, lows: true, states: true, lakes: true };
 
+    // Graticule LINES are vector layers in the 'grat' pane (below coast/state/country lines, as is standard);
+    // only the degree labels are drawn on the overlay canvas.
+    const gratStep = (z) => (z < 4.6 ? 10 : z < 6 ? 5 : z < 7.5 ? 2 : 1);
+    let gratLayer = null, gratLayerStep = 0;
+    function rebuildGraticule() {
+      const step = gratStep(map.getZoom());
+      if (gratLayer && step === gratLayerStep && opts.graticule) return;
+      if (gratLayer) { map.removeLayer(gratLayer); gratLayer = null; }
+      if (!opts.graticule) return;
+      gratLayerStep = step;
+      const st = { pane: 'grat', interactive: false, color: '#141922', opacity: 0.3, weight: 0.7, dashArray: '2 4' };
+      const lines = [];
+      for (let lat = Math.ceil(dom.south / step) * step; lat <= dom.north; lat += step) lines.push(L.polyline([[lat, dom.west], [lat, dom.east]], st));
+      for (let lon = Math.ceil(dom.west / step) * step; lon <= dom.east; lon += step) lines.push(L.polyline([[dom.south, lon], [dom.north, lon]], st));
+      gratLayer = L.layerGroup(lines).addTo(map);
+    }
+
     function drawGraticule() {
       const ctx = gratCv.getContext('2d');
       const s = map.getSize();
       ctx.clearRect(0, 0, s.x, s.y);
       if (!opts.graticule) return;
-      const z = map.getZoom();
-      const step = z < 4.6 ? 10 : z < 6 ? 5 : z < 7.5 ? 2 : 1;
+      const step = gratStep(map.getZoom());
       const b = map.getBounds();
       const lat0 = Math.ceil(b.getSouth() / step) * step, lon0 = Math.ceil(b.getWest() / step) * step;
-      ctx.lineWidth = 0.7;
-      ctx.strokeStyle = 'rgba(20,25,34,0.28)';
-      ctx.setLineDash([2, 4]);
-      ctx.beginPath();
-      const labels = [];
-      for (let lat = lat0; lat <= b.getNorth(); lat += step) {
-        const y = map.latLngToContainerPoint([lat, b.getWest()]).y;
-        ctx.moveTo(0, y); ctx.lineTo(s.x, y);
-        labels.push([`${Math.abs(lat)}°${lat < 0 ? 'S' : 'N'}`, 5, y - 3, 'left']);
-      }
-      for (let lon = lon0; lon <= b.getEast(); lon += step) {
-        const x = map.latLngToContainerPoint([b.getSouth(), lon]).x;
-        ctx.moveTo(x, 0); ctx.lineTo(x, s.y);
-        labels.push([`${Math.abs(lon)}°${lon < 0 ? 'W' : 'E'}`, x + 3, 12, 'left']);
-      }
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.font = '600 10.5px system-ui, sans-serif';
+      ctx.font = '600 10.5px ' + FONT;
       ctx.lineJoin = 'round';
-      labels.forEach(([t, x, y, a]) => {
-        ctx.textAlign = a;
+      ctx.textAlign = 'left';
+      const put = (t, x, y) => {
         ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.strokeText(t, x, y);
         ctx.fillStyle = '#2a3342'; ctx.fillText(t, x, y);
-      });
+      };
+      for (let lat = lat0; lat <= b.getNorth(); lat += step) put(`${Math.abs(lat)}°${lat < 0 ? 'S' : 'N'}`, 5, map.latLngToContainerPoint([lat, b.getWest()]).y - 3);
+      for (let lon = lon0; lon <= b.getEast(); lon += step) put(`${Math.abs(lon)}°${lon < 0 ? 'W' : 'E'}`, map.latLngToContainerPoint([b.getSouth(), lon]).x + 3, 12);
     }
 
     function drawLows() {
@@ -216,30 +214,45 @@
       state.lowsPx = [];
       if (!opts.lows || !manifest.products[state.product].has_lows) return;
       const z = map.getZoom();
-      const size = clamp(9 + (z - 3) * 1.6, 9, 22);
-      const showP = z >= 5;
+      const size = clamp(12 + (z - 3) * 1.8, 13, 28);          // "L" height in px
+      const fs = Math.max(10, size * 0.74);                     // pressure label size
+      const pts = [];
+      for (const [lon, lat, p, mi] of state.lows) {
+        const pt = map.latLngToContainerPoint([lat, lon]);
+        if (pt.x < -30 || pt.y < -40 || pt.x > s.x + 30 || pt.y > s.y + 30) continue;
+        pts.push({ x: pt.x, y: pt.y, p, mi });
+      }
+      state.lowsPx = pts.map((q) => [q.x, q.y, q.p, q.mi]);
+      pts.sort((a, b) => b.p - a.p);                            // shallow first -> the deepest lows end up on top
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.lineJoin = 'round';
-      for (const [lon, lat, p, mi] of state.lows) {
-        const pt = map.latLngToContainerPoint([lat, lon]);
-        if (pt.x < -20 || pt.y < -20 || pt.x > s.x + 20 || pt.y > s.y + 20) continue;
-        state.lowsPx.push([pt.x, pt.y, p, mi]);
-        ctx.font = `800 ${size}px system-ui, sans-serif`;
-        ctx.lineWidth = 3.2; ctx.strokeStyle = 'rgba(255,255,255,0.92)'; ctx.strokeText('L', pt.x, pt.y);
-        ctx.fillStyle = '#08306b'; ctx.fillText('L', pt.x, pt.y);
-        if (showP) {
-          ctx.font = `700 ${Math.max(9, size * 0.62)}px system-ui, sans-serif`;
-          const t = String(Math.round(p));
-          ctx.lineWidth = 2.6; ctx.strokeStyle = 'rgba(255,255,255,0.92)'; ctx.strokeText(t, pt.x, pt.y + size * 0.82);
-          ctx.fillStyle = '#08306b'; ctx.fillText(t, pt.x, pt.y + size * 0.82);
-        }
+      ctx.font = `900 ${size}px ${FONT}`;
+      for (const q of pts) {
+        ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(255,255,255,0.95)'; ctx.strokeText('L', q.x, q.y);
+        ctx.fillStyle = LOW_RED; ctx.fillText('L', q.x, q.y);
+      }
+      // hPa value directly above each L.  Deepest lows first; a label that would overlap one already
+      // placed is skipped (zoom in and more labels appear; hover any L for member + exact value).
+      ctx.font = `800 ${fs}px ${FONT}`;
+      const placed = [];
+      for (let i = pts.length - 1; i >= 0; i--) {
+        const q = pts[i];
+        const t = String(Math.round(q.p));
+        const w = ctx.measureText(t).width + 3, h = fs + 1;
+        const cx = q.x, cy = q.y - size * 0.5 - fs * 0.55;
+        const r = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2];
+        if (placed.some((o) => r[0] < o[2] && r[2] > o[0] && r[1] < o[3] && r[3] > o[1])) continue;
+        placed.push(r);
+        ctx.lineWidth = 3.4; ctx.strokeStyle = 'rgba(255,255,255,0.96)'; ctx.strokeText(t, cx, cy);
+        ctx.fillStyle = LOW_RED; ctx.fillText(t, cx, cy);
       }
     }
 
     let raf = 0;
     const redrawOverlays = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(() => { drawGraticule(); drawLows(); }); };
     map.on('move moveend zoomend viewreset', redrawOverlays);
+    map.on('zoomend', rebuildGraticule);
     map.on('resize', () => { lockZoom(); sizeCv(); redrawOverlays(); });
     map.on('zoomstart', () => { gratCv.style.opacity = 0; lowsCv.style.opacity = 0; });   // avoid mis-registered overlays during the zoom animation
     map.on('zoomend', () => { gratCv.style.opacity = 1; lowsCv.style.opacity = 1; });
@@ -318,21 +331,28 @@
       const P = manifest.products[state.product];
       const n = P.colors.length;
       const e = P.edges;
-      const stride = Math.max(1, Math.ceil(e.length / 9));
+      const segs = (manifest.scale && manifest.scale.segments) || [];
+      const hinges = segs.map((g) => g.to_hpa).filter((v) => v != null);          // e.g. [980, 1000]
+      const barPx = Math.min(430, window.innerWidth - 20) - 24;
+      let want = e.filter((v) => v % 8 === 0);
+      if (want.length * 36 > barPx) want = e.filter((v) => v % 16 === 8);        // keeps 1000 on narrow screens
       let ticks = '';
       e.forEach((v, k) => {
-        if (k % stride !== 0 && k !== e.length - 1) return;
-        const pos = ((k + 1) / n) * 100;
-        const lab = k === 0 ? `<${v}` : k === e.length - 1 ? `≥${v}` : `${v}`;
-        ticks += `<span style="left:${pos.toFixed(2)}%">${lab}</span>`;
+        const hinge = hinges.includes(v);
+        const lab = want.includes(v);
+        if (!hinge && !lab) return;
+        ticks += `<span class="${hinge ? 'hinge' : ''}${lab && v === 1000 ? ' b' : ''}" style="left:${(((k + 1) / n) * 100).toFixed(2)}%">${lab ? v : ''}</span>`;
       });
+      const note = segs.length === 3
+        ? `Colours (ColorBrewer): <b>${segs[2].ramp}</b> at/above ${segs[2].from_hpa} hPa, blue = lower → red = higher · <b>${segs[1].ramp}</b> ${segs[1].from_hpa}–${segs[1].to_hpa} · <b>${segs[0].ramp}</b> below ${segs[0].to_hpa}.`
+        : '';
       const lowsRow = P.has_lows
-        ? `<div class="lg-lows"><b>L</b> member low centre &lt; ${manifest.lows_threshold_hpa} hPa · hover for member &amp; value</div>` : '';
+        ? `<div class="lg-lows"><span class="lg-low"><i>987</i><b>L</b></span> member low centre (&lt; ${manifest.lows_threshold_hpa} hPa) · hover for member &amp; value</div>` : '';
       $('#legend').innerHTML =
         `<div class="lg-title"><span>${P.title}</span><small>hPa</small></div>` +
-        `<div class="lg-desc">${PRODUCT_TEXT[state.product]} Colours: ${PRODUCT_HINT[state.product]}.</div>` +
-        `<div class="lg-bar" role="img" aria-label="Colour scale from ${e[0]} to ${e[e.length - 1]} hPa">${P.colors.map((c) => `<i style="background:${c}"></i>`).join('')}</div>` +
-        `<div class="lg-ticks">${ticks}</div>${lowsRow}`;
+        `<div class="lg-desc">${PRODUCT_TEXT[state.product]}</div>` +
+        `<div class="lg-bar" role="img" aria-label="Colour scale from below ${e[0]} to above ${e[e.length - 1]} hPa">${P.colors.map((c) => `<i style="background:${c}"></i>`).join('')}</div>` +
+        `<div class="lg-ticks">${ticks}</div><div class="lg-note">${note}</div>${lowsRow}`;
     }
 
     // ---- timeline / transport ------------------------------------------------------------------
@@ -394,7 +414,7 @@
     $('#opacity').addEventListener('input', (e) => { map.getPane('data').style.opacity = e.target.value / 100; });
     map.getPane('data').style.opacity = $('#opacity').value / 100;
     $('#optLows').addEventListener('change', (e) => { opts.lows = e.target.checked; drawLows(); });
-    $('#optGrat').addEventListener('change', (e) => { opts.graticule = e.target.checked; drawGraticule(); });
+    $('#optGrat').addEventListener('change', (e) => { opts.graticule = e.target.checked; rebuildGraticule(); drawGraticule(); });
     $('#optStates').addEventListener('change', (e) => layers.states.forEach((l) => e.target.checked ? l.addTo(map) : map.removeLayer(l)));
     $('#optLakes').addEventListener('change', (e) => e.target.checked ? layers.lakes.addTo(map) : map.removeLayer(layers.lakes));
     if (window.matchMedia('(max-width:720px)').matches) $('#opts').open = false;
@@ -417,6 +437,7 @@
       state.idx = i >= 0 ? i : 0;
     }
     buildLegend();
+    rebuildGraticule();
     drawGraticule();
     show();
     window.addEventListener('resize', () => map.invalidateSize());

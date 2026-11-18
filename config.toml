@@ -57,23 +57,41 @@ min_separation_deg = 1.5
 precision          = 2          # decimals kept in GeoJSON coordinates
 upsample_to_deg    = 0.25       # 0.5-deg frames are cubic-spline upsampled so fills are not blocky
 
+# --- colour scale ----------------------------------------------------------------------------
+# ONE scale shared by both products so they can be compared directly.  Classes are `step` hPa wide between
+# `start` and `stop` (first class is open below, last is open above); each class gets one colour sampled
+# (in OKLab) from a ColorBrewer ramp.  Segments are listed LOWEST pressure first:
+#   upto = highest class upper-edge (hPa) that belongs to the segment (omit for the last segment)
+#   t    = [position on the ramp at the lowest-pressure class, position at the highest-pressure class], 0..1
+#          measured along the ramp *after* `reverse`.
+[scale]
+edges = { start = 948, stop = 1032, step = 4 }
+
+[[scale.segments]]                # deep lows: bright pink -> deep purple as pressure falls
+name  = "Deep lows (<980 hPa)"
+ramp  = "RdPu"
+upto  = 980
+t     = [1.0, 0.5]
+
+[[scale.segments]]                # moderate lows: mid blue -> navy as pressure falls
+name  = "Lows (980-1000 hPa)"
+ramp  = "Blues"
+upto  = 1000
+t     = [1.0, 0.75]
+
+[[scale.segments]]                # >= 1000 hPa: ColorBrewer RdYlBu (9), blue = lower, pale yellow ~ 1016-1020, red = higher
+name    = "1000 hPa and above"
+ramp    = "RdYlBu"
+reverse = true
+t       = [0.0, 1.0]
+
 # --- data products ---------------------------------------------------------------------------
-# Palettes are ColorBrewer ramps (see gefs_pipeline/palette.py), interpolated in OKLab to one
-# colour per class.  "reverse" flips the ramp; "diverging_center" pins the neutral mid colour
-# to the class containing that pressure.
 [products.mean]
-title       = "Ensemble-mean MSLP + member lows"
-short       = "Mean + lows"
-palette     = "YlOrRd"          # sequential, warm = higher pressure (matches reference images)
-reverse     = false
-has_lows    = true
-edges       = { start = 988, stop = 1044, step = 4 }
+title    = "Ensemble-mean MSLP + member lows"
+short    = "Mean + lows"
+has_lows = true
 
 [products.min]
-title       = "Member-wise minimum MSLP"
-short       = "Member minimum"
-palette     = "RdBu"            # diverging, blue = low, red = high, neutral near standard pressure
-reverse     = true
-has_lows    = false
-diverging_center = 1014
-edges       = { start = 952, stop = 1036, step = 4 }
+title    = "Member-wise minimum MSLP"
+short    = "Member minimum"
+has_lows = false

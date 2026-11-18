@@ -22,6 +22,10 @@ log = logging.getLogger("gefs.basemap")
 NE = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/{}.geojson"
 EXTRA = 3.0          # degrees of basemap beyond the data domain (the viewer is locked to the domain)
 MIN_LAKE_DEG2 = 0.04  # ~400 km2: drops the myriad small Canadian lakes that would clutter the map
+# Natural Earth files every river / diagonal US state line (Mississippi, Ohio, Colorado, NV-CA ...) and several
+# Canadian provincial lines under the "statistical" classes - they ARE real borders.  Only the short over-water
+# "indicator" stubs are left out.  (Keeping just "Admin-1 boundary" drops roughly 40 % of the border length.)
+ADMIN1_CLASSES = {"Admin-1 boundary", "Admin-1 statistical boundary", "Admin-1 statistical meta bounds"}
 
 
 def _download(name: str, cache: Path) -> dict:
@@ -95,7 +99,7 @@ def build_basemap(cfg, out: Path, cache: Path) -> None:
                      props=lambda p: {"t": 2})
     _write(out / "admin0.json", a0 + maritime)
     _write(out / "admin1.json", feats("ne_10m_admin_1_states_provinces_lines", "line", 0.006,
-                                      keep=lambda p, g: (p.get("FEATURECLA") or "") == "Admin-1 boundary"))
+                                      keep=lambda p, g: (p.get("FEATURECLA") or "") in ADMIN1_CLASSES))
     (out / "ATTRIBUTION.txt").write_text(
         "Basemap vectors: Natural Earth (naturalearthdata.com), public domain, 1:10m Cultural + Physical vectors,\n"
         "clipped to the viewer domain and simplified by gefs_pipeline/basemap.py.\n")
