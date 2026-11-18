@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 
 [run]
-families = ["gefs", "ifs"]      # ensemble systems to fetch; a blend view is added automatically when there are two
+families = ["gefs", "ifs", "geps"]   # ensemble systems to fetch; blend views are added automatically (see [blend])
 # Cycles the build may use.  ECMWF only publishes the full 10-day range (and beyond) on 00/12Z; its 06/18Z runs
 # stop at 144 h.  [0, 12] therefore guarantees 10 days for every view including the blend; use [0, 6, 12, 18]
 # to also build the 06/18Z cycles (the ECMWF and blend views then end at 6 days on those runs).
@@ -16,6 +16,9 @@ cycles   = [0, 12]
 # The blended MINIMUM is always the lowest value over every member of every family, and the blended low
 # markers are every member's lows from both families.
 weighting = "equal"
+# Which blends to build.  true  = every combination of two or more families (GEFS+IFS+GEPS, GEFS+IFS, GEFS+GEPS, IFS+GEPS),
+# so the viewer can switch systems in and out of the blend; false = only the blend of all families.
+subsets   = true
 
 [source]                        # ---- NOAA GEFS (AWS Open Data: noaa-gefs-pds) ----
 base_url      = "https://noaa-gefs-pds.s3.amazonaws.com"
@@ -48,6 +51,17 @@ full_range_cycles = [0, 12]     # these cycles publish to full_max_fh; the other
 full_max_fh       = 360
 short_max_fh      = 144
 requests_per_second = 3         # the ECMWF bucket answers 503 SlowDown above ~4-5 req/s from one client, so it gets its own, gentler cap
+
+[geps]                          # ---- Canadian GEPS (ECCC MSC Datamart) ----
+# {date} is replaced by the cycle date (YYYYMMDD); the Datamart keeps several recent days.
+base_url            = "https://dd.weather.gc.ca/{date}/WXO-DD/ensemble/geps/grib2/raw"
+variable            = "PRMSL_MSL_0"
+grid                = "latlon0p5x0p5"   # 0.5 deg: the only resolution ECCC publishes for the raw members
+n_perturbed         = 20                # control + 20 = 21 members, all inside one file per forecast hour
+cycles              = [0, 12]           # runs that publish the full 384 h
+max_fh              = 384
+short_max_fh        = 144               # the 06/18Z runs are not part of the open raw GEPS product; be conservative
+requests_per_second = 4                 # gentle: ~65 small requests per cycle in total
 
 [forecast]
 start = 0

@@ -30,6 +30,42 @@ class Grid:
         return float(abs(self.lats[1] - self.lats[0]))
 
 
+def split_messages(raw: bytes) -> list[bytes]:
+    """Split a multi-message GRIB2 file (e.g. the GEPS all-member file) into its messages, using the section-0 lengths."""
+    out, pos, n = [], 0, len(raw)
+    while pos < n:
+        j = raw.find(b"GRIB", pos)
+        if j < 0 or j + 16 > n:
+            break
+        length = int.from_bytes(raw[j + 8:j + 16], "big")
+        if length < 16 or j + length > n or raw[j + length - 4:j + length] != b"7777":
+            raise DecodeError(f"truncated or corrupt GRIB message at byte {j}")
+        out.append(raw[j:j + length])
+        pos = j + length
+    return out
+
+
+def member_key(raw: bytes) -> tuple[int, int]:
+    """(is_perturbed, perturbationNumber) of one ensemble message; control forecasts sort first.
+
+    GRIB2 code table 4.6: 0/1 = unperturbed control (high/low resolution), 2/3 = negatively/positively perturbed.
+    Messages that carry no ensemble keys sort by their position (the caller falls back to file order)."""
+    import eccodes as ec
+    with _ECC_LOCK:
+        gid = ec.codes_new_from_message(raw)
+        try:
+            def get(k, default):
+                try:
+                    return int(ec.codes_get(gid, k))
+                except Exception:       # key absent for this product definition
+                    return default
+            typ = get("typeOfEnsembleForecast", -1)
+            num = get("perturbationNumber", 0)
+        finally:
+            ec.codes_release(gid)
+    return (0 if typ in (0, 1) else 1, num)
+
+
 def decode_message(raw: bytes, west: float, east: float, south: float, north: float) -> Grid:
     import eccodes as ec  # imported lazily so unit tests that do not need GRIB work without ecCodes
 

@@ -1,7 +1,7 @@
-/* Ensemble MSLP viewer (NOAA GEFS, ECMWF IFS ENS, and their blend) — Leaflet, no build step, no runtime deps.
+/* Ensemble MSLP viewer (NOAA GEFS, ECMWF IFS ENS, Canadian GEPS, and blends of any two or all three) — Leaflet, no build step, no runtime deps.
  *
  * Data contract (written by gefs_pipeline, manifest schema 2):
- *   data/manifest.json                         run info, families {gefs, ifs, blend} (+ member lists), products
+ *   data/manifest.json                         run info, families {gefs, ifs, geps, <blend views such as gefs_ifs_geps>} (+ member lists, blends carry `parts`), products
  *                                              (class edges + ColorBrewer colours), frames[{fh, valid, avail:{family:{..}}}]
  *   data/<run>/<family>/<product>/fNNN.json   GeoJSON FeatureCollection of filled contour bands, plus
  *                                              `lows`: [[lon, lat, hPa, memberIdx], ...]  (memberIdx -> families[f].members)
@@ -39,7 +39,7 @@
       a0: '#ffffff', a0Case: '#000000', a0CaseOp: 0.65, a0Sea: '#9aa7b6',
       lakeStroke: '#6ea6d9', lakeFill: '#000000', lakeFillOp: 0.18,
       grat: '#ffffff', gratOp: 0.22, gratText: '#d9e1ec', gratHalo: 'rgba(0,0,0,0.85)',
-      low: '#ff3a3a', low2: '#ffd23f', halo: 'rgba(0,0,0,0.92)', dataOp: 100,
+      low: '#ff3a3a', sys: { gefs: '#ff3a3a', ifs: '#ffd23f', geps: '#37e8cf' }, halo: 'rgba(0,0,0,0.92)', dataOp: 100,
     },
     light: {
       land: '#e8ebe6', coast: '#222a36', coastOp: 0.85,
@@ -47,7 +47,7 @@
       a0: '#141922', a0Case: '#ffffff', a0CaseOp: 0.55, a0Sea: '#3b4452',
       lakeStroke: '#3d5f7e', lakeFill: '#ffffff', lakeFillOp: 0.22,
       grat: '#141922', gratOp: 0.3, gratText: '#2a3342', gratHalo: 'rgba(255,255,255,0.85)',
-      low: '#cb181d', low2: '#c26a00', halo: 'rgba(255,255,255,0.96)', dataOp: 85,
+      low: '#cb181d', sys: { gefs: '#cb181d', ifs: '#b85f00', geps: '#007a73' }, halo: 'rgba(255,255,255,0.96)', dataOp: 85,
     },
   };
   const readTheme = () => {
@@ -83,12 +83,22 @@
     const bounds = L.latLngBounds([dom.south, dom.west], [dom.north, dom.east]);
     const fams = manifest.families;
     const availableViews = (manifest.views || Object.keys(fams)).filter((k) => frames.some((f) => f.avail[k]));
-    const shortOf = (k) => ({ gefs: 'GEFS', ifs: 'ECMWF', blend: 'Blend' }[k] || fams[k].label);
-    const parts = (fams.blend && fams.blend.parts) || [];            // e.g. ['gefs', 'ifs']
-    const partOffset = {};                                           // member index offset of each system inside the blend list
-    parts.reduce((o, k) => { partOffset[k] = o; return o + fams[k].members.length; }, 0);
-    const partOf = (mi) => { let r = parts[0]; for (const k of parts) if (mi >= partOffset[k]) r = k; return r; };
-    state.family = availableViews[0];
+    const isBlend = (k) => !!(fams[k] && fams[k].parts);
+    const bases = availableViews.filter((k) => !isBlend(k));           // single systems, e.g. gefs, ifs, geps
+    const blendViews = availableViews.filter(isBlend);                  // e.g. gefs_ifs_geps, gefs_ifs, ...
+    const shortOf = (k) => (isBlend(k) ? 'Blend' : ({ gefs: 'GEFS', ifs: 'ECMWF', geps: 'GEPS' }[k] || fams[k].label));
+    const curParts = () => (isBlend(state.family) ? fams[state.family].parts : null);
+    const SYS_FALLBACK = ['#ff3a3a', '#ffd23f', '#37e8cf', '#c792ea'];
+    const sysColor = (k) => (th.sys && th.sys[k]) || SYS_FALLBACK[Math.max(0, bases.indexOf(k))];
+    // which system a member index belongs to inside the CURRENT blend's concatenated member list
+    const partOfMember = (mi) => {
+      const ps = curParts();
+      let off = 0;
+      for (const k of ps) { off += fams[k].members.length; if (mi < off) return k; }
+      return ps[ps.length - 1];
+    };
+    state.family = bases[0] || availableViews[0];
+    state.blendSel = blendViews.length ? fams[blendViews[0]].parts.slice() : [];   // systems currently ticked for the blend
 
     // frames available for the selected family (the ECMWF 06/18Z runs, e.g., stop at F144)
     let vframes = frames;
@@ -96,7 +106,7 @@
     rebuildViewFrames();
 
     $('#runline').textContent =
-      `${fmtInit(run.init)} · ${availableViews.filter((k) => k !== 'blend').map((k) => `${shortOf(k)} ${fams[k].members.length}`).join(' + ')} members · ${gridSummary(frames)}`;
+      `${fmtInit(run.init)} · ${bases.map((k) => `${shortOf(k)} ${fams[k].members.length}`).join(' + ')} members · ${gridSummary(frames, bases)}`;
 
     // ---- map ----------------------------------------------------------------------------------
     const map = L.map('map', {
@@ -110,6 +120,7 @@
     map.attributionControl.addAttribution(
       'GEFS: NOAA/NCEP via <a href="https://registry.opendata.aws/noaa-gefs/" target="_blank" rel="noopener">AWS Open Data</a> · ' +
       'IFS ENS: © <a href="https://www.ecmwf.int" target="_blank" rel="noopener">ECMWF</a>, <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a> (processed) · ' +
+      'GEPS: Data Source: <a href="https://eccc-msc.github.io/open-data/licence/readme_en/" target="_blank" rel="noopener">Environment and Climate Change Canada</a> · ' +
       'Basemap: <a href="https://www.naturalearthdata.com/" target="_blank" rel="noopener">Natural Earth</a> · ' +
       'Colours: <a href="https://colorbrewer2.org" target="_blank" rel="noopener">ColorBrewer</a> · ' +
       '<a href="https://leafletjs.com" target="_blank" rel="noopener">Leaflet</a>');
@@ -248,7 +259,7 @@
       for (let lon = lon0; lon <= b.getEast(); lon += step) put(`${Math.abs(lon)}°${lon < 0 ? 'W' : 'E'}`, map.latLngToContainerPoint([b.getSouth(), lon]).x + 3, 14);
     }
 
-    const byFamily = () => state.family === 'blend' && opts.byFamily && parts.length === 2;
+    const byFamily = () => isBlend(state.family) && opts.byFamily;
     function drawLows() {
       const ctx = lowsCv.getContext('2d');
       const s = map.getSize();
@@ -263,7 +274,7 @@
       for (const [lon, lat, p, mi] of state.lows) {
         const pt = map.latLngToContainerPoint([lat, lon]);
         if (pt.x < -40 || pt.y < -60 || pt.x > s.x + 40 || pt.y > s.y + 40) continue;
-        pts.push({ x: pt.x, y: pt.y, p, mi, k: byFamily() ? (partOf(mi) === parts[0] ? 0 : 1) : 0 });
+        pts.push({ x: pt.x, y: pt.y, p, mi, col: byFamily() ? sysColor(partOfMember(mi)) : th.low });
       }
       state.lowsPx = pts.map((q) => [q.x, q.y, q.p, q.mi]);
       pts.sort((a, b) => b.p - a.p);                            // shallow first -> the deepest lows end up on top
@@ -274,7 +285,7 @@
       // two passes (all halos, then all glyphs) so a tight cluster of members reads as one clean red group
       ctx.lineWidth = Math.max(3.5, size * 0.18); ctx.strokeStyle = th.halo;
       for (const q of pts) ctx.strokeText('L', q.x, q.y);
-      for (const q of pts) { ctx.fillStyle = q.k ? th.low2 : th.low; ctx.fillText('L', q.x, q.y); }
+      for (const q of pts) { ctx.fillStyle = q.col; ctx.fillText('L', q.x, q.y); }
       // hPa value directly above each L.  Deepest lows are labelled first; a label that would overlap one
       // already placed is skipped (zoom in and more appear; the cursor read-out lists every low under it).
       ctx.font = `800 ${fs}px ${FONT}`;
@@ -288,7 +299,7 @@
         if (placed.some((o) => r[0] < o[2] && r[2] > o[0] && r[1] < o[3] && r[3] > o[1])) continue;
         placed.push(r);
         ctx.lineWidth = Math.max(3.5, fs * 0.22); ctx.strokeStyle = th.halo; ctx.strokeText(t, cx, cy);
-        ctx.fillStyle = q.k ? th.low2 : th.low; ctx.fillText(t, cx, cy);
+        ctx.fillStyle = q.col; ctx.fillText(t, cx, cy);
       }
     }
 
@@ -310,8 +321,8 @@
     // cursor everywhere on the map and is also refreshed when the frame or product changes.
     const tip = $('#tip');
     const tipLabel = () => (state.product === 'mean'
-      ? (state.family === 'blend' ? 'Blended ensemble mean' : 'Ensemble-mean MSLP')
-      : (state.family === 'blend' ? 'Lowest of all members' : 'Lowest member MSLP'));
+      ? (isBlend(state.family) ? 'Blended ensemble mean' : 'Ensemble-mean MSLP')
+      : (isBlend(state.family) ? 'Lowest of all members' : 'Lowest member MSLP'));
     let lastPt = null;                                           // last pointer position {x, y, ll}
     function valueAt(lat, lon, arr) {
       const g = state.grid;
@@ -334,7 +345,7 @@
     };
     const fmtLat = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'S' : 'N'}`;
     const fmtLon = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'W' : 'E'}`;
-    const memberName = (mi) => (state.family === 'blend' ? fams.blend.members[mi] : fams[state.family].members[mi]);
+    const memberName = (mi) => fams[state.family].members[mi];
     const sb = { pos: $('#sbPos'), val: $('#sbVal'), low: $('#sbLow'), zoom: $('#sbZoom') };
     const updateZoomReadout = () => { sb.zoom.textContent = `ZOOM ${map.getZoom().toFixed(2)}`; };
     function updateTip() {
@@ -345,8 +356,8 @@
       }
       const { x, y, ll } = lastPt;
       const v = valueAt(ll.lat, ll.lng);
-      const blendVals = (state.family === 'blend' && state.grid && state.grid.fam)
-        ? parts.map((k) => [k, valueAt(ll.lat, ll.lng, state.grid.fam[k])]) : null;
+      const blendVals = (isBlend(state.family) && state.grid && state.grid.fam)
+        ? curParts().map((k) => [k, valueAt(ll.lat, ll.lng, state.grid.fam[k])]) : null;
       const hit = Math.max(16, state.lowSize * 0.75);
       const near = state.lowsPx.filter(([px, py]) => Math.hypot(px - x, py - y - state.lowSize * 0.15) < hit).sort((a, b) => a[2] - b[2]);
       let html = '';
@@ -354,9 +365,14 @@
         html += `<div class="tt-val"><i style="background:${classColor(v)}"></i><b>${v.toFixed(1)}</b><span>hPa</span></div>` +
                 `<div class="tt-sub">${shortOf(state.family)} · ${tipLabel()}</div>`;
         if (blendVals && blendVals.every(([, x]) => x != null)) {
-          const dlt = blendVals[1][1] - blendVals[0][1];
-          html += '<div class="tt-fams">' + blendVals.map(([k, x], n) => `<div class="tt-frow"><span class="sw${n ? ' two' : ''}"></span><span>${shortOf(k)}</span><b>${x.toFixed(1)}</b></div>`).join('') +
-                  `<div class="tt-frow tt-d"><span></span><span>${shortOf(parts[1])} − ${shortOf(parts[0])}</span><b>${dlt >= 0 ? '+' : '−'}${Math.abs(dlt).toFixed(1)}</b></div></div>`;
+          const xs = blendVals.map(([, x]) => x);
+          const sgn = (d) => `${d >= 0 ? '+' : '\u2212'}${Math.abs(d).toFixed(1)}`;
+          const diff = blendVals.length === 2
+            ? [`${shortOf(blendVals[1][0])} \u2212 ${shortOf(blendVals[0][0])}`, sgn(xs[1] - xs[0])]
+            : ['Spread (max \u2212 min)', (Math.max(...xs) - Math.min(...xs)).toFixed(1)];
+          html += '<div class="tt-fams">' +
+            blendVals.map(([k, x]) => `<div class="tt-frow"><span class="sw" style="background:${sysColor(k)}"></span><span>${shortOf(k)}</span><b>${x.toFixed(1)}</b></div>`).join('') +
+            `<div class="tt-frow tt-d"><span></span><span>${diff[0]}</span><b>${diff[1]}</b></div></div>`;
         }
       } else {
         html += `<div class="tt-sub">No data here</div>`;
@@ -365,7 +381,7 @@
       if (near.length) {
         const who = state.product === 'min' ? 'Envelope low (lowest member)' : 'Member lows here';
         html += `<div class="tt-lows"><div class="tt-h">${who}</div>` +
-          near.slice(0, 6).map(([, , p, mi]) => `<div class="tt-row"><b class="${byFamily() && partOf(mi) !== parts[0] ? 'two' : ''}">L ${p.toFixed(1)}</b><span>${memberName(mi)}</span></div>`).join('') +
+          near.slice(0, 6).map(([, , p, mi]) => `<div class="tt-row"><b${byFamily() ? ` style="color:${sysColor(partOfMember(mi))}"` : ''}>L ${p.toFixed(1)}</b><span>${memberName(mi)}</span></div>`).join('') +
           (near.length > 6 ? `<div class="tt-more">+${near.length - 6} more</div>` : '') + '</div>';
       }
       sb.pos.textContent = `LAT ${fmtLat(ll.lat)}  LON ${fmtLon(ll.lng)}`;
@@ -460,11 +476,11 @@
         if (!hinge && !lab) return;
         ticks += `<span class="${hinge ? 'hinge' : ''}${lab && v === 1000 ? ' b' : ''}" style="left:${(((k + 1) / n) * 100).toFixed(2)}%">${lab ? v : ''}</span>`;
       });
-      const twoTone = byFamily();
-      const sample = (cls) => `<span class="lg-low${cls}"><i>987</i><b>L</b></span>`;
+      const sample = (col) => `<span class="lg-low"${col ? ` style="--c:${col}"` : ''}><i>987</i><b>L</b></span>`;
+      const bySys = byFamily() ? curParts() : null;
       const lowsRow = P.has_lows
-        ? `<div class="lg-lows">${twoTone ? `${sample('')}<span>${shortOf(parts[0])}</span>${sample(' two')}<span>${shortOf(parts[1])}</span><span class="lg-sep">·</span>` : sample('')}<span>${
-            state.product === 'min' ? 'Local minimum of the lowest-member field' : (state.family === 'blend' ? 'Low centre of any member' : 'Member low centre')} (hPa)</span></div>` : '';
+        ? `<div class="lg-lows">${bySys ? bySys.map((k) => `${sample(sysColor(k))}<span>${shortOf(k)}</span>`).join('') + '<span class="lg-sep">·</span>' : sample('')}<span>${
+            state.product === 'min' ? 'Local minimum of the lowest-member field' : (isBlend(state.family) ? 'Low centre of any member' : 'Member low centre')} (hPa)</span></div>` : '';
       $('#legend').innerHTML =
         `<div class="lg-bar" role="img" aria-label="Colour scale from below ${e[0]} to above ${e[e.length - 1]} hPa">${P.colors.map((c) => `<i style="background:${c}"></i>`).join('')}</div>` +
         `<div class="lg-ticks">${ticks}</div>${lowsRow}`;
@@ -474,10 +490,10 @@
       if (!f) return;
       const P = manifest.products[state.product];
       const F = fams[state.family];
-      const who = state.family === 'blend'
-        ? `BLEND: ${parts.map((k) => fams[k].label).join(' + ')}`.toUpperCase() : F.label.toUpperCase();
-      const nm = state.family === 'blend' ? parts.map((k) => fams[k].members.length).join(' + ') : F.members.length;
-      const suffix = state.family === 'blend' && state.product === 'mean'
+      const ps = curParts();
+      const who = ps ? `BLEND: ${ps.map((k) => fams[k].label).join(' + ')}`.toUpperCase() : F.label.toUpperCase();
+      const nm = ps ? ps.map((k) => fams[k].members.length).join(' + ') : F.members.length;
+      const suffix = ps && state.product === 'mean'
         ? ` — ${F.weighting === 'equal' ? 'EQUAL-WEIGHT' : 'POOLED MEMBERS'}` : '';
       $('#caveLegend').innerHTML =
         `<div class="cv-1">${who} · ${fmtInit(run.init).toUpperCase()} · ${nm} MEMBERS</div>` +
@@ -501,9 +517,12 @@
       updateCaveLegend(f);
       const a = f.avail[state.family];
       const cover = vframes.length < frames.length ? ` · F${pad3(vframes[0].fh)}–F${pad3(vframes[vframes.length - 1].fh)} ONLY` : '';
-      $('#vGrid').textContent = state.family === 'blend'
-        ? `${a.grid_deg}° GRID · ${a.members} MEMBERS (${parts.map((k) => f.avail[k].members).join(' + ')})${cover}`
-        : `${a.grid_deg}° GRID · ${a.members} MEMBERS${cover}`;
+      const ps = curParts();
+      const resNote = [];
+      if (ps) for (const k of ps) { const d = f.avail[k].grid_deg; if (d !== a.grid_deg) resNote.push(`${shortOf(k)} ${d}\u00b0\u2192${a.grid_deg}\u00b0`); }
+      $('#vGrid').textContent = `${a.grid_deg}\u00b0 GRID \u00b7 ${a.members} MEMBERS` +
+        (ps ? ` (${ps.map((k) => f.avail[k].members).join(' + ')})` : '') +
+        (resNote.length ? ` \u00b7 REGRIDDED: ${resNote.join(', ')}` : '') + cover;
       writeHash();
     }
     function setIdx(i) { state.idx = clamp(i, 0, vframes.length - 1); show(); }
@@ -538,6 +557,7 @@
       else if (e.key === '2') setProduct('min');
       else if (e.key === 'g' || e.key === 'G') setFamily('gefs');
       else if (e.key === 'e' || e.key === 'E') setFamily('ifs');
+      else if (e.key === 'c' || e.key === 'C') setFamily('geps');
       else if (e.key === 'b' || e.key === 'B') setFamily('blend');
       else if (e.key === 't' || e.key === 'T') applyTheme(themeName === 'dark' ? 'light' : 'dark', true);
       else if (e.key === 'Escape') closeMenus();
@@ -551,24 +571,46 @@
       });
     }
     // ---- ensemble family (GEFS / ECMWF IFS ENS / Blend) -------------------------------------------
-    const famSub = (k) => (k === 'blend'
-      ? `${parts.map(shortOf).join(' + ')} · ${fams.blend.members.length}` : `${fams[k].org} · ${fams[k].members.length} members`);
-    const FAM_KEY = { gefs: 'G', ifs: 'E', blend: 'B' };
-    $('#famSeg').innerHTML = availableViews.map((k) =>
-      `<button type="button" role="tab" data-act="family" data-family="${k}" aria-selected="false" title="${fams[k].name}${fams[k].note ? ' — ' + fams[k].note : ''} (${FAM_KEY[k] || ''})"><span class="seg-main">${fams[k].label}</span><span class="seg-sub">${famSub(k)}</span></button>`).join('');
-    $('#famMenu').innerHTML = availableViews.map((k) =>
-      `<button type="button" class="mi" role="menuitemradio" data-act="family" data-family="${k}" aria-checked="false"><span class="ck"></span>${fams[k].name}<kbd>${FAM_KEY[k] || ''}</kbd></button>`).join('');
+    const FAM_KEY = { gefs: 'G', ifs: 'E', geps: 'C', blend: 'B' };
+    const seg = bases.map((k) => ({ k, label: fams[k].label, name: fams[k].name, note: fams[k].note, key: FAM_KEY[k] || '' }));
+    if (blendViews.length) seg.push({ k: 'blend', label: 'Blend', name: 'Blend of selected systems', note: 'Tick the systems to blend', key: 'B' });
+    $('#famSeg').innerHTML = seg.map((e) =>
+      `<button type="button" role="tab" data-act="family" data-family="${e.k}" aria-selected="false" title="${e.name}${e.note ? ' \u2014 ' + e.note : ''} (${e.key})"><span class="seg-main">${e.label}</span><span class="seg-sub" data-sub="${e.k}"></span></button>`).join('');
+    $('#famMenu').innerHTML = seg.map((e) =>
+      `<button type="button" class="mi" role="menuitemradio" data-act="family" data-family="${e.k}" aria-checked="false"><span class="ck"></span>${e.name}<kbd>${e.key}</kbd></button>`).join('');
+    $('#blendChips').innerHTML = bases.map((k) =>
+      `<button type="button" class="chip" data-act="blendpart" data-part="${k}" aria-pressed="false" style="--c:${sysColor(k)}"><i></i>${shortOf(k)}</button>`).join('');
+    const blendKeyFor = (sel) => bases.filter((k) => sel.includes(k)).join('_');
     function syncFamilyUI() {
+      const inBlend = isBlend(state.family);
       document.querySelectorAll('[data-act=family]').forEach((b) => {
-        const on = b.dataset.family === state.family;
+        const on = b.dataset.family === 'blend' ? inBlend : b.dataset.family === state.family;
         b.setAttribute(b.getAttribute('role') === 'tab' ? 'aria-selected' : 'aria-checked', String(on));
       });
-      $('#optFamRow').hidden = state.family !== 'blend';
+      bases.forEach((k) => { const el = document.querySelector(`[data-sub="${k}"]`); if (el) el.textContent = `${fams[k].org.replace('/NCEP', '')} \u00b7 ${fams[k].members.length}`; });
+      const bs = document.querySelector('[data-sub="blend"]');
+      if (bs) {
+        const sel = inBlend ? fams[state.family].parts : state.blendSel;
+        bs.textContent = `${sel.length} systems \u00b7 ${sel.reduce((n, k) => n + fams[k].members.length, 0)}`;
+      }
+      $('#blendGroup').hidden = !inBlend;
+      $('#optFamRow').hidden = !inBlend;
+      document.querySelectorAll('[data-act=blendpart]').forEach((b) => {
+        const k = b.dataset.part, sel = state.blendSel, on = sel.includes(k);
+        const next = on ? sel.filter((x) => x !== k) : bases.filter((x) => sel.includes(x) || x === k);
+        b.setAttribute('aria-pressed', String(on));
+        b.disabled = !(next.length >= 2 && availableViews.includes(blendKeyFor(next)));
+        b.title = b.disabled ? (on ? 'A blend needs at least two systems' : 'This combination is not available') : (on ? `Remove ${fams[k].label} from the blend` : `Add ${fams[k].label} to the blend`);
+      });
     }
+    // 'blend' = the combination currently ticked; otherwise a concrete view key (a base system or e.g. gefs_ifs)
+    const resolveView = (k) => (k === 'blend' ? (availableViews.includes(blendKeyFor(state.blendSel)) ? blendKeyFor(state.blendSel) : blendViews[0]) : k);
     function setFamily(k) {
-      if (!availableViews.includes(k) || k === state.family) return;
+      const v = resolveView(k);
+      if (!v || !availableViews.includes(v) || v === state.family) return;
       const wantFh = vframes[state.idx] ? vframes[state.idx].fh : 0;
-      state.family = k;
+      state.family = v;
+      if (isBlend(v)) state.blendSel = fams[v].parts.slice();
       rebuildViewFrames();
       // keep the same forecast hour; if this system does not cover it, show the closest earlier one
       let j = 0;
@@ -579,10 +621,18 @@
       buildLegend();
       state.lows = []; state.grid = null; drawLows(); updateTip();
       if (vframes[j].fh !== wantFh) {
-        setStatus(`${shortOf(k)} has no F${pad3(wantFh)} on this cycle — showing F${pad3(vframes[j].fh)}`);
+        setStatus(`${shortOf(v)} has no F${pad3(wantFh)} on this cycle \u2014 showing F${pad3(vframes[j].fh)}`);
         setTimeout(() => setStatus(''), 3500);
       }
       show();
+    }
+    function toggleBlendPart(k) {
+      const sel = state.blendSel;
+      const next = sel.includes(k) ? sel.filter((x) => x !== k) : bases.filter((x) => sel.includes(x) || x === k);
+      const key = blendKeyFor(next);
+      if (next.length < 2 || !availableViews.includes(key)) return;
+      state.blendSel = next;
+      setFamily(key);
     }
 
     function setProduct(p) {
@@ -644,6 +694,7 @@
       switch (it.dataset.act) {
         case 'product': setProduct(it.dataset.product); break;
         case 'family': setFamily(it.dataset.family); break;
+        case 'blendpart': toggleBlendPart(it.dataset.part); break;
         case 'theme': applyTheme(it.dataset.theme, true); break;
         case 'toggletheme': applyTheme(themeName === 'dark' ? 'light' : 'dark', true); break;
         case 'reset': map.fitBounds(initial); break;
@@ -668,7 +719,12 @@
 
     // ---- go ------------------------------------------------------------------------------------
     if (hash.p && manifest.products[hash.p]) state.product = hash.p;
-    if (hash.e && availableViews.includes(hash.e)) { state.family = hash.e; rebuildViewFrames(); buildTicks(); }
+    const hv = hash.e === 'blend' ? blendViews[0] : hash.e;                  // '#e=blend' (old links) = blend of everything
+    if (hv && availableViews.includes(hv)) {
+      state.family = hv;
+      if (isBlend(hv)) state.blendSel = fams[hv].parts.slice();
+      rebuildViewFrames(); buildTicks();
+    }
     syncProductUI();
     syncFamilyUI();
     applyTheme(themeName, false);
@@ -685,11 +741,12 @@
   }
 
   // ---------------------------------------------------------------------------------------------
-  function gridSummary(frames) {
-    const deg = (f) => Object.values(f.avail)[0].grid_deg;
-    const g = [...new Set(frames.map(deg))].sort((a, b) => a - b);
-    const lo = (r) => frames.filter((f) => deg(f) === r).map((f) => f.fh);
-    return g.map((r) => `${r}° f${pad3(Math.min(...lo(r)))}–f${pad3(Math.max(...lo(r)))}`).join(' · ');
+  function gridSummary(frames, bases) {
+    const deg = (f) => { const k = bases.find((x) => f.avail[x]); return f.avail[k].grid_deg; };
+    const have = frames.filter((f) => bases.some((x) => f.avail[x]));
+    const g = [...new Set(have.map(deg))].sort((a, b) => a - b);
+    const lo = (r) => have.filter((f) => deg(f) === r).map((f) => f.fh);
+    return g.map((r) => `${r}\u00b0 f${pad3(Math.min(...lo(r)))}\u2013f${pad3(Math.max(...lo(r)))}`).join(' \u00b7 ');
   }
   function parseHash() {
     const h = {};

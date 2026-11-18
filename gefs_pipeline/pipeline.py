@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 import time
+from itertools import combinations
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -38,7 +39,8 @@ def make_http(cfg, **over) -> Http:
     if os.environ.get("GITHUB_REPOSITORY"):          # identify ourselves properly when running in Actions
         ua = ua.replace("YOUR-USER/gefs-mslp-viewer", os.environ["GITHUB_REPOSITORY"])
     return Http(user_agent=ua, rps=over.get("rps", f.requests_per_second),
-                host_rps={"ecmwf-forecasts": float(cfg.ifs.requests_per_second)} if hasattr(cfg, "ifs") else None, max_retries=f.max_retries,
+                host_rps={h: float(getattr(cfg, sec).requests_per_second) for h, sec in (("ecmwf-forecasts", "ifs"), ("weather.gc.ca", "geps")) if hasattr(cfg, sec)},
+                max_retries=f.max_retries,
                 backoff_base=f.backoff_base_s, backoff_max=f.backoff_max_s,
                 timeout=(f.timeout_connect_s, f.timeout_read_s))
 
@@ -134,8 +136,22 @@ def _emit(cfg, out_dir: Path, run_id: str, view: str, fh: int, scales: dict, met
                    {"type": "FeatureCollection", "features": feats, "meta": meta, "lows": lw, "grid": grid})
 
 
+def blend_sets(cfg, order: list[str]) -> list[list[str]]:
+    """Family combinations to blend, largest first, each in `order` (e.g. [gefs,ifs,geps], [gefs,ifs], ...)."""
+    if len(order) < 2:
+        return []
+    if not getattr(cfg.blend, "subsets", True):
+        return [list(order)]
+    sets = [list(c) for n in range(len(order), 1, -1) for c in combinations(order, n)]
+    return sets
+
+
+def blend_key(parts: list[str]) -> str:
+    return "_".join(parts)
+
+
 def build_frame(cfg, frames: dict[str, FamilyFrame], order: list[str], fh: int, scales: dict, out_dir: Path,
-                run_id: str, member_offsets: dict[str, int]) -> dict:
+                run_id: str) -> dict:
     """Write every view available for this hour and return the manifest entry."""
     fields = {k: _fields(cfg, frames[k]) for k in order if k in frames}
     avail = {}
@@ -146,34 +162,48 @@ def build_frame(cfg, frames: dict[str, FamilyFrame], order: list[str], fh: int, 
         avail[k] = {"members": f.n, "grid_deg": f.res, "source": f.source}
     valid = next(iter(fields.values())).valid
 
-    # ---- blend: only when every family has this hour ---------------------------------------------------
-    if len(order) > 1 and len(fields) == len(order):
-        if len({f.valid for f in fields.values()}) > 1:
-            log.warning("f%03d: families disagree on the valid time - no blend", fh)
-        else:
-            ref = fields[order[0]]
-            wt = {k: (1.0 if cfg.blend.weighting == "equal" else float(f.n)) for k, f in fields.items()}
-            means = {k: _to_grid(ref.lats, ref.lons, f, f.mean) for k, f in fields.items()}
-            mins = {k: _to_grid(ref.lats, ref.lons, f, f.min) for k, f in fields.items()}
-            num = sum(np.where(np.isfinite(means[k]), means[k], 0.0) * wt[k] for k in fields)
-            den = sum(np.isfinite(means[k]) * wt[k] for k in fields)
-            bmean = np.where(den > 0, num / np.maximum(den, 1e-9), np.nan).astype(np.float32)
-            bmin = mins[order[0]].copy()
-            bowner = _to_grid(ref.lats, ref.lons, ref, ref.owner, True).astype(np.int32) + member_offsets[order[0]]
-            for k in order[1:]:                         # the lowest value wins; its member is the owner there
-                f = fields[k]
-                lower = np.isfinite(mins[k]) & (~np.isfinite(bmin) | (mins[k] < bmin))
-                bmin = np.where(lower, mins[k], bmin)
-                own = _to_grid(ref.lats, ref.lons, f, f.owner, True).astype(np.int32) + member_offsets[k]
-                bowner = np.where(lower, own, bowner)
-            blows = [[lo, la, p, mi + member_offsets[k]] for k in order for lo, la, p, mi in fields[k].lows]
-            n = sum(f.n for f in fields.values())
-            meta = {"fh": fh, "valid": valid, "grid_deg": ref.res, "members": n, "family": "blend",
-                    "source": "+".join(fields[k].source for k in order)}
-            _emit(cfg, out_dir, run_id, "blend", fh, scales, meta, ref.lats, ref.lons, bmean, bmin, blows,
-                  _min_lows(cfg, ref.lats, ref.lons, bmin, bowner),
-                  {k: {"mean": means[k], "min": mins[k]} for k in order})
-            avail["blend"] = {"members": n, "grid_deg": ref.res}
+    # ---- blends: a combination is built only when every family in it has this hour -----------------------
+    todo = [p for p in blend_sets(cfg, order) if all(k in fields for k in p)]
+    if todo and len({f.valid for f in fields.values()}) > 1:
+        log.warning("f%03d: families disagree on the valid time - no blend", fh)
+        todo = []
+    cache: dict[tuple[str, str], np.ndarray] = {}
+    for parts in todo:
+        ref = fields[parts[0]]                              # blend on the first (finest, by config order) grid
+
+        def on_ref(k, name, arr, nearest=False):
+            key = (parts[0], k, name)
+            if key not in cache:
+                cache[key] = _to_grid(ref.lats, ref.lons, fields[k], arr, nearest)
+            return cache[key]
+
+        wt = {k: (1.0 if cfg.blend.weighting == "equal" else float(fields[k].n)) for k in parts}
+        means = {k: on_ref(k, "mean", fields[k].mean) for k in parts}
+        mins = {k: on_ref(k, "min", fields[k].min) for k in parts}
+        num = sum(np.where(np.isfinite(means[k]), means[k], 0.0) * wt[k] for k in parts)
+        den = sum(np.isfinite(means[k]) * wt[k] for k in parts)
+        bmean = np.where(den > 0, num / np.maximum(den, 1e-9), np.nan).astype(np.float32)
+
+        off, offsets = 0, {}                                # member index of each family inside THIS blend's member list
+        for k in parts:
+            offsets[k] = off
+            off += len(frames[k].fam.members)
+        bmin = mins[parts[0]].copy()
+        bowner = on_ref(parts[0], "owner", fields[parts[0]].owner, True).astype(np.int32) + offsets[parts[0]]
+        for k in parts[1:]:                                 # the lowest value wins; its member is the owner there
+            lower = np.isfinite(mins[k]) & (~np.isfinite(bmin) | (mins[k] < bmin))
+            bmin = np.where(lower, mins[k], bmin)
+            own = on_ref(k, "owner", fields[k].owner, True).astype(np.int32) + offsets[k]
+            bowner = np.where(lower, own, bowner)
+        blows = [[lo, la, p, mi + offsets[k]] for k in parts for lo, la, p, mi in fields[k].lows]
+        n = sum(fields[k].n for k in parts)
+        view = blend_key(parts)
+        meta = {"fh": fh, "valid": valid, "grid_deg": ref.res, "members": n, "family": view,
+                "source": "+".join(fields[k].source for k in parts)}
+        _emit(cfg, out_dir, run_id, view, fh, scales, meta, ref.lats, ref.lons, bmean, bmin, blows,
+              _min_lows(cfg, ref.lats, ref.lons, bmin, bowner),
+              {k: {"mean": means[k], "min": mins[k]} for k in parts})
+        avail[view] = {"members": n, "grid_deg": ref.res, "parts": {k: fields[k].n for k in parts}}
     return {"fh": fh, "valid": valid, "avail": avail}
 
 
@@ -191,11 +221,7 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
 
     order = [f.key for f in families]
     fam = {f.key: f for f in families}
-    offsets, off = {}, 0
-    for k in order:
-        offsets[k] = off
-        off += len(fam[k].members)
-    blend_on = len(order) > 1
+    sets = blend_sets(cfg, order)
 
     edges, colors, scale_segments = build_scale(cfg.scale)         # ONE scale shared by every view so they compare directly
     scales = {"mean": (edges, colors), "min": (edges, colors)}
@@ -243,7 +269,7 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
                 ready[k] = ff
             if not ready:
                 continue
-            frames.append(build_frame(cfg, ready, order, fh, scales, data_dir, run_id, offsets))
+            frames.append(build_frame(cfg, ready, order, fh, scales, data_dir, run_id))
             log.info("f%03d done  %s   [%d/%d frames, %.0fs, %d req, %.0f MB]", fh,
                      "  ".join(f"{k}:{v['members']}" for k, v in frames[-1]["avail"].items()),
                      len(frames), len(fhs), time.time() - t0, http.stats.requests, http.stats.bytes / 1e6)
@@ -256,15 +282,18 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
                     "members": list(fam[k].members),
                     "frames": sum(1 for f in frames if k in f["avail"])} for k in order}
     views = list(order)
-    if blend_on:
-        fam_meta["blend"] = {"label": "Blend", "name": " + ".join(fam[k].label for k in order) + " blend", "org": "",
-                             "note": ("Equal-weight mean of the family means (each system counts once)"
-                                      if cfg.blend.weighting == "equal"
-                                      else "Mean of all members pooled (each member counts once)"),
-                             "members": [m for k in order for m in fam[k].members], "parts": order,
-                             "weighting": cfg.blend.weighting,
-                             "frames": sum(1 for f in frames if "blend" in f["avail"])}
-        views.append("blend")
+    for parts in sets:
+        key = blend_key(parts)
+        n_frames = sum(1 for f in frames if key in f["avail"])
+        if not n_frames:
+            continue
+        fam_meta[key] = {"label": "Blend", "name": " + ".join(fam[k].label for k in parts) + " blend", "org": "",
+                         "note": ("Equal-weight mean of the family means (each system counts once)"
+                                  if cfg.blend.weighting == "equal"
+                                  else "Mean of all members pooled (each member counts once)"),
+                         "members": [m for k in parts for m in fam[k].members], "parts": list(parts),
+                         "weighting": cfg.blend.weighting, "frames": n_frames}
+        views.append(key)
     init = run.strftime("%Y-%m-%dT%H:%M:%SZ")
     manifest = {
         "schema": 2,

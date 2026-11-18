@@ -10,6 +10,11 @@ ECMWF layout (verified against the bucket and ECMWF's open-data documentation, I
   <base>/<YYYYMMDD>/<HH>z/ifs/0p25/oper/<YYYYMMDD><HH>0000-<step>h-oper-fc.grib2  (+ .index)
         -> the HRES run, which since 50r1 IS the ensemble control (the old enfo type=cf was retired); ~100 MB
   Messages are located through the .index and fetched with HTTP Range requests (~0.5 MB per field).
+
+  * GepsFamily  - Canadian GEPS (ECCC), MSC Datamart     (21 members: cc00 + cp01..cp20), 0.5 deg, 3-hourly to 192 h,
+                  6-hourly to 384 h on 00/12Z.  One all-member GRIB2 file per step:
+  <base>/<HH>/<hhh>/CMC_geps-raw_PRMSL_MSL_0_latlon0p5x0p5_<YYYYMMDDHH>_P<hhh>_allmbrs.grib2   (~2.2 MB)
+  with <base> = https://dd.weather.gc.ca/<YYYYMMDD>/WXO-DD/ensemble/geps/grib2/raw  (a `today/` form also exists).
 """
 from __future__ import annotations
 
@@ -19,7 +24,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .decode import Grid, decode_message
+from .decode import Grid, decode_message, member_key, split_messages
 from .fetcher import Http, NotFound, find_message, parse_idx, parse_json_index
 from .gefs import choose_product, object_url
 
@@ -188,7 +193,63 @@ class IfsFamily(Family):
 
 
 # =====================================================================================================
-FAMILIES = {"gefs": GefsFamily, "ifs": IfsFamily}
+class GepsFamily(Family):
+    """Canadian GEPS (Environment and Climate Change Canada), MSC Datamart.
+
+    One GRIB2 file per forecast hour holds every member (`..._allmbrs.grib2`, ~2 MB for MSLP), so the whole file is
+    downloaded once per step and split into members; there is no index / byte-range step."""
+    key, label, name, org = "geps", "CMC GEPS", "Canadian GEPS", "ECCC"
+    note = "cc00 is the control member; cp01-cp20 are the perturbed members (member order follows the GRIB ensemble keys)"
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        c = cfg.geps
+        self.members = ["cc00"] + [f"cp{i:02d}" for i in range(1, int(c.n_perturbed) + 1)]
+        self._steps: dict[int, dict] = {}              # fh -> {member: Grid}; filled once per step, shared by all member jobs
+        self._lock = threading.Lock()
+
+    def max_fh(self, run):
+        c = self.cfg.geps
+        return int(c.max_fh) if run.hour in set(c.cycles) else int(c.short_max_fh)
+
+    def _url(self, run: datetime, fh: int) -> str:
+        c = self.cfg.geps
+        base = c.base_url.replace("{date}", f"{run:%Y%m%d}").rstrip("/")
+        return (f"{base}/{run:%H}/{fh:03d}/CMC_geps-raw_{c.variable}_{c.grid}_{run:%Y%m%d%H}_P{fh:03d}_allmbrs.grib2")
+
+    def plan(self, http, run, fh):
+        url = self._url(run, fh)
+        return url if http.exists(url) else None
+
+    def plan_tag(self, plan):
+        return "allmbrs"
+
+    def cycle_ready(self, http, run, fhs):
+        hrs = self.hours(run, fhs)
+        return bool(hrs) and http.exists(self._url(run, hrs[-1])) and http.exists(self._url(run, hrs[0]))
+
+    def _step_grids(self, http, run, url, fh, cache_dir) -> dict:
+        with self._lock:                                # first worker downloads + decodes; the others wait and reuse it
+            if fh in self._steps:
+                return self._steps[fh]
+            cache = cache_dir / f"{run:%Y%m%d%H}" / f"geps.f{fh:03d}.grib2" if cache_dir else None
+            raw = _cached(cache, lambda: http.get_bytes(url))
+            msgs = split_messages(raw)
+            keyed = sorted(range(len(msgs)), key=lambda i: (member_key(msgs[i]), i))   # control first, then by number
+            if len(msgs) != len(self.members):
+                log.warning("f%03d geps: file has %d messages, expected %d members", fh, len(msgs), len(self.members))
+            grids = {}
+            for name, i in zip(self.members, keyed):
+                grids[name] = decode_message(msgs[i], *_bbox(self.cfg))
+            self._steps[fh] = grids
+            return grids
+
+    def fetch_grid(self, http, run, plan, member, fh, cache_dir):
+        return self._step_grids(http, run, plan, fh, cache_dir)[member]
+
+
+# =====================================================================================================
+FAMILIES = {"gefs": GefsFamily, "ifs": IfsFamily, "geps": GepsFamily}
 
 
 def make_families(cfg, keys: list[str] | None = None) -> list[Family]:

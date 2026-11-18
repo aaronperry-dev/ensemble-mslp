@@ -138,7 +138,7 @@ def test_members_and_schedule():
     assert fam.max_fh(RUN.replace(hour=12)) == 360
     assert fam.max_fh(RUN.replace(hour=6)) == 144                          # 06/18Z stop at 144 h
     assert fam.hours(RUN.replace(hour=18), [0, 72, 144, 150, 240]) == [0, 72, 144]
-    assert [f.key for f in make_families(cfg)] == ["gefs", "ifs"]
+    assert [f.key for f in make_families(cfg)] == ["gefs", "ifs", "geps"]
     with pytest.raises(ValueError):
         make_families(cfg, ["nope"])
 

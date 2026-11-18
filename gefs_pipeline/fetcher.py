@@ -153,6 +153,15 @@ class Http:
     def get_text(self, url: str) -> str:
         return self.request("GET", url, ok=(200,)).text
 
+    def get_bytes(self, url: str) -> bytes:
+        """Download a whole (small) object, e.g. the ~2 MB GEPS all-member file; verifies the length when announced."""
+        r = self.request("GET", url, ok=(200,))
+        data = r.content
+        cl = r.headers.get("Content-Length")
+        if cl and cl.isdigit() and int(cl) != len(data):
+            raise FetchError(f"short read for {url}: {len(data)} of {cl} B")
+        return data
+
     def get_range(self, url: str, start: int, end: int | None = None) -> bytes:
         """Fetch bytes [start, end] (inclusive; open-ended if end is None) and validate the reply."""
         rng = f"bytes={start}-{'' if end is None else end}"
