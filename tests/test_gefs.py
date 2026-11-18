@@ -26,6 +26,7 @@ def test_highest_resolution_first_with_fallback():
 
 def test_hours_and_cycle_parse():
     h = forecast_hours(CFG)
-    assert h[0] == 0 and h[-1] == 384 and h[1] - h[0] == 6
+    assert h[0] == 0 and h[-1] == 240 and h[1] - h[0] == 6      # 10 days, all inside the 0.25-deg range
+    assert all(products_for_fh(CFG, x)[0].resolution_deg == 0.25 for x in h)
     assert forecast_hours(CFG, 24) == [0, 6, 12, 18, 24]
     assert parse_cycle("2026111806") == RUN

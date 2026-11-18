@@ -13,7 +13,7 @@ on:
         required: false
         default: ""
       max_fh:
-        description: "Limit forecast hours, e.g. 120 for a quick test (blank = all, to f384)"
+        description: "Limit forecast hours, e.g. 120 for a quick test (blank = all, to f240 = 10 days)"
         required: false
         default: ""
       force:

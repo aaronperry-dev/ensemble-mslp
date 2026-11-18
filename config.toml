@@ -25,8 +25,8 @@ max_fh         = 384
 
 [forecast]
 start = 0
-stop  = 384
-step  = 6                       # 3 is possible out to f240 (0.25-deg) but doubles download volume
+stop  = 240                     # 10 days = f240, the full extent of the 0.25-deg product
+step  = 6                       # 3 is also available at 0.25-deg but doubles download volume (81 frames, ~1.3 GB)
 
 [domain]                        # data extent; the viewer cannot pan/zoom outside it (degrees east is positive)
 west  = -150

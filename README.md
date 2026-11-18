@@ -39,7 +39,7 @@ python -m pytest -q                                     # 26 tests, no network n
 # quick smoke test: 6 members, first 24 h (≈ 65 requests, ≈ 16 MB)
 python -m gefs_pipeline build --out dist --max-fh 24 --members 6
 
-# full production build: 31 members, f000-f384 (≈ 4 000 requests, ≈ 0.8 GB, ~6-10 min)
+# full production build: 31 members, f000-f240 = 10 days (≈ 2 600 requests, ≈ 0.7 GB, ~5 min)
 python -m gefs_pipeline build --out dist
 
 python -m http.server 8000 --directory dist             # open http://localhost:8000
@@ -50,10 +50,10 @@ Useful flags: `--cycle 2026111806` (pin a run), `--max-fh`, `--members N`, `--rp
 
 ## 2. What the pipeline does
 
-1. **Pick the cycle.** Starting at the current time, step back through 00/06/12/18Z until a cycle is *complete* (the last forecast hour exists for all 31 members), so a half-published run is never shown.
+1. **Pick the cycle.** Starting at the current time, step back through 00/06/12/18Z until a cycle is *complete* (the last forecast hour of the 0.25° product exists for all 31 members), so a half-published run is never shown.
 2. **Pick the grid per forecast hour – highest resolution first.**
    `pgrb2sp25` (**0.25°**) is probed first; if the object does not exist, `pgrb2ap5` (0.5°) is used.
-   Verified against the bucket: **0.25° only exists for f000–f240**; f246–f384 exist only at 0.5° (the +270 h GEFS image in your reference set is therefore a 0.5° field). The viewer labels every frame with its grid, and 0.5° frames are cubic-spline-upsampled to 0.25° spacing *for contouring only* so polygons are smooth.
+   Verified against the bucket: **0.25° exists for f000–f240, exactly the 10-day window this project is configured for (`[forecast] stop = 240`)**, so every frame is 0.25°. The 0.5° product is only a safety net if a 0.25° object is missing; it can also serve longer runs (raise `stop` up to 384: f246+ exist only at 0.5° and are cubic-spline-upsampled for contouring). The viewer labels every frame with its grid.
 3. **Download only the MSLP bytes (HTTP Range).**
    For each member × hour the client reads the tiny `.idx` inventory, finds the `PRMSL:mean sea level` record and requests exactly `bytes=start-end`. That is **~0.5 MB instead of the ~13.5 MB file (≈ 25× less)**. Every ranged reply is validated (`206`, `Content-Range`, length, `GRIB…7777` framing) and cached on disk atomically so re-runs are free.
 4. **Decode in memory** (`eccodes`, no temp files), roll longitudes 0…360 → −180…180, flip to south→north, convert Pa → hPa, cut to the configured domain (+ padding).

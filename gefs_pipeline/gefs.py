@@ -48,7 +48,7 @@ def cycle_is_complete(http: Http, cfg, run: datetime, members: list[str], fhs: l
     prods = products_for_fh(cfg, fh)
     if not prods:
         return False
-    p = prods[-1] if len(prods) > 1 else prods[0]  # last-resort product is published last
+    p = prods[0]                                  # highest-resolution product: what frames are fetched from
     return all(http.exists(object_url(cfg, run, p, m, fh) + ".idx") for m in members)
 
 
@@ -60,7 +60,7 @@ def resolve_cycle(http: Http, cfg, fhs: list[int], now: datetime | None = None, 
     members = member_names(cfg)
     for _ in range(lookback):
         # cheap sentinel first: last member, last hour
-        p = products_for_fh(cfg, fhs[-1])[-1]
+        p = products_for_fh(cfg, fhs[-1])[0]
         sentinel = object_url(cfg, run, p, members[-1], fhs[-1]) + ".idx"
         if http.exists(sentinel) and cycle_is_complete(http, cfg, run, members, fhs):
             return run
