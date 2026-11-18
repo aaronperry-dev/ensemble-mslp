@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>GEFS Ensemble MSLP Viewer</title>
+  <title>Ensemble MSLP Viewer — GEFS · ECMWF IFS ENS · Blend</title>
   <meta name="description" content="GEFS ensemble mean sea-level pressure, member low-pressure centres and member-wise minimum MSLP, updated every cycle.">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Crect width=%2724%27 height=%2724%27 fill=%27%23111%27/%3E%3Ccircle cx=%2712%27 cy=%2712%27 r=%2710%27 fill=%27none%27 stroke=%27%234dd0e1%27 stroke-width=%271.6%27/%3E%3Ccircle cx=%2712%27 cy=%2712%27 r=%276%27 fill=%27none%27 stroke=%27%234dd0e1%27 stroke-width=%271.6%27/%3E%3Ccircle cx=%2712%27 cy=%2712%27 r=%272.2%27 fill=%27%234dd0e1%27/%3E%3C/svg%3E">
   <script>/* apply the saved theme before first paint (no flash) */
@@ -16,7 +16,7 @@
   <!-- title bar -->
   <header class="titlebar">
     <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="6.2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="2.2" fill="currentColor"/></svg>
-    <h1>GEFS Ensemble MSLP Viewer</h1>
+    <h1>Ensemble MSLP Viewer</h1>
     <p id="runline" aria-live="polite">Loading…</p>
   </header>
 
@@ -38,6 +38,7 @@
         <div class="ms"></div>
         <div class="mh">Layers</div>
         <label class="mi chk"><span class="ck"><input id="optLows" type="checkbox" checked></span>Low centres (L + hPa)</label>
+        <label class="mi chk" id="optFamRow"><span class="ck"><input id="optFam" type="checkbox" checked></span>Colour blend lows by system</label>
         <label class="mi chk"><span class="ck"><input id="optStates" type="checkbox" checked></span>State / province borders</label>
         <label class="mi chk"><span class="ck"><input id="optGrat" type="checkbox" checked></span>Lat / lon grid</label>
         <label class="mi chk"><span class="ck"><input id="optLakes" type="checkbox" checked></span>Lakes</label>
@@ -45,6 +46,10 @@
         <button type="button" class="mi" role="menuitem" data-act="reset"><span class="ck"></span>Reset view</button>
         <button type="button" class="mi" role="menuitem" data-act="fullscreen"><span class="ck"></span>Full screen</button>
       </div>
+    </div>
+    <div class="menu">
+      <button type="button" class="mb" aria-haspopup="true" aria-expanded="false">Ensemble</button>
+      <div class="dd" role="menu" id="famMenu"></div>
     </div>
     <div class="menu">
       <button type="button" class="mb" aria-haspopup="true" aria-expanded="false">Products</button>
@@ -63,11 +68,18 @@
 
   <!-- toolbar -->
   <div class="toolbar" role="toolbar" aria-label="Viewer toolbar">
-    <div class="tgroup seg" role="tablist" aria-label="Data product">
-      <button type="button" role="tab" data-act="product" data-product="mean" aria-selected="true" title="Ensemble mean + member lows (1)"><span class="seg-main">Ensemble mean</span><span class="seg-sub">+ member lows</span></button>
-      <button type="button" role="tab" data-act="product" data-product="min" aria-selected="false" title="Member-wise minimum (2)"><span class="seg-main">Member minimum</span><span class="seg-sub">lowest of all members</span></button>
+    <div class="tgroup">
+      <span class="tlabel">Ensemble</span>
+      <div class="seg" id="famSeg" role="tablist" aria-label="Ensemble family"></div>
     </div>
     <div class="tgroup">
+      <span class="tlabel">Product</span>
+      <div class="seg" role="tablist" aria-label="Data product">
+        <button type="button" role="tab" data-act="product" data-product="mean" aria-selected="true" title="Ensemble mean + member lows (1)"><span class="seg-main">Ensemble mean</span><span class="seg-sub">+ member lows</span></button>
+        <button type="button" role="tab" data-act="product" data-product="min" aria-selected="false" title="Member-wise minimum (2)"><span class="seg-main">Member minimum</span><span class="seg-sub">lowest of all members</span></button>
+      </div>
+    </div>
+    <div class="tgroup opacity">
       <label class="tlabel" for="opacity">Opacity</label>
       <input id="opacity" type="range" min="20" max="100" value="85" aria-label="Data opacity">
     </div>
@@ -121,11 +133,16 @@
         <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>Previous / next forecast hour</td></tr>
         <tr><td><kbd>Space</kbd></td><td>Play / pause</td></tr>
         <tr><td><kbd>1</kbd> <kbd>2</kbd></td><td>Ensemble mean + lows / Member minimum</td></tr>
+        <tr><td><kbd>G</kbd> <kbd>E</kbd> <kbd>B</kbd></td><td>GEFS / ECMWF IFS ENS / Blend of both</td></tr>
         <tr><td><kbd>T</kbd></td><td>Switch dark / light theme</td></tr>
       </table>
-      <h3>Data</h3>
-      <p>Forecast: NOAA/NCEP GEFS via the NOAA Open Data Dissemination programme (AWS). Basemap: Natural Earth. Colour schemes: ColorBrewer (RdYlBu, Blues, RdPu). Map engine: Leaflet.</p>
-      <p>The “L” markers are local pressure minima below the threshold shown in the legend. In the minimum product, each L is attributed to the member that supplies the lowest value there.</p>
+      <h3>Ensembles &amp; blend</h3>
+      <p><b>GEFS</b> – NOAA/NCEP Global Ensemble Forecast System, 31 members (control + 30). <b>ECMWF IFS ENS</b> – 51 members (the IFS control, which is the HRES run, plus 50 perturbed members). Both are used at 0.25° on the same cycle and valid times.</p>
+      <p><b>Blend</b> – the ensemble mean is the equal-weight average of the two family means (each system counts once; configurable to pooled-member weighting). The member minimum is the lowest value over all members of both systems. L markers are the low centres of every member of both systems, coloured by system; in the minimum product each L is credited to the member that supplies the lowest value there. The cursor read-out lists each system's value and the difference.</p>
+      <p>ECMWF's 06/18Z runs only reach 6 days, so on such a cycle the ECMWF and blend views end at F144.</p>
+      <h3>Data &amp; licences</h3>
+      <p>NOAA/NCEP GEFS via the NOAA Open Data Dissemination programme (AWS). ECMWF IFS ENS open data, © European Centre for Medium-Range Weather Forecasts (ECMWF), published under the <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a> licence; source www.ecmwf.int. The data shown here have been processed (decoded, subset to the map area, contoured, averaged and blended); ECMWF does not accept any liability for errors or omissions in the data or in this processing. Basemap: Natural Earth. Colour schemes: ColorBrewer. Map engine: Leaflet.</p>
+      <p>The “L” markers are local pressure minima below the threshold shown in the legend.</p>
       <div class="dlg-actions"><button class="tbtn" value="close">Close</button></div>
     </form>
   </dialog>

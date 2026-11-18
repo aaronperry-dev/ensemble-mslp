@@ -1,4 +1,10 @@
-"""Orchestration: resolve cycle -> (prefetching) fetch members -> products -> static files + manifest."""
+"""Orchestration: resolve cycle -> (prefetching) fetch every family's members -> per-family + blended products
+-> static files + manifest.
+
+Views written for each forecast hour (data/<run>/<view>/<product>/fNNN.json):
+    views    gefs | ifs | blend        (blend only when both families have that hour)
+    products mean (filled contours + member lows) | min (member-wise minimum envelope + its low centres)
+"""
 from __future__ import annotations
 
 import logging
@@ -7,18 +13,21 @@ import shutil
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+from scipy.interpolate import RegularGridInterpolator
 
 from . import __version__
-from .config import ROOT, member_names
-from .decode import DecodeError, Grid, decode_message
-from .fetcher import FetchError, Http, NotFound, find_message, parse_idx
-from .gefs import choose_product, forecast_hours, object_url
+from .config import ROOT
+from .decode import DecodeError, Grid
+from .fetcher import FetchError, Http, NotFound
 from .palette import build_scale
 from .products import (contour_bands, detect_lows, ensemble_mean, ensemble_min, sample_grid, upsample, write_json)
+from .sources import Family
 
 log = logging.getLogger("gefs.pipeline")
 
@@ -28,100 +37,151 @@ def make_http(cfg, **over) -> Http:
     ua = f.user_agent
     if os.environ.get("GITHUB_REPOSITORY"):          # identify ourselves properly when running in Actions
         ua = ua.replace("YOUR-USER/gefs-mslp-viewer", os.environ["GITHUB_REPOSITORY"])
-    return Http(user_agent=ua, rps=over.get("rps", f.requests_per_second), max_retries=f.max_retries,
+    return Http(user_agent=ua, rps=over.get("rps", f.requests_per_second),
+                host_rps={"ecmwf-forecasts": float(cfg.ifs.requests_per_second)} if hasattr(cfg, "ifs") else None, max_retries=f.max_retries,
                 backoff_base=f.backoff_base_s, backoff_max=f.backoff_max_s,
                 timeout=(f.timeout_connect_s, f.timeout_read_s))
 
 
 # ---------------------------------------------------------------------------------------------------
-# one member / one hour
+# one family, one hour -> fields
 # ---------------------------------------------------------------------------------------------------
-def fetch_member_grid(http: Http, cfg, run: datetime, product, member: str, fh: int, cache_dir: Path | None) -> Grid:
-    """idx lookup + byte-range GET of the single MSLP message (cached on disk), then decode+subset."""
-    d = cfg.domain
-    pad = float(d.pad_deg)
-    bbox = (d.west - pad, d.east + pad, d.south - pad, d.north + pad)
-    url = object_url(cfg, run, product, member, fh)
-    cache = cache_dir / f"{run:%Y%m%d%H}" / f"{member}.{product.dir}.f{fh:03d}.grib2" if cache_dir else None
-    raw = None
-    if cache and cache.exists():
-        raw = cache.read_bytes()
-    if raw is None:
-        entries = parse_idx(http.get_text(url + ".idx"))
-        start, end = find_message(entries, cfg.source.variable, cfg.source.level)
-        raw = http.get_range(url, start, end)
-        if cache:
-            cache.parent.mkdir(parents=True, exist_ok=True)
-            tmp = cache.with_suffix(".tmp")
-            tmp.write_bytes(raw)
-            os.replace(tmp, cache)        # atomic: an interrupted run never leaves a half-written file
-    return decode_message(raw, *bbox)
+@dataclass
+class FamilyFrame:
+    fam: Family
+    plan: object
+    grids: dict[str, Grid]          # members that arrived (same grid as the reference member)
+    names: list[str]                # ... in family order
 
 
-# ---------------------------------------------------------------------------------------------------
-# frame products
-# ---------------------------------------------------------------------------------------------------
-def build_frame(cfg, grids: dict[str, Grid], members: list[str], fh: int, product, scales: dict,
-                out_dir: Path, run_id: str) -> dict:
-    """Write mean/min frame files and return the manifest entry."""
-    names = [m for m in members if m in grids]
+def _usable(fam: Family, grids: dict[str, Grid], fh: int) -> FamilyFrame | None:
+    names = [m for m in fam.members if m in grids]
+    if not names:
+        return None
     ref = grids[names[0]]
     ok = [m for m in names if grids[m].values.shape == ref.values.shape]
     if len(ok) < len(names):
-        log.warning("f%03d: dropped %d members with a different grid", fh, len(names) - len(ok))
-    stack = np.stack([grids[m].values for m in ok])
-    d = cfg.domain
-    meta = {"fh": fh, "valid": ref.valid_time, "grid_deg": ref.res, "members": len(ok), "source": product.dir}
-    prec = int(cfg.contours.precision)
-    f3 = f"f{fh:03d}"
+        log.warning("f%03d %s: dropped %d members with a different grid", fh, fam.key, len(names) - len(ok))
+    return FamilyFrame(fam, None, {m: grids[m] for m in ok}, ok)
 
-    # --- product 1: ensemble mean + every member's low-pressure centres --------------------------------
+
+def _fields(cfg, ff: FamilyFrame) -> SimpleNamespace:
+    """Mean, minimum, member lows and minimum-envelope lows for one family on its native grid."""
+    d = cfg.domain
+    dom = (d.west, d.east, d.south, d.north)
+    names = ff.names
+    ref = ff.grids[names[0]]
+    stack = np.stack([ff.grids[m].values for m in names])
+    midx = {m: i for i, m in enumerate(ff.fam.members)}
+    to_member = np.array([midx[m] for m in names])
+
     mean = ensemble_mean(stack)
-    la, lo, z = upsample(ref.lats, ref.lons, mean, float(cfg.contours.upsample_to_deg))
-    feats = contour_bands(la, lo, z, scales["mean"][0], prec)
+    mn = ensemble_min(stack)
+    owner = to_member[np.argmin(np.where(np.isfinite(stack), stack, np.inf), axis=0)]   # family-member index at each cell
+
     L = cfg.lows
     lows = []
-    for mi, m in enumerate(members):
-        if m not in ok:
-            continue
-        g = grids[m]
+    for m in names:
+        g = ff.grids[m]
         for lon, lat, p in detect_lows(g.lats, g.lons, g.values, threshold_hpa=L.threshold_hpa, radius_deg=L.radius_deg,
-                                       smooth_deg=L.smooth_deg, min_sep_deg=L.min_separation_deg,
-                                       domain=(d.west, d.east, d.south, d.north)):
-            lows.append([round(lon, 2), round(lat, 2), round(p, 1), mi])
-    dom = (d.west, d.east, d.south, d.north)
-    tip_deg = float(cfg.tooltip.grid_deg)
-    write_json(out_dir / run_id / "mean" / f"{f3}.json",
-               {"type": "FeatureCollection", "features": feats, "meta": meta, "lows": lows,
-                "grid": sample_grid(ref.lats, ref.lons, mean, domain=dom, step_deg=tip_deg)})
+                                       smooth_deg=L.smooth_deg, min_sep_deg=L.min_separation_deg, domain=dom):
+            lows.append([round(lon, 2), round(lat, 2), round(p, 1), midx[m]])
+    return SimpleNamespace(lats=ref.lats, lons=ref.lons, mean=mean, min=mn, owner=owner, lows=lows,
+                           n=len(names), res=ref.res, valid=ref.valid_time, source=ff.fam.plan_tag(ff.plan))
 
-    # --- product 2: member-wise minimum -------------------------------------------------------------
-    mn = ensemble_min(stack)
-    la, lo, z = upsample(ref.lats, ref.lons, mn, float(cfg.contours.upsample_to_deg))
-    feats = contour_bands(la, lo, z, scales["min"][0], prec)
-    # low centres of the envelope; each is attributed to the member that supplies the minimum at that cell
+
+def _min_lows(cfg, lats, lons, mn, owner, offset: int = 0):
+    """Low centres of a minimum field, each attributed to the member that supplies the minimum there."""
+    d = cfg.domain
     LM = cfg.lows_min
-    owner = np.argmin(np.where(np.isfinite(stack), stack, np.inf), axis=0)       # index into `ok`
-    midx = {m: i for i, m in enumerate(members)}
-    mlows = []
-    for lon, lat, p in detect_lows(ref.lats, ref.lons, mn, threshold_hpa=LM.threshold_hpa, radius_deg=LM.radius_deg,
-                                   smooth_deg=LM.smooth_deg, min_sep_deg=LM.min_separation_deg, domain=dom):
-        j = int(np.argmin(np.abs(ref.lats - lat)))
-        i = int(np.argmin(np.abs(ref.lons - lon)))
-        mlows.append([round(lon, 2), round(lat, 2), round(p, 1), midx[ok[int(owner[j, i])]]])
-    write_json(out_dir / run_id / "min" / f"{f3}.json",
-               {"type": "FeatureCollection", "features": feats, "meta": meta, "lows": mlows,
-                "grid": sample_grid(ref.lats, ref.lons, mn, domain=dom, step_deg=tip_deg)})
+    out = []
+    for lon, lat, p in detect_lows(lats, lons, mn, threshold_hpa=LM.threshold_hpa, radius_deg=LM.radius_deg,
+                                   smooth_deg=LM.smooth_deg, min_sep_deg=LM.min_separation_deg,
+                                   domain=(d.west, d.east, d.south, d.north)):
+        j = int(np.argmin(np.abs(lats - lat)))
+        i = int(np.argmin(np.abs(lons - lon)))
+        out.append([round(lon, 2), round(lat, 2), round(p, 1), int(owner[j, i]) + offset])
+    return out
 
-    return {**meta, "n_lows": len(lows), "n_lows_min": len(mlows), "mean_hpa": [round(float(np.nanmin(mean)), 1), round(float(np.nanmax(mean)), 1)],
-            "min_hpa": [round(float(np.nanmin(mn)), 1), round(float(np.nanmax(mn)), 1)]}
+
+def _to_grid(lats, lons, f: SimpleNamespace, field: np.ndarray, nearest: bool = False) -> np.ndarray:
+    """Resample `field` (on f's grid) onto (lats, lons).  A no-op when the grids already match (the normal case)."""
+    if f.lats.shape == lats.shape and f.lons.shape == lons.shape and np.allclose(f.lats, lats) and np.allclose(f.lons, lons):
+        return field
+    interp = RegularGridInterpolator((f.lats, f.lons), field.astype(np.float64), method="nearest" if nearest else "linear",
+                                     bounds_error=False, fill_value=np.nan)
+    la, lo = np.meshgrid(lats, lons, indexing="ij")
+    return interp((la, lo)).astype(field.dtype)
+
+
+# ---------------------------------------------------------------------------------------------------
+# writing one view
+# ---------------------------------------------------------------------------------------------------
+def _emit(cfg, out_dir: Path, run_id: str, view: str, fh: int, scales: dict, meta: dict, lats, lons,
+          mean, mn, lows, mlows, per_family: dict | None = None) -> None:
+    d = cfg.domain
+    dom = (d.west, d.east, d.south, d.north)
+    prec = int(cfg.contours.precision)
+    tip = float(cfg.tooltip.grid_deg)
+    f3 = f"f{fh:03d}"
+    for prod, field, lw in (("mean", mean, lows), ("min", mn, mlows)):
+        la, lo, z = upsample(lats, lons, field, float(cfg.contours.upsample_to_deg))
+        feats = contour_bands(la, lo, z, scales[prod][0], prec)
+        grid = sample_grid(lats, lons, field, domain=dom, step_deg=tip)
+        if per_family:                                  # blend: also ship each family's own value for the read-out
+            grid["fam"] = {k: sample_grid(lats, lons, v[prod], domain=dom, step_deg=tip)["v"] for k, v in per_family.items()}
+        write_json(out_dir / run_id / view / prod / f"{f3}.json",
+                   {"type": "FeatureCollection", "features": feats, "meta": meta, "lows": lw, "grid": grid})
+
+
+def build_frame(cfg, frames: dict[str, FamilyFrame], order: list[str], fh: int, scales: dict, out_dir: Path,
+                run_id: str, member_offsets: dict[str, int]) -> dict:
+    """Write every view available for this hour and return the manifest entry."""
+    fields = {k: _fields(cfg, frames[k]) for k in order if k in frames}
+    avail = {}
+    for k, f in fields.items():
+        meta = {"fh": fh, "valid": f.valid, "grid_deg": f.res, "members": f.n, "source": f.source, "family": k}
+        _emit(cfg, out_dir, run_id, k, fh, scales, meta, f.lats, f.lons, f.mean, f.min, f.lows,
+              _min_lows(cfg, f.lats, f.lons, f.min, f.owner), None)
+        avail[k] = {"members": f.n, "grid_deg": f.res, "source": f.source}
+    valid = next(iter(fields.values())).valid
+
+    # ---- blend: only when every family has this hour ---------------------------------------------------
+    if len(order) > 1 and len(fields) == len(order):
+        if len({f.valid for f in fields.values()}) > 1:
+            log.warning("f%03d: families disagree on the valid time - no blend", fh)
+        else:
+            ref = fields[order[0]]
+            wt = {k: (1.0 if cfg.blend.weighting == "equal" else float(f.n)) for k, f in fields.items()}
+            means = {k: _to_grid(ref.lats, ref.lons, f, f.mean) for k, f in fields.items()}
+            mins = {k: _to_grid(ref.lats, ref.lons, f, f.min) for k, f in fields.items()}
+            num = sum(np.where(np.isfinite(means[k]), means[k], 0.0) * wt[k] for k in fields)
+            den = sum(np.isfinite(means[k]) * wt[k] for k in fields)
+            bmean = np.where(den > 0, num / np.maximum(den, 1e-9), np.nan).astype(np.float32)
+            bmin = mins[order[0]].copy()
+            bowner = _to_grid(ref.lats, ref.lons, ref, ref.owner, True).astype(np.int32) + member_offsets[order[0]]
+            for k in order[1:]:                         # the lowest value wins; its member is the owner there
+                f = fields[k]
+                lower = np.isfinite(mins[k]) & (~np.isfinite(bmin) | (mins[k] < bmin))
+                bmin = np.where(lower, mins[k], bmin)
+                own = _to_grid(ref.lats, ref.lons, f, f.owner, True).astype(np.int32) + member_offsets[k]
+                bowner = np.where(lower, own, bowner)
+            blows = [[lo, la, p, mi + member_offsets[k]] for k in order for lo, la, p, mi in fields[k].lows]
+            n = sum(f.n for f in fields.values())
+            meta = {"fh": fh, "valid": valid, "grid_deg": ref.res, "members": n, "family": "blend",
+                    "source": "+".join(fields[k].source for k in order)}
+            _emit(cfg, out_dir, run_id, "blend", fh, scales, meta, ref.lats, ref.lons, bmean, bmin, blows,
+                  _min_lows(cfg, ref.lats, ref.lons, bmin, bowner),
+                  {k: {"mean": means[k], "min": mins[k]} for k in order})
+            avail["blend"] = {"members": n, "grid_deg": ref.res}
+    return {"fh": fh, "valid": valid, "avail": avail}
 
 
 # ---------------------------------------------------------------------------------------------------
 # full build
 # ---------------------------------------------------------------------------------------------------
-def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, workers: int, members: list[str],
-          fhs: list[int], min_frames: int = 1) -> dict:
+def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, workers: int,
+          families: list[Family], fhs: list[int], min_frames: int = 1) -> dict:
     site_src = ROOT / "site"
     out.mkdir(parents=True, exist_ok=True)
     shutil.copytree(site_src, out, dirs_exist_ok=True)               # viewer + basemap
@@ -129,17 +189,31 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
     run_id = f"{run:%Y%m%d}_{run:%H}"
     shutil.rmtree(data_dir / run_id, ignore_errors=True)
 
-    edges, colors, scale_segments = build_scale(cfg.scale)         # one scale, shared by both products
+    order = [f.key for f in families]
+    fam = {f.key: f for f in families}
+    offsets, off = {}, 0
+    for k in order:
+        offsets[k] = off
+        off += len(fam[k].members)
+    blend_on = len(order) > 1
+
+    edges, colors, scale_segments = build_scale(cfg.scale)         # ONE scale shared by every view so they compare directly
     scales = {"mean": (edges, colors), "min": (edges, colors)}
-    min_members = max(1, int(np.ceil(len(members) * float(cfg.fetch.min_member_fraction))))
+    need = {k: max(1, int(np.ceil(len(fam[k].members) * float(cfg.fetch.min_member_fraction)))) for k in order}
     t0 = time.time()
 
     def submit(pool, fh):
-        product = choose_product(http, cfg, run, fh)
-        if product is None:
-            log.error("f%03d: not available in any product - skipped", fh)
-            return fh, None, {}
-        return fh, product, {m: pool.submit(fetch_member_grid, http, cfg, run, product, m, fh, cache_dir) for m in members}
+        jobs = {}
+        for k in order:
+            f = fam[k]
+            if fh > f.max_fh(run):
+                continue                                              # e.g. IFS 06/18Z runs stop at 144 h
+            plan = f.plan(http, run, fh)
+            if plan is None:
+                log.warning("f%03d: %s not published - skipped", fh, k)
+                continue
+            jobs[k] = (plan, {m: pool.submit(f.fetch_grid, http, run, plan, m, fh, cache_dir) for m in f.members})
+        return fh, jobs
 
     frames: list[dict] = []
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="fetch") as pool:
@@ -149,35 +223,58 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
         for _ in range(min(2, len(todo))):
             queue.append(submit(pool, todo.popleft()))
         while queue:
-            fh, product, futs = queue.popleft()
+            fh, jobs = queue.popleft()
             if todo:
                 queue.append(submit(pool, todo.popleft()))
-            grids: dict[str, Grid] = {}
-            for m, fut in futs.items():
-                try:
-                    grids[m] = fut.result()
-                except (NotFound, FetchError, DecodeError, KeyError) as e:
-                    log.warning("f%03d %s: %s", fh, m, e)
-            if len(grids) < min_members:
-                log.error("f%03d: only %d/%d members (need %d) - frame skipped", fh, len(grids), len(members), min_members)
+            ready: dict[str, FamilyFrame] = {}
+            for k, (plan, futs) in jobs.items():
+                grids: dict[str, Grid] = {}
+                for m, fut in futs.items():
+                    try:
+                        grids[m] = fut.result()
+                    except (NotFound, FetchError, DecodeError, KeyError) as e:
+                        log.warning("f%03d %s %s: %s", fh, k, m, repr(e) if not str(e) else e)
+                ff = _usable(fam[k], grids, fh)
+                if ff is None or len(ff.names) < need[k]:
+                    log.error("f%03d %s: only %d/%d members (need %d) - family skipped for this hour",
+                              fh, k, 0 if ff is None else len(ff.names), len(fam[k].members), need[k])
+                    continue
+                ff.plan = plan
+                ready[k] = ff
+            if not ready:
                 continue
-            frames.append(build_frame(cfg, grids, members, fh, product, scales, data_dir, run_id))
-            log.info("f%03d done  %s %.2f deg  %d members  %d lows   [%d/%d frames, %.0fs, %d req, %.0f MB]",
-                     fh, product.dir, frames[-1]["grid_deg"], frames[-1]["members"], frames[-1]["n_lows"],
+            frames.append(build_frame(cfg, ready, order, fh, scales, data_dir, run_id, offsets))
+            log.info("f%03d done  %s   [%d/%d frames, %.0fs, %d req, %.0f MB]", fh,
+                     "  ".join(f"{k}:{v['members']}" for k, v in frames[-1]["avail"].items()),
                      len(frames), len(fhs), time.time() - t0, http.stats.requests, http.stats.bytes / 1e6)
 
     if len(frames) < min_frames:
         raise RuntimeError(f"only {len(frames)} frame(s) built (need >= {min_frames})")
     frames.sort(key=lambda f: f["fh"])
+
+    fam_meta = {k: {"label": fam[k].label, "name": fam[k].name, "org": fam[k].org, "note": fam[k].note,
+                    "members": list(fam[k].members),
+                    "frames": sum(1 for f in frames if k in f["avail"])} for k in order}
+    views = list(order)
+    if blend_on:
+        fam_meta["blend"] = {"label": "Blend", "name": " + ".join(fam[k].label for k in order) + " blend", "org": "",
+                             "note": ("Equal-weight mean of the family means (each system counts once)"
+                                      if cfg.blend.weighting == "equal"
+                                      else "Mean of all members pooled (each member counts once)"),
+                             "members": [m for k in order for m in fam[k].members], "parts": order,
+                             "weighting": cfg.blend.weighting,
+                             "frames": sum(1 for f in frames if "blend" in f["avail"])}
+        views.append("blend")
     init = run.strftime("%Y-%m-%dT%H:%M:%SZ")
     manifest = {
-        "schema": 1,
+        "schema": 2,
         "generator": f"gefs-mslp-viewer {__version__}",
         "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "run": {"id": run_id, "model": "GEFS", "init": init, "cycle": f"{run:%H}", "date": f"{run:%Y%m%d}"},
+        "run": {"id": run_id, "init": init, "cycle": f"{run:%H}", "date": f"{run:%Y%m%d}"},
         "domain": {"west": cfg.domain.west, "east": cfg.domain.east, "south": cfg.domain.south, "north": cfg.domain.north,
                    "initial": list(cfg.domain.initial_view)},
-        "members": members,
+        "families": fam_meta,
+        "views": views,
         "lows_threshold_hpa": cfg.lows.threshold_hpa,
         "products": {
             k: {"title": getattr(cfg.products, k).title, "short": getattr(cfg.products, k).short,

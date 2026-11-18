@@ -142,3 +142,10 @@ def test_rate_limiter_spaces_requests():
     for _ in range(5):
         rl.wait()
     assert time.monotonic() - t0 >= 0.19   # 4 gaps x 50 ms
+
+
+def test_per_host_rate_limit_is_separate_from_the_default():
+    h = Http(user_agent="t", rps=100, host_rps={"ecmwf-forecasts": 2})
+    assert h._limiter_for("https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com/x") is h.host_limiters["ecmwf-forecasts"]
+    assert h._limiter_for("https://noaa-gefs-pds.s3.amazonaws.com/x") is h.limiter
+    assert h.host_limiters["ecmwf-forecasts"].interval == pytest.approx(0.5)

@@ -1,15 +1,16 @@
-name: Build & deploy GEFS MSLP viewer
+name: Build & deploy ensemble MSLP viewer
 
 on:
   schedule:
-    # GEFS cycles (00/06/12/18Z) finish publishing roughly 4.5-5.5 h after cycle time.
-    # The pipeline selects the newest *complete* cycle itself and skips the deploy when the live
-    # site already serves it, so being a little early or late here is harmless.
-    - cron: "25 5,11,17,23 * * *"
+    # Both ensembles are built from the same cycle ([run] cycles in config.toml = 00Z and 12Z, the cycles on which
+    # ECMWF ENS runs to day 15).  GEFS has finished ~5 h after cycle time, ECMWF open data ~7.5-9 h after.
+    # The pipeline selects the newest cycle that is *complete for both families* and skips the deploy when the live
+    # site already serves it, so the extra late attempts (09:35 / 21:35) only do work if the first one was too early.
+    - cron: "35 8,9,20,21 * * *"
   workflow_dispatch:
     inputs:
       cycle:
-        description: "Force a cycle YYYYMMDDHH (blank = newest complete cycle)"
+        description: "Force a cycle YYYYMMDDHH (blank = newest cycle complete for both ensembles)"
         required: false
         default: ""
       max_fh:
@@ -68,7 +69,7 @@ jobs:
           cache-dependency-path: requirements*.txt
       - run: pip install -r requirements.txt
 
-      - name: Resolve newest complete GEFS cycle
+      - name: Resolve newest cycle complete for GEFS and ECMWF IFS ENS
         id: resolve
         env:
           IN_CYCLE: ${{ inputs.cycle }}
@@ -85,7 +86,7 @@ jobs:
           fi
           python -m gefs_pipeline resolve-cycle "${args[@]}"
 
-      # Raw GRIB messages (~0.5 MB each, ~0.8 GB per cycle) are only cached when a build FAILS, so a re-run of the
+      # Raw GRIB messages (~0.5 MB each, ~1.7 GB per cycle for both ensembles) are only cached when a build FAILS, so a re-run of the
       # same cycle resumes instead of re-downloading - without burning the repository's 10 GB cache quota every run.
       - name: Restore cached GRIB messages (resume after a failed run)
         if: steps.resolve.outputs.skip != 'true'

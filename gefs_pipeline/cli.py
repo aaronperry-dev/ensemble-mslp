@@ -9,17 +9,20 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import ROOT, load_config, member_names
-from .gefs import forecast_hours, parse_cycle, resolve_cycle
+from .config import ROOT, load_config
+from .gefs import forecast_hours, parse_cycle
 from .pipeline import build, make_http
+from .sources import make_families, resolve_cycle
 
 
 def _common(p: argparse.ArgumentParser):
     p.add_argument("--config", default=None, help="path to config.toml")
     p.add_argument("--cycle", default=None, help="model cycle YYYYMMDDHH (default: newest complete cycle)")
     p.add_argument("--max-fh", type=int, default=None, help="limit forecast hours (testing)")
-    p.add_argument("--members", type=int, default=None, help="use only the first N members (testing)")
-    p.add_argument("--base-url", default=None, help="override bucket URL (testing / mirrors)")
+    p.add_argument("--members", type=int, default=None, help="use only the first N members of each family (testing)")
+    p.add_argument("--families", default=None, help="comma-separated ensemble families to build, e.g. gefs,ifs (default: config [run].families)")
+    p.add_argument("--base-url", default=None, help="override the GEFS bucket URL (testing / mirrors)")
+    p.add_argument("--ifs-base-url", default=None, help="override the ECMWF bucket URL (testing / mirrors)")
     p.add_argument("--rps", type=float, default=None, help="override requests-per-second cap")
     p.add_argument("-v", "--verbose", action="store_true")
 
@@ -30,12 +33,15 @@ def _setup(args):
     cfg = load_config(args.config)
     if args.base_url:
         cfg.source.base_url = args.base_url.rstrip("/")
-    members = member_names(cfg)
+    if args.ifs_base_url:
+        cfg.ifs.base_url = args.ifs_base_url.rstrip("/")
+    families = make_families(cfg, [k.strip() for k in args.families.split(",")] if args.families else None)
     if args.members:
-        members = members[: args.members]
+        for f in families:
+            f.members = f.members[: args.members]
     http = make_http(cfg, **({"rps": args.rps} if args.rps else {}))
     fhs = forecast_hours(cfg, args.max_fh)
-    return cfg, members, http, fhs
+    return cfg, families, http, fhs
 
 
 def _deployed_run(url: str) -> str | None:
@@ -48,8 +54,8 @@ def _deployed_run(url: str) -> str | None:
 
 
 def cmd_resolve(args) -> int:
-    cfg, members, http, fhs = _setup(args)
-    run = parse_cycle(args.cycle) if args.cycle else resolve_cycle(http, cfg, fhs)
+    cfg, families, http, fhs = _setup(args)
+    run = parse_cycle(args.cycle) if args.cycle else resolve_cycle(http, cfg, families, fhs)
     cyc = run.strftime("%Y%m%d%H")
     run_id = f"{run:%Y%m%d}_{run:%H}"
     skip = bool(args.skip_if_deployed and _deployed_run(args.skip_if_deployed) == run_id)
@@ -61,13 +67,13 @@ def cmd_resolve(args) -> int:
 
 
 def cmd_build(args) -> int:
-    cfg, members, http, fhs = _setup(args)
-    run = parse_cycle(args.cycle) if args.cycle else resolve_cycle(http, cfg, fhs)
-    logging.getLogger("gefs").info("building GEFS %s  |  %d members  |  %d forecast hours (f%03d-f%03d)",
-                                   run.strftime("%Y-%m-%d %HZ"), len(members), len(fhs), fhs[0], fhs[-1])
+    cfg, families, http, fhs = _setup(args)
+    run = parse_cycle(args.cycle) if args.cycle else resolve_cycle(http, cfg, families, fhs)
+    logging.getLogger("gefs").info("building %s  |  %s  |  %d forecast hours (f%03d-f%03d)", run.strftime("%Y-%m-%d %HZ"),
+                                   " + ".join(f"{f.label} ({len(f.members)})" for f in families), len(fhs), fhs[0], fhs[-1])
     cache = None if args.no_cache else Path(args.cache_dir)
     build(cfg, run=run, out=Path(args.out), cache_dir=cache, http=http, workers=args.workers or int(cfg.fetch.workers),
-          members=members, fhs=fhs, min_frames=args.min_frames)
+          families=families, fhs=fhs, min_frames=args.min_frames)
     return 0
 
 

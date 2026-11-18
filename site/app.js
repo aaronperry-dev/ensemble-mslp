@@ -1,9 +1,11 @@
-/* GEFS ensemble MSLP viewer — Leaflet, no build step, no external runtime dependencies.
+/* Ensemble MSLP viewer (NOAA GEFS, ECMWF IFS ENS, and their blend) — Leaflet, no build step, no runtime deps.
  *
- * Data contract (written by gefs_pipeline):
- *   data/manifest.json                         run info, products (class edges + ColorBrewer colours), frames
- *   data/<run>/<product>/fNNN.json             GeoJSON FeatureCollection of filled contour bands
- *                                              ("mean" also carries `lows`: [[lon, lat, hPa, memberIdx], ...])
+ * Data contract (written by gefs_pipeline, manifest schema 2):
+ *   data/manifest.json                         run info, families {gefs, ifs, blend} (+ member lists), products
+ *                                              (class edges + ColorBrewer colours), frames[{fh, valid, avail:{family:{..}}}]
+ *   data/<run>/<family>/<product>/fNNN.json   GeoJSON FeatureCollection of filled contour bands, plus
+ *                                              `lows`: [[lon, lat, hPa, memberIdx], ...]  (memberIdx -> families[f].members)
+ *                                              `grid`: value grid for the cursor read-out (blend adds grid.fam per system)
  *   data/basemap/{land,lakes,coast,admin0,admin1}.json   Natural Earth vectors
  */
 (() => {
@@ -37,7 +39,7 @@
       a0: '#ffffff', a0Case: '#000000', a0CaseOp: 0.65, a0Sea: '#9aa7b6',
       lakeStroke: '#6ea6d9', lakeFill: '#000000', lakeFillOp: 0.18,
       grat: '#ffffff', gratOp: 0.22, gratText: '#d9e1ec', gratHalo: 'rgba(0,0,0,0.85)',
-      low: '#ff3a3a', halo: 'rgba(0,0,0,0.92)', dataOp: 100,
+      low: '#ff3a3a', low2: '#ffd23f', halo: 'rgba(0,0,0,0.92)', dataOp: 100,
     },
     light: {
       land: '#e8ebe6', coast: '#222a36', coastOp: 0.85,
@@ -45,7 +47,7 @@
       a0: '#141922', a0Case: '#ffffff', a0CaseOp: 0.55, a0Sea: '#3b4452',
       lakeStroke: '#3d5f7e', lakeFill: '#ffffff', lakeFillOp: 0.22,
       grat: '#141922', gratOp: 0.3, gratText: '#2a3342', gratHalo: 'rgba(255,255,255,0.85)',
-      low: '#cb181d', halo: 'rgba(255,255,255,0.96)', dataOp: 85,
+      low: '#cb181d', low2: '#c26a00', halo: 'rgba(255,255,255,0.96)', dataOp: 85,
     },
   };
   const readTheme = () => {
@@ -55,7 +57,7 @@
   };
   let themeName = readTheme();
   let th = THEMES[themeName];
-  const state = { product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [], grid: null, lowSize: 24 };
+  const state = { family: 'gefs', product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [], grid: null, lowSize: 24 };
   const fmtCave = (iso) => {
     const d = new Date(iso);
     return `${DOW[d.getUTCDay()]} ${d.getUTCDate()} ${MON[d.getUTCMonth()]} ${d.getUTCFullYear()} ${iso.slice(11, 16)}Z`.toUpperCase();
@@ -79,10 +81,22 @@
     const run = manifest.run;
     const dom = manifest.domain;
     const bounds = L.latLngBounds([dom.south, dom.west], [dom.north, dom.east]);
-    const nMembers = manifest.members.length;
+    const fams = manifest.families;
+    const availableViews = (manifest.views || Object.keys(fams)).filter((k) => frames.some((f) => f.avail[k]));
+    const shortOf = (k) => ({ gefs: 'GEFS', ifs: 'ECMWF', blend: 'Blend' }[k] || fams[k].label);
+    const parts = (fams.blend && fams.blend.parts) || [];            // e.g. ['gefs', 'ifs']
+    const partOffset = {};                                           // member index offset of each system inside the blend list
+    parts.reduce((o, k) => { partOffset[k] = o; return o + fams[k].members.length; }, 0);
+    const partOf = (mi) => { let r = parts[0]; for (const k of parts) if (mi >= partOffset[k]) r = k; return r; };
+    state.family = availableViews[0];
+
+    // frames available for the selected family (the ECMWF 06/18Z runs, e.g., stop at F144)
+    let vframes = frames;
+    const rebuildViewFrames = () => { vframes = frames.filter((f) => f.avail[state.family]); };
+    rebuildViewFrames();
 
     $('#runline').textContent =
-      `GEFS ${fmtInit(run.init)} · ${nMembers} members · ${gridSummary(frames)}`;
+      `${fmtInit(run.init)} · ${availableViews.filter((k) => k !== 'blend').map((k) => `${shortOf(k)} ${fams[k].members.length}`).join(' + ')} members · ${gridSummary(frames)}`;
 
     // ---- map ----------------------------------------------------------------------------------
     const map = L.map('map', {
@@ -95,6 +109,7 @@
     map.attributionControl.setPrefix(false);
     map.attributionControl.addAttribution(
       'GEFS: NOAA/NCEP via <a href="https://registry.opendata.aws/noaa-gefs/" target="_blank" rel="noopener">AWS Open Data</a> · ' +
+      'IFS ENS: © <a href="https://www.ecmwf.int" target="_blank" rel="noopener">ECMWF</a>, <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a> (processed) · ' +
       'Basemap: <a href="https://www.naturalearthdata.com/" target="_blank" rel="noopener">Natural Earth</a> · ' +
       'Colours: <a href="https://colorbrewer2.org" target="_blank" rel="noopener">ColorBrewer</a> · ' +
       '<a href="https://leafletjs.com" target="_blank" rel="noopener">Leaflet</a>');
@@ -195,7 +210,7 @@
     };
     sizeCv();
 
-    const opts = { graticule: true, lows: true, states: true, lakes: true };
+    const opts = { graticule: true, lows: true, states: true, lakes: true, byFamily: true };
 
     // Graticule LINES are vector layers in the 'grat' pane (below coast/state/country lines, as is standard);
     // only the degree labels are drawn on the overlay canvas.
@@ -233,6 +248,7 @@
       for (let lon = lon0; lon <= b.getEast(); lon += step) put(`${Math.abs(lon)}°${lon < 0 ? 'W' : 'E'}`, map.latLngToContainerPoint([b.getSouth(), lon]).x + 3, 14);
     }
 
+    const byFamily = () => state.family === 'blend' && opts.byFamily && parts.length === 2;
     function drawLows() {
       const ctx = lowsCv.getContext('2d');
       const s = map.getSize();
@@ -247,7 +263,7 @@
       for (const [lon, lat, p, mi] of state.lows) {
         const pt = map.latLngToContainerPoint([lat, lon]);
         if (pt.x < -40 || pt.y < -60 || pt.x > s.x + 40 || pt.y > s.y + 40) continue;
-        pts.push({ x: pt.x, y: pt.y, p, mi });
+        pts.push({ x: pt.x, y: pt.y, p, mi, k: byFamily() ? (partOf(mi) === parts[0] ? 0 : 1) : 0 });
       }
       state.lowsPx = pts.map((q) => [q.x, q.y, q.p, q.mi]);
       pts.sort((a, b) => b.p - a.p);                            // shallow first -> the deepest lows end up on top
@@ -258,8 +274,7 @@
       // two passes (all halos, then all glyphs) so a tight cluster of members reads as one clean red group
       ctx.lineWidth = Math.max(3.5, size * 0.18); ctx.strokeStyle = th.halo;
       for (const q of pts) ctx.strokeText('L', q.x, q.y);
-      ctx.fillStyle = th.low;
-      for (const q of pts) ctx.fillText('L', q.x, q.y);
+      for (const q of pts) { ctx.fillStyle = q.k ? th.low2 : th.low; ctx.fillText('L', q.x, q.y); }
       // hPa value directly above each L.  Deepest lows are labelled first; a label that would overlap one
       // already placed is skipped (zoom in and more appear; the cursor read-out lists every low under it).
       ctx.font = `800 ${fs}px ${FONT}`;
@@ -273,7 +288,7 @@
         if (placed.some((o) => r[0] < o[2] && r[2] > o[0] && r[1] < o[3] && r[3] > o[1])) continue;
         placed.push(r);
         ctx.lineWidth = Math.max(3.5, fs * 0.22); ctx.strokeStyle = th.halo; ctx.strokeText(t, cx, cy);
-        ctx.fillStyle = th.low; ctx.fillText(t, cx, cy);
+        ctx.fillStyle = q.k ? th.low2 : th.low; ctx.fillText(t, cx, cy);
       }
     }
 
@@ -294,16 +309,19 @@
     // Shows the interpolated MSLP under the pointer plus every low-centre marker beneath it.  It tracks the
     // cursor everywhere on the map and is also refreshed when the frame or product changes.
     const tip = $('#tip');
-    const TIP_LABEL = { mean: 'Ensemble-mean MSLP', min: 'Lowest member MSLP' };
+    const tipLabel = () => (state.product === 'mean'
+      ? (state.family === 'blend' ? 'Blended ensemble mean' : 'Ensemble-mean MSLP')
+      : (state.family === 'blend' ? 'Lowest of all members' : 'Lowest member MSLP'));
     let lastPt = null;                                           // last pointer position {x, y, ll}
-    function valueAt(lat, lon) {
+    function valueAt(lat, lon, arr) {
       const g = state.grid;
       if (!g) return null;
+      const a_ = arr || g.v;
       const fx = (lon - g.lon0) / g.d, fy = (lat - g.lat0) / g.d;
       if (fx < 0 || fy < 0 || fx > g.nx - 1 || fy > g.ny - 1) return null;
       const x0 = Math.min(Math.floor(fx), g.nx - 2), y0 = Math.min(Math.floor(fy), g.ny - 2);
       const tx = fx - x0, ty = fy - y0;
-      const v = (x, y) => g.v[y * g.nx + x];
+      const v = (x, y) => a_[y * g.nx + x];
       const a = v(x0, y0), b = v(x0 + 1, y0), c = v(x0, y0 + 1), d = v(x0 + 1, y0 + 1);
       if (a == null || b == null || c == null || d == null) return null;
       return ((a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty) / 10;
@@ -316,6 +334,7 @@
     };
     const fmtLat = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'S' : 'N'}`;
     const fmtLon = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'W' : 'E'}`;
+    const memberName = (mi) => (state.family === 'blend' ? fams.blend.members[mi] : fams[state.family].members[mi]);
     const sb = { pos: $('#sbPos'), val: $('#sbVal'), low: $('#sbLow'), zoom: $('#sbZoom') };
     const updateZoomReadout = () => { sb.zoom.textContent = `ZOOM ${map.getZoom().toFixed(2)}`; };
     function updateTip() {
@@ -326,12 +345,19 @@
       }
       const { x, y, ll } = lastPt;
       const v = valueAt(ll.lat, ll.lng);
+      const blendVals = (state.family === 'blend' && state.grid && state.grid.fam)
+        ? parts.map((k) => [k, valueAt(ll.lat, ll.lng, state.grid.fam[k])]) : null;
       const hit = Math.max(16, state.lowSize * 0.75);
       const near = state.lowsPx.filter(([px, py]) => Math.hypot(px - x, py - y - state.lowSize * 0.15) < hit).sort((a, b) => a[2] - b[2]);
       let html = '';
       if (v != null) {
         html += `<div class="tt-val"><i style="background:${classColor(v)}"></i><b>${v.toFixed(1)}</b><span>hPa</span></div>` +
-                `<div class="tt-sub">${TIP_LABEL[state.product]}</div>`;
+                `<div class="tt-sub">${shortOf(state.family)} · ${tipLabel()}</div>`;
+        if (blendVals && blendVals.every(([, x]) => x != null)) {
+          const dlt = blendVals[1][1] - blendVals[0][1];
+          html += '<div class="tt-fams">' + blendVals.map(([k, x], n) => `<div class="tt-frow"><span class="sw${n ? ' two' : ''}"></span><span>${shortOf(k)}</span><b>${x.toFixed(1)}</b></div>`).join('') +
+                  `<div class="tt-frow tt-d"><span></span><span>${shortOf(parts[1])} − ${shortOf(parts[0])}</span><b>${dlt >= 0 ? '+' : '−'}${Math.abs(dlt).toFixed(1)}</b></div></div>`;
+        }
       } else {
         html += `<div class="tt-sub">No data here</div>`;
       }
@@ -339,18 +365,21 @@
       if (near.length) {
         const who = state.product === 'min' ? 'Envelope low (lowest member)' : 'Member lows here';
         html += `<div class="tt-lows"><div class="tt-h">${who}</div>` +
-          near.slice(0, 6).map(([, , p, mi]) => `<div class="tt-row"><b>L ${p.toFixed(1)}</b><span>${manifest.members[mi]}</span></div>`).join('') +
+          near.slice(0, 6).map(([, , p, mi]) => `<div class="tt-row"><b class="${byFamily() && partOf(mi) !== parts[0] ? 'two' : ''}">L ${p.toFixed(1)}</b><span>${memberName(mi)}</span></div>`).join('') +
           (near.length > 6 ? `<div class="tt-more">+${near.length - 6} more</div>` : '') + '</div>';
       }
       sb.pos.textContent = `LAT ${fmtLat(ll.lat)}  LON ${fmtLon(ll.lng)}`;
-      sb.val.textContent = v != null ? `${state.product === 'min' ? 'MIN MSLP' : 'MEAN MSLP'} ${v.toFixed(1)} hPa` : 'MSLP —';
-      sb.low.textContent = near.length ? `L ${near[0][2].toFixed(1)} hPa ${manifest.members[near[0][3]]}${near.length > 1 ? ` (+${near.length - 1})` : ''}` : '';
+      sb.val.textContent = v != null
+        ? `${shortOf(state.family).toUpperCase()} ${state.product === 'min' ? 'MIN' : 'MEAN'} ${v.toFixed(1)} hPa` +
+          (blendVals && blendVals.every(([, x]) => x != null) ? `  (${blendVals.map(([k, x]) => `${shortOf(k)} ${x.toFixed(1)}`).join(' | ')})` : '')
+        : 'MSLP —';
+      sb.low.textContent = near.length ? `L ${near[0][2].toFixed(1)} hPa ${memberName(near[0][3])}${near.length > 1 ? ` (+${near.length - 1})` : ''}` : '';
       tip.innerHTML = html;
       tip.hidden = false;
-      const sz = map.getSize(), tw = tip.offsetWidth, th = tip.offsetHeight;
+      const sz = map.getSize(), tw = tip.offsetWidth, tipH = tip.offsetHeight;
       let left = x + 18, top = y + 18;
       if (left + tw > sz.x - 6) left = x - tw - 18;                // flip to the other side of the cursor near edges
-      if (top + th > sz.y - 6) top = y - th - 18;
+      if (top + tipH > sz.y - 6) top = y - tipH - 18;
       tip.style.left = `${Math.max(6, left)}px`;
       tip.style.top = `${Math.max(6, top)}px`;
     }
@@ -364,27 +393,27 @@
 
     // ---- data layer ---------------------------------------------------------------------------
     const cache = new Map();
-    const frameUrl = (prod, fh) => `data/${run.id}/${prod}/f${pad3(fh)}.json`;
-    function loadFrame(prod, fh) {
-      const key = `${prod}/${fh}`;
+    const frameUrl = (fam, prod, fh) => `data/${run.id}/${fam}/${prod}/f${pad3(fh)}.json`;
+    function loadFrame(fam, prod, fh) {
+      const key = `${fam}/${prod}/${fh}`;
       if (cache.has(key)) return cache.get(key);
-      const p = fetch(frameUrl(prod, fh)).then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
+      const p = fetch(frameUrl(fam, prod, fh)).then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
       cache.set(key, p);
       p.catch(() => cache.delete(key));
-      if (cache.size > 80) cache.delete(cache.keys().next().value);
+      if (cache.size > 60) cache.delete(cache.keys().next().value);
       return p;
     }
 
     let dataLayer = null, token = 0;
     async function show() {
       const my = ++token;
-      const f = frames[state.idx];
-      const prod = state.product;
+      const f = vframes[state.idx];
+      const prod = state.product, fam = state.family;
       const P = manifest.products[prod];
       updateTimeline(f);
       const slow = setTimeout(() => setStatus(`Loading F${pad3(f.fh)}…`), 250);
       try {
-        const d = await loadFrame(prod, f.fh);
+        const d = await loadFrame(fam, prod, f.fh);
         if (my !== token) return;
         const colors = P.colors;
         const layer = L.geoJSON(d, {
@@ -408,8 +437,8 @@
     }
     function prefetch() {
       for (let k = 1; k <= 2; k++) {
-        const nf = frames[(state.idx + k) % frames.length];
-        loadFrame(state.product, nf.fh).catch(() => {});
+        const nf = vframes[(state.idx + k) % vframes.length];
+        loadFrame(state.family, state.product, nf.fh).catch(() => {});
       }
     }
 
@@ -431,43 +460,59 @@
         if (!hinge && !lab) return;
         ticks += `<span class="${hinge ? 'hinge' : ''}${lab && v === 1000 ? ' b' : ''}" style="left:${(((k + 1) / n) * 100).toFixed(2)}%">${lab ? v : ''}</span>`;
       });
+      const twoTone = byFamily();
+      const sample = (cls) => `<span class="lg-low${cls}"><i>987</i><b>L</b></span>`;
       const lowsRow = P.has_lows
-        ? `<div class="lg-lows"><span class="lg-low"><i>987</i><b>L</b></span><span>${state.product === 'min' ? 'Local minimum of the member-minimum field' : 'Member low centre'} (hPa)</span></div>` : '';
+        ? `<div class="lg-lows">${twoTone ? `${sample('')}<span>${shortOf(parts[0])}</span>${sample(' two')}<span>${shortOf(parts[1])}</span><span class="lg-sep">·</span>` : sample('')}<span>${
+            state.product === 'min' ? 'Local minimum of the lowest-member field' : (state.family === 'blend' ? 'Low centre of any member' : 'Member low centre')} (hPa)</span></div>` : '';
       $('#legend').innerHTML =
         `<div class="lg-bar" role="img" aria-label="Colour scale from below ${e[0]} to above ${e[e.length - 1]} hPa">${P.colors.map((c) => `<i style="background:${c}"></i>`).join('')}</div>` +
         `<div class="lg-ticks">${ticks}</div>${lowsRow}`;
-      updateCaveLegend(frames[state.idx]);
+      updateCaveLegend(vframes[state.idx]);
     }
     function updateCaveLegend(f) {
       if (!f) return;
       const P = manifest.products[state.product];
+      const F = fams[state.family];
+      const who = state.family === 'blend'
+        ? `BLEND: ${parts.map((k) => fams[k].label).join(' + ')}`.toUpperCase() : F.label.toUpperCase();
+      const nm = state.family === 'blend' ? parts.map((k) => fams[k].members.length).join(' + ') : F.members.length;
+      const suffix = state.family === 'blend' && state.product === 'mean'
+        ? ` — ${F.weighting === 'equal' ? 'EQUAL-WEIGHT' : 'POOLED MEMBERS'}` : '';
       $('#caveLegend').innerHTML =
-        `<div class="cv-1">GEFS ${fmtInit(run.init).toUpperCase()} · ${nMembers} MEMBERS</div>` +
-        `<div class="cv-2">${P.title.toUpperCase()} (hPa)</div>` +
+        `<div class="cv-1">${who} · ${fmtInit(run.init).toUpperCase()} · ${nm} MEMBERS</div>` +
+        `<div class="cv-2">${P.title.toUpperCase()}${suffix} (hPa)</div>` +
         `<div class="cv-3">F${pad3(f.fh)} · VALID ${fmtCave(f.valid)}</div>`;
     }
 
     // ---- timeline / transport ------------------------------------------------------------------
     const slider = $('#slider');
-    slider.max = frames.length - 1;
-    $('#ticks').innerHTML = frames.map((f, i) => (f.fh % 48 === 0 && f.fh > 0)
-      ? `<span style="left:${(i / (frames.length - 1)) * 100}%">+${f.fh / 24}d</span>` : '').join('');
+    function buildTicks() {
+      slider.max = vframes.length - 1;
+      $('#ticks').innerHTML = vframes.map((f, i) => (f.fh % 48 === 0 && f.fh > 0 && vframes.length > 1)
+        ? `<span style="left:${(i / (vframes.length - 1)) * 100}%${i === vframes.length - 1 ? ';transform:translateX(-100%)' : ''}">+${f.fh / 24}d</span>` : '').join('');
+    }
+    buildTicks();
 
     function updateTimeline(f) {
       slider.value = state.idx;
       $('#vFh').textContent = `F${pad3(f.fh)}`;
       $('#vTime').textContent = `Valid ${fmtValid(f.valid)}`;
       updateCaveLegend(f);
-      $('#vGrid').textContent = `${f.grid_deg}° GRID · ${f.members} MEMBERS`;
+      const a = f.avail[state.family];
+      const cover = vframes.length < frames.length ? ` · F${pad3(vframes[0].fh)}–F${pad3(vframes[vframes.length - 1].fh)} ONLY` : '';
+      $('#vGrid').textContent = state.family === 'blend'
+        ? `${a.grid_deg}° GRID · ${a.members} MEMBERS (${parts.map((k) => f.avail[k].members).join(' + ')})${cover}`
+        : `${a.grid_deg}° GRID · ${a.members} MEMBERS${cover}`;
       writeHash();
     }
-    function setIdx(i) { state.idx = clamp(i, 0, frames.length - 1); show(); }
+    function setIdx(i) { state.idx = clamp(i, 0, vframes.length - 1); show(); }
 
     let timer = 0;
     async function tick() {
       if (!state.playing) return;
-      const next = (state.idx + 1) % frames.length;
-      try { await loadFrame(state.product, frames[next].fh); } catch (e) { /* show() reports it */ }
+      const next = (state.idx + 1) % vframes.length;
+      try { await loadFrame(state.family, state.product, vframes[next].fh); } catch (e) { /* show() reports it */ }
       if (!state.playing) return;
       setIdx(next);
       timer = setTimeout(tick, +$('#speed').value);
@@ -491,6 +536,9 @@
       else if (e.key === ' ' && !e.target.matches('button')) { e.preventDefault(); setPlaying(!state.playing); }
       else if (e.key === '1') setProduct('mean');
       else if (e.key === '2') setProduct('min');
+      else if (e.key === 'g' || e.key === 'G') setFamily('gefs');
+      else if (e.key === 'e' || e.key === 'E') setFamily('ifs');
+      else if (e.key === 'b' || e.key === 'B') setFamily('blend');
       else if (e.key === 't' || e.key === 'T') applyTheme(themeName === 'dark' ? 'light' : 'dark', true);
       else if (e.key === 'Escape') closeMenus();
     });
@@ -502,6 +550,41 @@
         b.setAttribute(b.getAttribute('role') === 'tab' ? 'aria-selected' : 'aria-checked', String(on));
       });
     }
+    // ---- ensemble family (GEFS / ECMWF IFS ENS / Blend) -------------------------------------------
+    const famSub = (k) => (k === 'blend'
+      ? `${parts.map(shortOf).join(' + ')} · ${fams.blend.members.length}` : `${fams[k].org} · ${fams[k].members.length} members`);
+    const FAM_KEY = { gefs: 'G', ifs: 'E', blend: 'B' };
+    $('#famSeg').innerHTML = availableViews.map((k) =>
+      `<button type="button" role="tab" data-act="family" data-family="${k}" aria-selected="false" title="${fams[k].name}${fams[k].note ? ' — ' + fams[k].note : ''} (${FAM_KEY[k] || ''})"><span class="seg-main">${fams[k].label}</span><span class="seg-sub">${famSub(k)}</span></button>`).join('');
+    $('#famMenu').innerHTML = availableViews.map((k) =>
+      `<button type="button" class="mi" role="menuitemradio" data-act="family" data-family="${k}" aria-checked="false"><span class="ck"></span>${fams[k].name}<kbd>${FAM_KEY[k] || ''}</kbd></button>`).join('');
+    function syncFamilyUI() {
+      document.querySelectorAll('[data-act=family]').forEach((b) => {
+        const on = b.dataset.family === state.family;
+        b.setAttribute(b.getAttribute('role') === 'tab' ? 'aria-selected' : 'aria-checked', String(on));
+      });
+      $('#optFamRow').hidden = state.family !== 'blend';
+    }
+    function setFamily(k) {
+      if (!availableViews.includes(k) || k === state.family) return;
+      const wantFh = vframes[state.idx] ? vframes[state.idx].fh : 0;
+      state.family = k;
+      rebuildViewFrames();
+      // keep the same forecast hour; if this system does not cover it, show the closest earlier one
+      let j = 0;
+      vframes.forEach((f, i) => { if (f.fh <= wantFh) j = i; });
+      state.idx = j;
+      syncFamilyUI();
+      buildTicks();
+      buildLegend();
+      state.lows = []; state.grid = null; drawLows(); updateTip();
+      if (vframes[j].fh !== wantFh) {
+        setStatus(`${shortOf(k)} has no F${pad3(wantFh)} on this cycle — showing F${pad3(vframes[j].fh)}`);
+        setTimeout(() => setStatus(''), 3500);
+      }
+      show();
+    }
+
     function setProduct(p) {
       if (!manifest.products[p] || p === state.product) return;
       state.product = p;
@@ -516,6 +599,7 @@
     $('#opacity').addEventListener('input', (e) => { opacityTouched = true; setDataOpacity(e.target.value); });
     setDataOpacity($('#opacity').value);
     $('#optLows').addEventListener('change', (e) => { opts.lows = e.target.checked; drawLows(); });
+    $('#optFam').addEventListener('change', (e) => { opts.byFamily = e.target.checked; buildLegend(); drawLows(); updateTip(); });
     $('#optGrat').addEventListener('change', (e) => { opts.graticule = e.target.checked; rebuildGraticule(); drawGraticule(); });
     $('#optStates').addEventListener('change', (e) => layers.states.forEach((l) => e.target.checked ? l.addTo(map) : map.removeLayer(l)));
     $('#optLakes').addEventListener('change', (e) => e.target.checked ? layers.lakes.addTo(map) : map.removeLayer(layers.lakes));
@@ -559,6 +643,7 @@
       if (!it) return;
       switch (it.dataset.act) {
         case 'product': setProduct(it.dataset.product); break;
+        case 'family': setFamily(it.dataset.family); break;
         case 'theme': applyTheme(it.dataset.theme, true); break;
         case 'toggletheme': applyTheme(themeName === 'dark' ? 'light' : 'dark', true); break;
         case 'reset': map.fitBounds(initial); break;
@@ -575,18 +660,20 @@
 
     // ---- shareable URL state: #p=mean&f=132&v=lat,lon,zoom --------------------------------------
     function writeHash() {
-      const f = frames[state.idx];
-      const parts = [`p=${state.product}`, `f=${f ? f.fh : 0}`];
-      if (state.view) parts.push(`v=${state.view.join(',')}`);
-      history.replaceState(null, '', `#${parts.join('&')}`);
+      const f = vframes[state.idx];
+      const hp = [`e=${state.family}`, `p=${state.product}`, `f=${f ? f.fh : 0}`];
+      if (state.view) hp.push(`v=${state.view.join(',')}`);
+      history.replaceState(null, '', `#${hp.join('&')}`);
     }
 
     // ---- go ------------------------------------------------------------------------------------
     if (hash.p && manifest.products[hash.p]) state.product = hash.p;
+    if (hash.e && availableViews.includes(hash.e)) { state.family = hash.e; rebuildViewFrames(); buildTicks(); }
     syncProductUI();
+    syncFamilyUI();
     applyTheme(themeName, false);
     if (hash.f != null) {
-      const i = frames.findIndex((f) => f.fh === hash.f);
+      const i = vframes.findIndex((f) => f.fh === hash.f);
       state.idx = i >= 0 ? i : 0;
     }
     buildLegend();
@@ -599,8 +686,9 @@
 
   // ---------------------------------------------------------------------------------------------
   function gridSummary(frames) {
-    const g = [...new Set(frames.map((f) => f.grid_deg))].sort((a, b) => a - b);
-    const lo = (r) => frames.filter((f) => f.grid_deg === r).map((f) => f.fh);
+    const deg = (f) => Object.values(f.avail)[0].grid_deg;
+    const g = [...new Set(frames.map(deg))].sort((a, b) => a - b);
+    const lo = (r) => frames.filter((f) => deg(f) === r).map((f) => f.fh);
     return g.map((r) => `${r}° f${pad3(Math.min(...lo(r)))}–f${pad3(Math.max(...lo(r)))}`).join(' · ');
   }
   function parseHash() {
@@ -608,6 +696,7 @@
     location.hash.replace(/^#/, '').split('&').forEach((kv) => {
       const [k, v] = kv.split('=');
       if (k === 'p') h.p = v;
+      else if (k === 'e') h.e = v;
       else if (k === 'f' && v !== undefined && !isNaN(+v)) h.f = +v;
       else if (k === 'v' && v) { const a = v.split(',').map(Number); if (a.length === 3 && a.every(Number.isFinite)) h.v = a; }
     });

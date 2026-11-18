@@ -2,7 +2,22 @@
 # GEFS MSLP viewer - pipeline configuration
 # ---------------------------------------------------------------------------
 
-[source]
+[run]
+families = ["gefs", "ifs"]      # ensemble systems to fetch; a blend view is added automatically when there are two
+# Cycles the build may use.  ECMWF only publishes the full 10-day range (and beyond) on 00/12Z; its 06/18Z runs
+# stop at 144 h.  [0, 12] therefore guarantees 10 days for every view including the blend; use [0, 6, 12, 18]
+# to also build the 06/18Z cycles (the ECMWF and blend views then end at 6 days on those runs).
+cycles   = [0, 12]
+
+[blend]
+# How the blended ensemble MEAN is formed:
+#   "equal"   - average of the family means, each system counts once (the usual multi-system convention)
+#   "members" - mean of all members pooled, so a bigger ensemble weighs more (IFS 51 vs GEFS 31)
+# The blended MINIMUM is always the lowest value over every member of every family, and the blended low
+# markers are every member's lows from both families.
+weighting = "equal"
+
+[source]                        # ---- NOAA GEFS (AWS Open Data: noaa-gefs-pds) ----
 base_url      = "https://noaa-gefs-pds.s3.amazonaws.com"
 n_perturbed   = 30              # gep01 .. gep30 (control member gec00 is always added)
 variable      = "PRMSL"         # GRIB short name as written in the .idx files
@@ -22,6 +37,17 @@ dir            = "pgrb2ap5"
 file_tag       = "pgrb2a.0p50"
 resolution_deg = 0.5
 max_fh         = 384
+
+[ifs]                           # ---- ECMWF IFS ENS (AWS Open Data: ecmwf-forecasts) ----
+base_url          = "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com"
+model             = "ifs"
+resolution        = "0p25"      # the highest resolution ECMWF publishes for the ensemble
+n_perturbed       = 50          # ep01..ep50 from stream enfo; the control ec00 comes from stream oper (IFS >= 50r1)
+param             = "msl"       # mean sea level pressure, as named in the .index files
+full_range_cycles = [0, 12]     # these cycles publish to full_max_fh; the others stop at short_max_fh
+full_max_fh       = 360
+short_max_fh      = 144
+requests_per_second = 3         # the ECMWF bucket answers 503 SlowDown above ~4-5 req/s from one client, so it gets its own, gentler cap
 
 [forecast]
 start = 0

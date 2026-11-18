@@ -11,6 +11,7 @@ Rate-limit / server-friendliness features
 """
 from __future__ import annotations
 
+import json
 import logging
 import random
 import re
@@ -72,9 +73,12 @@ class Stats:
 
 class Http:
     def __init__(self, *, user_agent: str, rps: float = 8, max_retries: int = 6, backoff_base: float = 1.0,
-                 backoff_max: float = 60.0, timeout: tuple[float, float] = (10, 60), sleep=time.sleep):
+                 backoff_max: float = 60.0, timeout: tuple[float, float] = (10, 60), sleep=time.sleep,
+                 host_rps: dict[str, float] | None = None):
         self.user_agent = user_agent
         self.limiter = RateLimiter(rps)
+        # optional gentler limit for particular hosts (substring of the hostname), e.g. {"ecmwf-forecasts": 3}
+        self.host_limiters = {h: RateLimiter(r) for h, r in (host_rps or {}).items()}
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
@@ -105,9 +109,15 @@ class Http:
         log.warning("%s on %s - retry %d/%d in %.1fs", why, url.rsplit("/", 1)[-1], attempt + 1, self.max_retries, delay)
         self._sleep(delay)
 
+    def _limiter_for(self, url: str) -> RateLimiter:
+        for host, lim in self.host_limiters.items():
+            if host in url.split("/", 3)[2]:
+                return lim
+        return self.limiter
+
     def request(self, method: str, url: str, *, headers: dict | None = None, ok=(200, 206)) -> requests.Response:
         for attempt in range(self.max_retries + 1):
-            self.limiter.wait()
+            self._limiter_for(url).wait()
             self.stats.add(requests=1)
             try:
                 r = self._session().request(method, url, headers=headers, timeout=self.timeout, stream=True)
@@ -184,3 +194,25 @@ def find_message(entries: list[IdxEntry], var: str, level: str) -> tuple[int, in
             nxt = entries[i + 1].offset - 1 if i + 1 < len(entries) else None
             return e.offset, nxt
     raise KeyError(f"{var}:{level} not in inventory")
+
+
+# ---- ECMWF open-data .index (one JSON object per line) ------------------------------------------------
+def parse_json_index(text: str, param: str) -> dict[tuple[str, str], tuple[int, int]]:
+    """Reduce an ECMWF `.index` file to {(type, number): (offset, length)} for one parameter.
+
+    The index of a 0.25-deg ENS step lists ~8 850 messages (2-3 MB); only the handful we need is kept.
+    `number` is "" for messages without a member number (control / deterministic forecasts).
+    """
+    out: dict[tuple[str, str], tuple[int, int]] = {}
+    needle = f'"{param}"'
+    for line in text.splitlines():
+        if needle not in line:               # cheap pre-filter before json parsing
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("param") != param or "_offset" not in row or "_length" not in row:
+            continue
+        out.setdefault((str(row.get("type", "")), str(row.get("number", ""))), (int(row["_offset"]), int(row["_length"])))
+    return out

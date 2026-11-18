@@ -6,9 +6,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-from .config import member_names
 from .fetcher import Http
 
 log = logging.getLogger("gefs.layout")
@@ -40,30 +39,3 @@ def choose_product(http: Http, cfg, run: datetime, fh: int):
             return p
         log.info("f%03d: %s not available, trying next resolution", fh, p.dir)
     return None
-
-
-def cycle_is_complete(http: Http, cfg, run: datetime, members: list[str], fhs: list[int]) -> bool:
-    """True when the *last* forecast hour exists for every member (S3 publishes hours progressively)."""
-    fh = fhs[-1]
-    prods = products_for_fh(cfg, fh)
-    if not prods:
-        return False
-    p = prods[0]                                  # highest-resolution product: what frames are fetched from
-    return all(http.exists(object_url(cfg, run, p, m, fh) + ".idx") for m in members)
-
-
-def resolve_cycle(http: Http, cfg, fhs: list[int], now: datetime | None = None, lookback: int = 8) -> datetime:
-    """Newest 00/06/12/18Z cycle that is fully published."""
-    now = now or datetime.now(timezone.utc)
-    run = now.replace(minute=0, second=0, microsecond=0)
-    run -= timedelta(hours=run.hour % 6)
-    members = member_names(cfg)
-    for _ in range(lookback):
-        # cheap sentinel first: last member, last hour
-        p = products_for_fh(cfg, fhs[-1])[0]
-        sentinel = object_url(cfg, run, p, members[-1], fhs[-1]) + ".idx"
-        if http.exists(sentinel) and cycle_is_complete(http, cfg, run, members, fhs):
-            return run
-        log.info("cycle %s not complete yet", run.strftime("%Y%m%d%H"))
-        run -= timedelta(hours=6)
-    raise RuntimeError("no complete GEFS cycle found in the look-back window")

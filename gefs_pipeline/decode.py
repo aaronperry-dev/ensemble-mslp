@@ -10,6 +10,9 @@ import numpy as np
 _ECC_LOCK = threading.Lock()
 
 
+MSLP_SHORT_NAMES = {"prmsl", "msl"}     # NCEP GEFS: PRMSL, ECMWF: msl
+
+
 class DecodeError(Exception):
     pass
 
@@ -37,7 +40,10 @@ def decode_message(raw: bytes, west: float, east: float, south: float, north: fl
         try:
             ni, nj = ec.codes_get(gid, "Ni"), ec.codes_get(gid, "Nj")
             la1, la2 = ec.codes_get(gid, "latitudeOfFirstGridPointInDegrees"), ec.codes_get(gid, "latitudeOfLastGridPointInDegrees")
-            lo1, lo2 = ec.codes_get(gid, "longitudeOfFirstGridPointInDegrees"), ec.codes_get(gid, "longitudeOfLastGridPointInDegrees")
+            lo1 = ec.codes_get(gid, "longitudeOfFirstGridPointInDegrees")
+            di = abs(ec.codes_get(gid, "iDirectionIncrementInDegrees"))
+            if ec.codes_get(gid, "iScansNegatively"):
+                di = -di
             units = ec.codes_get(gid, "units")
             short = ec.codes_get(gid, "shortName")
             ec.codes_set(gid, "missingValue", 9.999e20)
@@ -46,7 +52,7 @@ def decode_message(raw: bytes, west: float, east: float, south: float, north: fl
             step = int(ec.codes_get(gid, "endStep"))
         finally:
             ec.codes_release(gid)
-    if short != "prmsl":
+    if short not in MSLP_SHORT_NAMES:
         raise DecodeError(f"unexpected shortName {short!r}")
     if vals.size != ni * nj:
         raise DecodeError("value count does not match grid")
@@ -56,7 +62,9 @@ def decode_message(raw: bytes, west: float, east: float, south: float, north: fl
     if units == "Pa":
         vals /= 100.0
     lats = np.linspace(la1, la2, nj)
-    lons = np.linspace(lo1, lo2, ni)
+    # Longitudes come from the increment, NOT from first/last point: ECMWF's global grid starts at 180 E and wraps
+    # through 0 (180 -> 359.75 -> 0 -> 179.75), which linspace(first, last) would get wrong.
+    lons = lo1 + di * np.arange(ni)
 
     lons = ((lons + 180.0) % 360.0) - 180.0          # 0..360 -> -180..180
     order = np.argsort(lons)
