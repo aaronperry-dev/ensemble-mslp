@@ -18,7 +18,7 @@ from .decode import DecodeError, Grid, decode_message
 from .fetcher import FetchError, Http, NotFound, find_message, parse_idx
 from .gefs import choose_product, forecast_hours, object_url
 from .palette import build_scale
-from .products import (contour_bands, detect_lows, ensemble_mean, ensemble_min, upsample, write_json)
+from .products import (contour_bands, detect_lows, ensemble_mean, ensemble_min, sample_grid, upsample, write_json)
 
 log = logging.getLogger("gefs.pipeline")
 
@@ -89,16 +89,31 @@ def build_frame(cfg, grids: dict[str, Grid], members: list[str], fh: int, produc
                                        smooth_deg=L.smooth_deg, min_sep_deg=L.min_separation_deg,
                                        domain=(d.west, d.east, d.south, d.north)):
             lows.append([round(lon, 2), round(lat, 2), round(p, 1), mi])
+    dom = (d.west, d.east, d.south, d.north)
+    tip_deg = float(cfg.tooltip.grid_deg)
     write_json(out_dir / run_id / "mean" / f"{f3}.json",
-               {"type": "FeatureCollection", "features": feats, "meta": meta, "lows": lows})
+               {"type": "FeatureCollection", "features": feats, "meta": meta, "lows": lows,
+                "grid": sample_grid(ref.lats, ref.lons, mean, domain=dom, step_deg=tip_deg)})
 
     # --- product 2: member-wise minimum -------------------------------------------------------------
     mn = ensemble_min(stack)
     la, lo, z = upsample(ref.lats, ref.lons, mn, float(cfg.contours.upsample_to_deg))
     feats = contour_bands(la, lo, z, scales["min"][0], prec)
-    write_json(out_dir / run_id / "min" / f"{f3}.json", {"type": "FeatureCollection", "features": feats, "meta": meta})
+    # low centres of the envelope; each is attributed to the member that supplies the minimum at that cell
+    LM = cfg.lows_min
+    owner = np.argmin(np.where(np.isfinite(stack), stack, np.inf), axis=0)       # index into `ok`
+    midx = {m: i for i, m in enumerate(members)}
+    mlows = []
+    for lon, lat, p in detect_lows(ref.lats, ref.lons, mn, threshold_hpa=LM.threshold_hpa, radius_deg=LM.radius_deg,
+                                   smooth_deg=LM.smooth_deg, min_sep_deg=LM.min_separation_deg, domain=dom):
+        j = int(np.argmin(np.abs(ref.lats - lat)))
+        i = int(np.argmin(np.abs(ref.lons - lon)))
+        mlows.append([round(lon, 2), round(lat, 2), round(p, 1), midx[ok[int(owner[j, i])]]])
+    write_json(out_dir / run_id / "min" / f"{f3}.json",
+               {"type": "FeatureCollection", "features": feats, "meta": meta, "lows": mlows,
+                "grid": sample_grid(ref.lats, ref.lons, mn, domain=dom, step_deg=tip_deg)})
 
-    return {**meta, "n_lows": len(lows), "mean_hpa": [round(float(np.nanmin(mean)), 1), round(float(np.nanmax(mean)), 1)],
+    return {**meta, "n_lows": len(lows), "n_lows_min": len(mlows), "mean_hpa": [round(float(np.nanmin(mean)), 1), round(float(np.nanmax(mean)), 1)],
             "min_hpa": [round(float(np.nanmin(mn)), 1), round(float(np.nanmax(mn)), 1)]}
 
 

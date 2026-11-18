@@ -79,3 +79,18 @@ def test_upsample_doubles_half_degree_grid_only():
     assert f2.shape == (2 * len(la) - 1, 2 * len(lo) - 1) and la2[0] == la[0] and lo2[-1] == lo[-1]
     la3, lo3, f3 = upsample(LATS, LONS, field(), 0.25)              # already 0.25 -> untouched
     assert f3.shape == (len(LATS), len(LONS))
+
+
+def test_sample_grid_decimates_and_roundtrips():
+    from gefs_pipeline.products import sample_grid
+    lats = np.arange(0, 10.01, 0.25)
+    lons = np.arange(-20, -9.99, 0.25)
+    field = 1000 + lats[:, None] + 0.1 * (lons[None, :] + 20)
+    field[3, 3] = np.nan
+    g = sample_grid(lats, lons, field, domain=(-18, -12, 2, 8), step_deg=0.5)
+    assert g["d"] == 0.5 and g["lat0"] == 2.0 and g["lon0"] == -18.0
+    assert g["nx"] == 13 and g["ny"] == 13 and len(g["v"]) == 13 * 13
+    assert g["v"][0] == round((1000 + 2.0 + 0.1 * 2.0) * 10)          # south-west corner, tenths of hPa
+    assert g["v"][-1] == round((1000 + 8.0 + 0.1 * 8.0) * 10)         # north-east corner
+    g2 = sample_grid(lats, lons, np.where(lats[:, None] == 4, np.nan, field), domain=(-18, -12, 2, 8), step_deg=0.5)
+    assert None in g2["v"]

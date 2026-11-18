@@ -4,8 +4,8 @@ A static, GitHub-Pages-hosted web map of **GEFS ensemble mean sea-level pressure
 
 | | |
 |---|---|
-| **Product 1 – Ensemble mean + member lows** | Filled contours of the ensemble-mean MSLP, with an **“L” at every low-pressure centre (< 1005 hPa) of every ensemble member** (31 members: `gec00` + `gep01`…`gep30`). Hover a low to see which member and its central pressure. |
-| **Product 2 – Member-wise minimum** | Filled contours of the *lowest* MSLP forecast by any member at each grid point (the “deepest-low envelope”). |
+| **Product 1 – Ensemble mean + member lows** | Filled contours of the ensemble-mean MSLP, with an **“L” at every low-pressure centre (< 1005 hPa) of every ensemble member** (31 members: `gec00` + `gep01`…`gep30`). Each L is labelled with its central pressure in hPa. |
+| **Product 2 – Member-wise minimum** | Filled contours of the *lowest* MSLP forecast by any member at each grid point (the “deepest-low envelope”), with an **L + hPa value at each local minimum** of that envelope. |
 | **Viewer** | Pan / zoom (mouse, touch, keyboard), product switch, forecast-hour slider + animation, opacity, lat/lon grid, state/province and lake toggles, scale bar, shareable URL (`#p=min&f=132&v=lat,lon,zoom`). |
 | **Data** | NOAA GEFS on AWS Open Data: `s3://noaa-gefs-pds` (public, no credentials). |
 
@@ -62,6 +62,10 @@ Useful flags: `--cycle 2026111806` (pin a run), `--max-fh`, `--members N`, `--rp
 ### Low-pressure centres
 For every member, MSLP is lightly Gaussian-smoothed (0.5°) *only to locate* minima; a point is a low when it is the minimum within a 2° radius, below 1005 hPa (as in the reference GEFS image), at least 1.5° from a deeper low, and not on the data border. The *reported* pressure is the raw grid minimum. All of this is in `[lows]` in `config.toml`.
 
+**Member-minimum product:** the same detector runs on the member-wise minimum field (`[lows_min]`, wider 3° radius because the envelope is broad). Each L is attributed to the member that supplies the minimum at that grid cell.
+
+**Cursor read-out:** every frame also carries a decimated value grid (`[tooltip] grid_deg`, default 0.5°, stored as tenths of hPa). The browser interpolates it bilinearly, so a popup follows the pointer anywhere on the map for both products, showing the pressure, a colour swatch, lat/lon and any low-centre markers under the cursor (tap on touch screens). Use `grid_deg = 0.25` for sharper values at roughly double the per-frame size.
+
 ### Rate-limit / server-friendliness
 * One global request limiter (`requests_per_second = 8`) shared by all threads; only `workers = 6` keep-alive connections.
 * Exponential backoff **with jitter** (1, 2, 4 … ≤ 60 s) on `429`, `5xx` (S3 *SlowDown* = 503) and network errors; honours `Retry-After`; 404 is never retried; hard stop after `max_retries`.
@@ -78,7 +82,7 @@ For every member, MSLP is lightly Gaussian-smoothed (0.5°) *only to locate* min
   * **980–1000 hPa:** sequential **Blues**, darkening steadily as pressure falls (navy at 980).
   * **< 980 hPa:** sequential **RdPu**, from bright pink at 976–980 to deep purple below 948, so deep lows read as a distinct, intense tier.
   * Colours are interpolated in OKLab between the ColorBrewer anchors. The legend marks the 980 and 1000 hPa hinges.
-* **Low markers** – a bold red **L** (ColorBrewer Reds) with a white halo and the member's central pressure in hPa directly above it. Labels are de-cluttered (deepest lows labelled first; more appear as you zoom in); hover any L for the member name and exact value.
+* **Low markers** – a bold red **L** (ColorBrewer Reds) with a white halo and the member's central pressure in hPa directly above it. Markers and labels are large and grow with zoom; labels are de-cluttered (deepest lows labelled first; more appear as you zoom in). The cursor read-out lists every low under the pointer with its member and exact value. Both products show L + hPa.
   Change `palette`, `reverse`, `edges`, `diverging_center` in `config.toml`; available ramps are listed in `gefs_pipeline/palette.py`.
 * Web-Mercator projection (the web-map standard). The projection of your reference images is not reproduced.
 

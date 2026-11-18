@@ -28,12 +28,12 @@
   };
 
   const PRODUCT_TEXT = {
-    mean: 'Filled: ensemble-mean MSLP. “L” marks every member’s low-pressure centre.',
-    min: 'At each point, the lowest MSLP forecast by any member — the deepest-low envelope.',
+    mean: 'Filled: ensemble-mean MSLP. Each red “L” is one member’s low-pressure centre, labelled with its central pressure.',
+    min: 'At each point, the lowest MSLP forecast by any member (the deepest-low envelope). “L” marks each local minimum of that envelope.',
   };
   const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
   const LOW_RED = '#cb181d';          // ColorBrewer Reds (7): bold red "L"
-  const state = { product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [] };
+  const state = { product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [], grid: null, lowSize: 24 };
 
   // ---------------------------------------------------------------------------------------------
   // boot
@@ -196,7 +196,7 @@
       const step = gratStep(map.getZoom());
       const b = map.getBounds();
       const lat0 = Math.ceil(b.getSouth() / step) * step, lon0 = Math.ceil(b.getWest() / step) * step;
-      ctx.font = '600 10.5px ' + FONT;
+      ctx.font = '600 12.5px ' + FONT;
       ctx.lineJoin = 'round';
       ctx.textAlign = 'left';
       const put = (t, x, y) => {
@@ -204,7 +204,7 @@
         ctx.fillStyle = '#2a3342'; ctx.fillText(t, x, y);
       };
       for (let lat = lat0; lat <= b.getNorth(); lat += step) put(`${Math.abs(lat)}°${lat < 0 ? 'S' : 'N'}`, 5, map.latLngToContainerPoint([lat, b.getWest()]).y - 3);
-      for (let lon = lon0; lon <= b.getEast(); lon += step) put(`${Math.abs(lon)}°${lon < 0 ? 'W' : 'E'}`, map.latLngToContainerPoint([b.getSouth(), lon]).x + 3, 12);
+      for (let lon = lon0; lon <= b.getEast(); lon += step) put(`${Math.abs(lon)}°${lon < 0 ? 'W' : 'E'}`, map.latLngToContainerPoint([b.getSouth(), lon]).x + 3, 14);
     }
 
     function drawLows() {
@@ -214,12 +214,13 @@
       state.lowsPx = [];
       if (!opts.lows || !manifest.products[state.product].has_lows) return;
       const z = map.getZoom();
-      const size = clamp(12 + (z - 3) * 1.8, 13, 28);          // "L" height in px
-      const fs = Math.max(10, size * 0.74);                     // pressure label size
+      const size = clamp(17 + (z - 4) * 2.2, 17, 32);           // "L" height in px (bold)
+      const fs = Math.round(size * 0.74);                       // hPa label size
+      state.lowSize = size;
       const pts = [];
       for (const [lon, lat, p, mi] of state.lows) {
         const pt = map.latLngToContainerPoint([lat, lon]);
-        if (pt.x < -30 || pt.y < -40 || pt.x > s.x + 30 || pt.y > s.y + 30) continue;
+        if (pt.x < -40 || pt.y < -60 || pt.x > s.x + 40 || pt.y > s.y + 40) continue;
         pts.push({ x: pt.x, y: pt.y, p, mi });
       }
       state.lowsPx = pts.map((q) => [q.x, q.y, q.p, q.mi]);
@@ -228,23 +229,24 @@
       ctx.textBaseline = 'middle';
       ctx.lineJoin = 'round';
       ctx.font = `900 ${size}px ${FONT}`;
-      for (const q of pts) {
-        ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(255,255,255,0.95)'; ctx.strokeText('L', q.x, q.y);
-        ctx.fillStyle = LOW_RED; ctx.fillText('L', q.x, q.y);
-      }
-      // hPa value directly above each L.  Deepest lows first; a label that would overlap one already
-      // placed is skipped (zoom in and more labels appear; hover any L for member + exact value).
+      // two passes (all halos, then all glyphs) so a tight cluster of members reads as one clean red group
+      ctx.lineWidth = Math.max(3.5, size * 0.18); ctx.strokeStyle = 'rgba(255,255,255,0.96)';
+      for (const q of pts) ctx.strokeText('L', q.x, q.y);
+      ctx.fillStyle = LOW_RED;
+      for (const q of pts) ctx.fillText('L', q.x, q.y);
+      // hPa value directly above each L.  Deepest lows are labelled first; a label that would overlap one
+      // already placed is skipped (zoom in and more appear; the cursor read-out lists every low under it).
       ctx.font = `800 ${fs}px ${FONT}`;
       const placed = [];
       for (let i = pts.length - 1; i >= 0; i--) {
         const q = pts[i];
         const t = String(Math.round(q.p));
-        const w = ctx.measureText(t).width + 3, h = fs + 1;
-        const cx = q.x, cy = q.y - size * 0.5 - fs * 0.55;
+        const w = ctx.measureText(t).width + 4, h = fs + 2;
+        const cx = q.x, cy = q.y - size * 0.5 - fs * 0.58;
         const r = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2];
         if (placed.some((o) => r[0] < o[2] && r[2] > o[0] && r[1] < o[3] && r[3] > o[1])) continue;
         placed.push(r);
-        ctx.lineWidth = 3.4; ctx.strokeStyle = 'rgba(255,255,255,0.96)'; ctx.strokeText(t, cx, cy);
+        ctx.lineWidth = Math.max(3.5, fs * 0.22); ctx.strokeStyle = 'rgba(255,255,255,0.97)'; ctx.strokeText(t, cx, cy);
         ctx.fillStyle = LOW_RED; ctx.fillText(t, cx, cy);
       }
     }
@@ -262,20 +264,66 @@
       writeHash();
     });
 
-    // hover read-out for low centres
+    // ---- cursor-following read-out (both products) ---------------------------------------------
+    // Shows the interpolated MSLP under the pointer plus every low-centre marker beneath it.  It tracks the
+    // cursor everywhere on the map and is also refreshed when the frame or product changes.
     const tip = $('#tip');
-    map.on('mousemove', (e) => {
-      if (!state.lowsPx.length) { tip.hidden = true; return; }
-      const near = state.lowsPx.filter(([x, y]) => Math.hypot(x - e.containerPoint.x, y - e.containerPoint.y) < 11)
-        .sort((a, b) => a[2] - b[2]);
-      if (!near.length) { tip.hidden = true; return; }
-      tip.innerHTML = near.slice(0, 6).map(([, , p, mi]) => `<div><b>${p.toFixed(1)} hPa</b> &nbsp;${manifest.members[mi]}</div>`).join('') +
-        (near.length > 6 ? `<div>+${near.length - 6} more</div>` : '');
+    const TIP_LABEL = { mean: 'Ensemble-mean MSLP', min: 'Lowest member MSLP' };
+    let lastPt = null;                                           // last pointer position {x, y, ll}
+    function valueAt(lat, lon) {
+      const g = state.grid;
+      if (!g) return null;
+      const fx = (lon - g.lon0) / g.d, fy = (lat - g.lat0) / g.d;
+      if (fx < 0 || fy < 0 || fx > g.nx - 1 || fy > g.ny - 1) return null;
+      const x0 = Math.min(Math.floor(fx), g.nx - 2), y0 = Math.min(Math.floor(fy), g.ny - 2);
+      const tx = fx - x0, ty = fy - y0;
+      const v = (x, y) => g.v[y * g.nx + x];
+      const a = v(x0, y0), b = v(x0 + 1, y0), c = v(x0, y0 + 1), d = v(x0 + 1, y0 + 1);
+      if (a == null || b == null || c == null || d == null) return null;
+      return ((a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty) / 10;
+    }
+    const classColor = (v) => {
+      const P = manifest.products[state.product];
+      let k = 0;
+      while (k < P.edges.length && v >= P.edges[k]) k++;
+      return P.colors[k];
+    };
+    const fmtLat = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'S' : 'N'}`;
+    const fmtLon = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'W' : 'E'}`;
+    function updateTip() {
+      if (!lastPt) { tip.hidden = true; return; }
+      const { x, y, ll } = lastPt;
+      const v = valueAt(ll.lat, ll.lng);
+      const hit = Math.max(16, state.lowSize * 0.75);
+      const near = state.lowsPx.filter(([px, py]) => Math.hypot(px - x, py - y - state.lowSize * 0.15) < hit).sort((a, b) => a[2] - b[2]);
+      let html = '';
+      if (v != null) {
+        html += `<div class="tt-val"><i style="background:${classColor(v)}"></i><b>${v.toFixed(1)}</b><span>hPa</span></div>` +
+                `<div class="tt-sub">${TIP_LABEL[state.product]}</div>`;
+      } else {
+        html += `<div class="tt-sub">No data here</div>`;
+      }
+      html += `<div class="tt-ll">${fmtLat(ll.lat)}  ${fmtLon(ll.lng)}</div>`;
+      if (near.length) {
+        const who = state.product === 'min' ? 'Envelope low (lowest member)' : 'Member lows here';
+        html += `<div class="tt-lows"><div class="tt-h">${who}</div>` +
+          near.slice(0, 6).map(([, , p, mi]) => `<div class="tt-row"><b>L ${p.toFixed(1)}</b><span>${manifest.members[mi]}</span></div>`).join('') +
+          (near.length > 6 ? `<div class="tt-more">+${near.length - 6} more</div>` : '') + '</div>';
+      }
+      tip.innerHTML = html;
       tip.hidden = false;
-      tip.style.left = `${Math.min(e.containerPoint.x + 14, map.getSize().x - 170)}px`;
-      tip.style.top = `${e.containerPoint.y + 14}px`;
-    });
-    map.on('mouseout', () => { tip.hidden = true; });
+      const sz = map.getSize(), tw = tip.offsetWidth, th = tip.offsetHeight;
+      let left = x + 18, top = y + 18;
+      if (left + tw > sz.x - 6) left = x - tw - 18;                // flip to the other side of the cursor near edges
+      if (top + th > sz.y - 6) top = y - th - 18;
+      tip.style.left = `${Math.max(6, left)}px`;
+      tip.style.top = `${Math.max(6, top)}px`;
+    }
+    const onPointer = (e) => { lastPt = { x: e.containerPoint.x, y: e.containerPoint.y, ll: e.latlng }; updateTip(); };
+    map.on('mousemove', onPointer);
+    map.on('click', onPointer);                                   // touch: tap to read a point
+    map.on('mouseout', () => { lastPt = null; tip.hidden = true; });
+    map.on('zoomstart', () => { tip.hidden = true; });
 
     // ---- data layer ---------------------------------------------------------------------------
     const cache = new Map();
@@ -310,7 +358,9 @@
         if (dataLayer) map.removeLayer(dataLayer);
         dataLayer = layer;
         state.lows = d.lows || [];
+        state.grid = d.grid || null;
         drawLows();
+        updateTip();
         setStatus('');
         prefetch();
       } catch (e) {
@@ -333,9 +383,9 @@
       const e = P.edges;
       const segs = (manifest.scale && manifest.scale.segments) || [];
       const hinges = segs.map((g) => g.to_hpa).filter((v) => v != null);          // e.g. [980, 1000]
-      const barPx = Math.min(430, window.innerWidth - 20) - 24;
+      const barPx = Math.min(480, window.innerWidth - 20) - 28;
       let want = e.filter((v) => v % 8 === 0);
-      if (want.length * 36 > barPx) want = e.filter((v) => v % 16 === 8);        // keeps 1000 on narrow screens
+      if (want.length * 37 > barPx) want = e.filter((v) => v % 16 === 8);        // keeps 1000 on narrow screens
       let ticks = '';
       e.forEach((v, k) => {
         const hinge = hinges.includes(v);
@@ -343,16 +393,12 @@
         if (!hinge && !lab) return;
         ticks += `<span class="${hinge ? 'hinge' : ''}${lab && v === 1000 ? ' b' : ''}" style="left:${(((k + 1) / n) * 100).toFixed(2)}%">${lab ? v : ''}</span>`;
       });
-      const note = segs.length === 3
-        ? `Colours (ColorBrewer): <b>${segs[2].ramp}</b> at/above ${segs[2].from_hpa} hPa, blue = lower → red = higher · <b>${segs[1].ramp}</b> ${segs[1].from_hpa}–${segs[1].to_hpa} · <b>${segs[0].ramp}</b> below ${segs[0].to_hpa}.`
-        : '';
       const lowsRow = P.has_lows
-        ? `<div class="lg-lows"><span class="lg-low"><i>987</i><b>L</b></span> member low centre (&lt; ${manifest.lows_threshold_hpa} hPa) · hover for member &amp; value</div>` : '';
+        ? `<div class="lg-lows"><span class="lg-low"><i>987</i><b>L</b></span><span>${state.product === 'min' ? 'Local minimum of the member-minimum field' : 'Member low centre'} (hPa)</span></div>` : '';
       $('#legend').innerHTML =
         `<div class="lg-title"><span>${P.title}</span><small>hPa</small></div>` +
-        `<div class="lg-desc">${PRODUCT_TEXT[state.product]}</div>` +
         `<div class="lg-bar" role="img" aria-label="Colour scale from below ${e[0]} to above ${e[e.length - 1]} hPa">${P.colors.map((c) => `<i style="background:${c}"></i>`).join('')}</div>` +
-        `<div class="lg-ticks">${ticks}</div><div class="lg-note">${note}</div>${lowsRow}`;
+        `<div class="lg-ticks">${ticks}</div>${lowsRow}`;
     }
 
     // ---- timeline / transport ------------------------------------------------------------------
@@ -406,7 +452,7 @@
       state.product = p;
       document.querySelectorAll('.seg button').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.product === p)));
       buildLegend();
-      state.lows = []; drawLows();
+      state.lows = []; state.grid = null; drawLows(); updateTip();
       show();
     }
     document.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => setProduct(b.dataset.product)));

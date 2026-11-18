@@ -65,6 +65,27 @@ def detect_lows(lats, lons, field, *, threshold_hpa: float, radius_deg: float, s
 
 
 # ---------------------------------------------------------------------------------------------------
+# value grid for the browser's cursor read-out
+# ---------------------------------------------------------------------------------------------------
+def sample_grid(lats, lons, field, *, domain: tuple[float, float, float, float], step_deg: float) -> dict:
+    """Decimate `field` to ~`step_deg` inside `domain` = (west, east, south, north).
+
+    Values are stored as integer tenths of hPa (row-major, south->north, west->east) so the JSON stays small;
+    the viewer interpolates bilinearly.  Missing cells are written as null.
+    """
+    west, east, south, north = domain
+    res = float(abs(lats[1] - lats[0]))
+    k = max(1, int(round(step_deg / res)))
+    jj = np.nonzero((lats >= south - 1e-6) & (lats <= north + 1e-6))[0][::k]
+    ii = np.nonzero((lons >= west - 1e-6) & (lons <= east + 1e-6))[0][::k]
+    sub = field[np.ix_(jj, ii)]
+    tenths = np.rint(sub * 10.0)
+    vals = [None if not np.isfinite(v) else int(v) for v in tenths.ravel()]
+    return {"lon0": round(float(lons[ii[0]]), 4), "lat0": round(float(lats[jj[0]]), 4),
+            "d": round(res * k, 4), "nx": int(len(ii)), "ny": int(len(jj)), "v": vals}
+
+
+# ---------------------------------------------------------------------------------------------------
 # filled contours -> GeoJSON
 # ---------------------------------------------------------------------------------------------------
 def upsample(lats, lons, field, target_deg: float):

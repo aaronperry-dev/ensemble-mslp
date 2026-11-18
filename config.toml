@@ -53,6 +53,15 @@ radius_deg    = 2.0             # a low must be the minimum within this radius
 smooth_deg    = 0.5             # Gaussian smoothing used only to LOCATE minima (reported value is raw)
 min_separation_deg = 1.5
 
+[lows_min]                      # low centres of the member-wise MINIMUM field (one per envelope minimum)
+threshold_hpa = 1005
+radius_deg    = 3.0             # the envelope is broad, so use a wider search radius than for single members
+smooth_deg    = 0.5
+min_separation_deg = 3.0
+
+[tooltip]                       # value grid shipped with every frame for the cursor read-out
+grid_deg = 0.5                  # bilinear interpolation in the browser; 0.25 doubles the data size
+
 [contours]
 precision          = 2          # decimals kept in GeoJSON coordinates
 upsample_to_deg    = 0.25       # 0.5-deg frames are cubic-spline upsampled so fills are not blocky
@@ -94,4 +103,4 @@ has_lows = true
 [products.min]
 title    = "Member-wise minimum MSLP"
 short    = "Member minimum"
-has_lows = false
+has_lows = true
