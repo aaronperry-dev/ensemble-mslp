@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>GEFS Ensemble MSLP Viewer</title>
+  <meta name="description" content="GEFS ensemble mean sea-level pressure, member low-pressure centres and member-wise minimum MSLP, updated every cycle.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Ccircle cx=%2712%27 cy=%2712%27 r=%2710%27 fill=%27%230e1726%27/%3E%3Ccircle cx=%2712%27 cy=%2712%27 r=%276%27 fill=%27none%27 stroke=%27%238fb8e8%27 stroke-width=%271.6%27/%3E%3Ccircle cx=%2712%27 cy=%2712%27 r=%272.2%27 fill=%27%238fb8e8%27/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="6.2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="2.2" fill="currentColor"/></svg>
+      <div>
+        <h1>GEFS ensemble MSLP</h1>
+        <p id="runline" aria-live="polite">Loading…</p>
+      </div>
+    </div>
+    <div class="seg" role="tablist" aria-label="Data product">
+      <button type="button" role="tab" data-product="mean" aria-selected="true"><span class="seg-main">Ensemble mean</span><span class="seg-sub">+ member lows</span></button>
+      <button type="button" role="tab" data-product="min" aria-selected="false"><span class="seg-main">Member minimum</span><span class="seg-sub">lowest of all members</span></button>
+    </div>
+  </header>
+
+  <main class="stage">
+    <div id="map" role="application" aria-label="Interactive map of GEFS mean sea level pressure"></div>
+
+    <details class="panel" id="opts" open>
+      <summary>Display</summary>
+      <label class="row"><span>Opacity</span><input id="opacity" type="range" min="20" max="100" value="85" aria-label="Data opacity"></label>
+      <label class="chk"><input id="optLows" type="checkbox" checked><span>Member low centres</span></label>
+      <label class="chk"><input id="optStates" type="checkbox" checked><span>State / province borders</span></label>
+      <label class="chk"><input id="optGrat" type="checkbox" checked><span>Lat / lon grid</span></label>
+      <label class="chk"><input id="optLakes" type="checkbox" checked><span>Lakes</span></label>
+    </details>
+
+    <section class="legend" id="legend" aria-label="Colour legend"></section>
+    <div class="status" id="status" role="status" hidden></div>
+    <div class="tip" id="tip" hidden></div>
+  </main>
+
+  <footer class="dock">
+    <div class="transport">
+      <button type="button" id="btnPrev" class="ico" aria-label="Previous forecast hour" title="Previous (←)">&#9664;</button>
+      <button type="button" id="btnPlay" class="ico play" aria-label="Play" title="Play / pause (space)">&#9654;</button>
+      <button type="button" id="btnNext" class="ico" aria-label="Next forecast hour" title="Next (→)">&#9654;&#xFE0E;</button>
+      <select id="speed" aria-label="Animation speed"><option value="1100">0.5×</option><option value="650" selected>1×</option><option value="320">2×</option><option value="150">4×</option></select>
+    </div>
+    <div class="timeline">
+      <div class="valid" aria-live="polite"><strong id="vFh">F000</strong><span id="vTime">—</span><span class="chip" id="vGrid"></span></div>
+      <input id="slider" type="range" min="0" max="0" step="1" value="0" aria-label="Forecast hour">
+      <div class="ticks" id="ticks" aria-hidden="true"></div>
+    </div>
+  </footer>
+
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

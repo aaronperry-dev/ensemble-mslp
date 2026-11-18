@@ -1,0 +1,74 @@
+"""Decode ONE GRIB2 message held in memory (no temp files) and cut it to the map domain."""
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass
+
+import numpy as np
+
+# ecCodes is not guaranteed thread-safe in every build; decoding is fast, so serialise it.
+_ECC_LOCK = threading.Lock()
+
+
+class DecodeError(Exception):
+    pass
+
+
+@dataclass
+class Grid:
+    lats: np.ndarray      # ascending, degrees north
+    lons: np.ndarray      # ascending, degrees east in [-180, 180)
+    values: np.ndarray    # (nlat, nlon) float32, hPa
+    valid_time: str       # ISO-8601 UTC
+    step_hours: int
+
+    @property
+    def res(self) -> float:
+        return float(abs(self.lats[1] - self.lats[0]))
+
+
+def decode_message(raw: bytes, west: float, east: float, south: float, north: float) -> Grid:
+    import eccodes as ec  # imported lazily so unit tests that do not need GRIB work without ecCodes
+
+    if raw[:4] != b"GRIB" or raw[-4:] != b"7777":
+        raise DecodeError("not a complete GRIB message")
+    with _ECC_LOCK:
+        gid = ec.codes_new_from_message(raw)
+        try:
+            ni, nj = ec.codes_get(gid, "Ni"), ec.codes_get(gid, "Nj")
+            la1, la2 = ec.codes_get(gid, "latitudeOfFirstGridPointInDegrees"), ec.codes_get(gid, "latitudeOfLastGridPointInDegrees")
+            lo1, lo2 = ec.codes_get(gid, "longitudeOfFirstGridPointInDegrees"), ec.codes_get(gid, "longitudeOfLastGridPointInDegrees")
+            units = ec.codes_get(gid, "units")
+            short = ec.codes_get(gid, "shortName")
+            ec.codes_set(gid, "missingValue", 9.999e20)
+            vals = ec.codes_get_values(gid).astype(np.float32)
+            valid = ec.codes_get(gid, "validityDate"), ec.codes_get(gid, "validityTime")
+            step = int(ec.codes_get(gid, "endStep"))
+        finally:
+            ec.codes_release(gid)
+    if short != "prmsl":
+        raise DecodeError(f"unexpected shortName {short!r}")
+    if vals.size != ni * nj:
+        raise DecodeError("value count does not match grid")
+
+    vals = vals.reshape(nj, ni)
+    vals[vals > 1e20] = np.nan
+    if units == "Pa":
+        vals /= 100.0
+    lats = np.linspace(la1, la2, nj)
+    lons = np.linspace(lo1, lo2, ni)
+
+    lons = ((lons + 180.0) % 360.0) - 180.0          # 0..360 -> -180..180
+    order = np.argsort(lons)
+    lons, vals = lons[order], vals[:, order]
+    if lats[0] > lats[-1]:                            # north->south scan -> ascending
+        lats, vals = lats[::-1], vals[::-1]
+
+    jm = (lats >= south - 1e-6) & (lats <= north + 1e-6)
+    im = (lons >= west - 1e-6) & (lons <= east + 1e-6)
+    if jm.sum() < 3 or im.sum() < 3:
+        raise DecodeError("domain does not intersect the grid")
+    d = str(valid[0]).zfill(8)
+    t = str(valid[1]).zfill(4)
+    iso = f"{d[:4]}-{d[4:6]}-{d[6:]}T{t[:2]}:{t[2:]}:00Z"
+    return Grid(lats[jm].copy(), lons[im].copy(), np.ascontiguousarray(vals[np.ix_(jm, im)]), iso, step)

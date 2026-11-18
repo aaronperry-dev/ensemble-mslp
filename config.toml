@@ -1,0 +1,79 @@
+# ---------------------------------------------------------------------------
+# GEFS MSLP viewer - pipeline configuration
+# ---------------------------------------------------------------------------
+
+[source]
+base_url      = "https://noaa-gefs-pds.s3.amazonaws.com"
+n_perturbed   = 30              # gep01 .. gep30 (control member gec00 is always added)
+variable      = "PRMSL"         # GRIB short name as written in the .idx files
+level         = "mean sea level"
+
+# Products are tried in order, i.e. HIGHEST RESOLUTION FIRST.
+# Verified against the bucket: 0.25-deg ("pgrb2sp25") only exists for f000-f240;
+# beyond that the pipeline automatically falls back to the 0.5-deg product.
+[[source.products]]
+dir            = "pgrb2sp25"
+file_tag       = "pgrb2s.0p25"
+resolution_deg = 0.25
+max_fh         = 240
+
+[[source.products]]
+dir            = "pgrb2ap5"
+file_tag       = "pgrb2a.0p50"
+resolution_deg = 0.5
+max_fh         = 384
+
+[forecast]
+start = 0
+stop  = 384
+step  = 6                       # 3 is possible out to f240 (0.25-deg) but doubles download volume
+
+[domain]                        # data extent; the viewer cannot pan/zoom outside it (degrees east is positive)
+west  = -150
+east  = -40
+south = 10
+north = 65
+pad_deg = 3                     # extra data kept around the domain so contours/lows are valid at the edges
+initial_view = [21, -128, 53, -63]   # [south, west, north, east] the viewer opens on (CONUS)
+
+[fetch]                         # --- polite-client settings -------------------------------------
+workers             = 6         # parallel connections (keep small)
+requests_per_second = 8         # global cap across all workers
+timeout_connect_s   = 10
+timeout_read_s      = 60
+max_retries         = 6
+backoff_base_s      = 1.0       # exponential backoff with jitter: 1, 2, 4, 8 ... capped at backoff_max_s
+backoff_max_s       = 60
+min_member_fraction = 0.8       # a frame is published only if >= this share of members arrived
+user_agent          = "gefs-mslp-viewer/1.0 (+https://github.com/YOUR-USER/gefs-mslp-viewer)"
+
+[lows]
+threshold_hpa = 1005            # only report lows deeper than this (as in the reference GEFS image)
+radius_deg    = 2.0             # a low must be the minimum within this radius
+smooth_deg    = 0.5             # Gaussian smoothing used only to LOCATE minima (reported value is raw)
+min_separation_deg = 1.5
+
+[contours]
+precision          = 2          # decimals kept in GeoJSON coordinates
+upsample_to_deg    = 0.25       # 0.5-deg frames are cubic-spline upsampled so fills are not blocky
+
+# --- data products ---------------------------------------------------------------------------
+# Palettes are ColorBrewer ramps (see gefs_pipeline/palette.py), interpolated in OKLab to one
+# colour per class.  "reverse" flips the ramp; "diverging_center" pins the neutral mid colour
+# to the class containing that pressure.
+[products.mean]
+title       = "Ensemble-mean MSLP + member lows"
+short       = "Mean + lows"
+palette     = "YlOrRd"          # sequential, warm = higher pressure (matches reference images)
+reverse     = false
+has_lows    = true
+edges       = { start = 988, stop = 1044, step = 4 }
+
+[products.min]
+title       = "Member-wise minimum MSLP"
+short       = "Member minimum"
+palette     = "RdBu"            # diverging, blue = low, red = high, neutral near standard pressure
+reverse     = true
+has_lows    = false
+diverging_center = 1014
+edges       = { start = 952, stop = 1036, step = 4 }

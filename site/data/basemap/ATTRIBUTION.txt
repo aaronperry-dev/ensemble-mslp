@@ -1,0 +1,2 @@
+Basemap vectors: Natural Earth (naturalearthdata.com), public domain, 1:10m Cultural + Physical vectors,
+clipped to the viewer domain and simplified by gefs_pipeline/basemap.py.

@@ -1,0 +1,3 @@
+-r requirements.txt
+pytest>=8
+palettable>=3.3      # tests compare our ColorBrewer hex values against this reference
