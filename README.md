@@ -73,6 +73,12 @@ For every member, MSLP is lightly Gaussian-smoothed (0.5°) *only to locate* min
 * Members that fail after retries are dropped; a frame is published only if ≥ 80 % of members arrived (`min_member_fraction`).
 * The scheduled workflow skips the whole build when the live site already serves the newest cycle.
 
+### Interface
+
+A flat, operational-workstation layout: title bar, **menu bar** (File · View · Products · Help), **toolbar** (product switch, data opacity, reset view, theme), map with a CAVE-style three-line header legend (run · product · forecast hour/valid time), a flat colour bar, a time bar, and a **status bar** showing the cursor's lat/lon, pressure and nearest low. A cursor-following pop-up gives the same read-out on the map.
+
+**Dark / light theme:** View ▸ Theme, the toolbar button, or the **T** key. Dark is the default; the choice is remembered in the browser. Map colours per theme (land, borders, graticule, L markers) live in `THEMES` at the top of `site/app.js`; page chrome colours are CSS variables at the top of `site/style.css`.
+
 ## 3. Cartography & colour
 
 * **Basemap**: Natural Earth 1:10m (public domain), clipped to the data domain and simplified at build time. Stacking order, bottom → top: land fill · **data** · lakes · coastline · state/province lines · international boundaries.

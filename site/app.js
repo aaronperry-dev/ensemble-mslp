@@ -27,13 +27,39 @@
     return `${d.getUTCDate()} ${MON[d.getUTCMonth()]} ${d.getUTCFullYear()} ${iso.slice(11, 13)}Z`;
   };
 
-  const PRODUCT_TEXT = {
-    mean: 'Filled: ensemble-mean MSLP. Each red “L” is one member’s low-pressure centre, labelled with its central pressure.',
-    min: 'At each point, the lowest MSLP forecast by any member (the deepest-low envelope). “L” marks each local minimum of that envelope.',
+  const FONT = '"Liberation Sans", "DejaVu Sans", "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif';
+  // Map colours per theme (the page chrome is themed in style.css).  Lines keep the same cartographic
+  // hierarchy in both: country > state/province > coast > graticule.
+  const THEMES = {
+    dark: {
+      land: '#1e242c', coast: '#b9c8da', coastOp: 0.8,
+      st: '#a3afbd', stOp: 0.78, stCase: '#000000', stCaseOp: 0.5,
+      a0: '#ffffff', a0Case: '#000000', a0CaseOp: 0.65, a0Sea: '#9aa7b6',
+      lakeStroke: '#6ea6d9', lakeFill: '#000000', lakeFillOp: 0.18,
+      grat: '#ffffff', gratOp: 0.22, gratText: '#d9e1ec', gratHalo: 'rgba(0,0,0,0.85)',
+      low: '#ff3a3a', halo: 'rgba(0,0,0,0.92)', dataOp: 100,
+    },
+    light: {
+      land: '#e8ebe6', coast: '#222a36', coastOp: 0.85,
+      st: '#323a47', stOp: 0.8, stCase: '#ffffff', stCaseOp: 0.32,
+      a0: '#141922', a0Case: '#ffffff', a0CaseOp: 0.55, a0Sea: '#3b4452',
+      lakeStroke: '#3d5f7e', lakeFill: '#ffffff', lakeFillOp: 0.22,
+      grat: '#141922', gratOp: 0.3, gratText: '#2a3342', gratHalo: 'rgba(255,255,255,0.85)',
+      low: '#cb181d', halo: 'rgba(255,255,255,0.96)', dataOp: 85,
+    },
   };
-  const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
-  const LOW_RED = '#cb181d';          // ColorBrewer Reds (7): bold red "L"
+  const readTheme = () => {
+    let t = document.documentElement.getAttribute('data-theme');
+    try { t = localStorage.getItem('gefs-theme') || t; } catch (e) { /* private mode */ }
+    return THEMES[t] ? t : 'dark';
+  };
+  let themeName = readTheme();
+  let th = THEMES[themeName];
   const state = { product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [], grid: null, lowSize: 24 };
+  const fmtCave = (iso) => {
+    const d = new Date(iso);
+    return `${DOW[d.getUTCDay()]} ${d.getUTCDate()} ${MON[d.getUTCMonth()]} ${d.getUTCFullYear()} ${iso.slice(11, 16)}Z`.toUpperCase();
+  };
 
   // ---------------------------------------------------------------------------------------------
   // boot
@@ -64,7 +90,7 @@
       zoomSnap: 0.25, zoomDelta: 0.5, wheelPxPerZoomLevel: 110,
       maxZoom: 10,
       attributionControl: true,
-      zoomControl: true,
+      zoomControl: false,
     });
     map.attributionControl.setPrefix(false);
     map.attributionControl.addAttribution(
@@ -72,6 +98,7 @@
       'Basemap: <a href="https://www.naturalearthdata.com/" target="_blank" rel="noopener">Natural Earth</a> · ' +
       'Colours: <a href="https://colorbrewer2.org" target="_blank" rel="noopener">ColorBrewer</a> · ' +
       '<a href="https://leafletjs.com" target="_blank" rel="noopener">Leaflet</a>');
+    L.control.zoom({ position: 'topright' }).addTo(map);
     L.control.scale({ position: 'bottomright', maxWidth: 130, imperial: true, metric: true }).addTo(map);
 
     const Home = L.Control.extend({
@@ -85,7 +112,7 @@
         return box;
       },
     });
-    new Home({ position: 'topleft' }).addTo(map);
+    new Home({ position: 'topright' }).addTo(map);
 
     // Panes give a deterministic cartographic stacking order (bottom -> top):
     //   land fill < DATA < lakes < graticule < coast < state casing < state lines < country casing < country lines
@@ -106,7 +133,7 @@
     if (hash.v) map.setView([hash.v[0], hash.v[1]], hash.v[2]);
     else map.fitBounds(initial);
 
-    // ---- basemap (vector, cartographic hierarchy) ----------------------------------------------
+    // ---- basemap (vector, cartographic hierarchy; colours from the active theme) ---------------
     const lineLayers = [];
     const w = (base, z, min) => Math.max(min, base * Math.pow(1.2, z - 4));   // width grows ~20 % per zoom level
     const addLines = (data, paneName, styleFn) => {
@@ -119,30 +146,29 @@
     const loadBase = (n) => fetch(`data/basemap/${n}.json`).then((r) => r.json());
     const [land, lakes, coast, admin0, admin1] = await Promise.all(['land', 'lakes', 'coast', 'admin0', 'admin1'].map(loadBase));
 
-    L.geoJSON(land, { pane: 'land', interactive: false, smoothFactor: 0.8,
-      style: { stroke: false, fillColor: '#e8ebe6', fillOpacity: 1 } }).addTo(map);
+    const landLayer = L.geoJSON(land, { pane: 'land', interactive: false, smoothFactor: 0.8,
+      style: () => ({ stroke: false, fillColor: th.land, fillOpacity: 1 }) }).addTo(map);
+    const lakeStyle = () => ({ color: th.lakeStroke, weight: 0.8, opacity: 0.9, fillColor: th.lakeFill, fillOpacity: th.lakeFillOp });
+    layers.lakes = L.geoJSON(lakes, { pane: 'lakes', interactive: false, smoothFactor: 0.8, style: lakeStyle }).addTo(map);   // data stays visible under water
 
-    layers.lakes = L.geoJSON(lakes, { pane: 'lakes', interactive: false, smoothFactor: 0.8,
-      style: { color: '#3d5f7e', weight: 0.8, opacity: 0.9, fillColor: '#ffffff', fillOpacity: 0.22 } }).addTo(map);   // data stays visible under water
+    addLines(coast, 'coast', (f, z) => ({ color: th.coast, weight: w(0.8, z, 0.6), opacity: th.coastOp, lineJoin: 'round' }));
 
-    addLines(coast, 'coast', (f, z) => ({ color: '#222a36', weight: w(0.8, z, 0.6), opacity: 0.85, lineJoin: 'round' }));
-
-    // 1st-order divisions: thin, mid-grey, with a faint light casing so they read on dark AND light fills
+    // 1st-order divisions: thin, mid-tone, with a faint contrasting casing so they read on dark AND light fills
     layers.states = [
-      addLines(admin1, 'admin1c', (f, z) => ({ color: '#ffffff', weight: w(0.8, z, 0.8) + 1.4, opacity: 0.32, lineCap: 'round' })),
-      addLines(admin1, 'admin1', (f, z) => ({ color: '#323a47', weight: w(0.75, z, 0.55), opacity: 0.8, lineCap: 'round' })),
+      addLines(admin1, 'admin1c', (f, z) => ({ color: th.stCase, weight: w(0.8, z, 0.8) + 1.4, opacity: th.stCaseOp, lineCap: 'round' })),
+      addLines(admin1, 'admin1', (f, z) => ({ color: th.st, weight: w(0.75, z, 0.55), opacity: th.stOp, lineCap: 'round' })),
     ];
-    // International boundaries: the heaviest line on the map (with a light casing so it reads on any fill);
-    // dashed where indefinite / disputed, fine grey dots at sea (treaty / median lines).
+    // International boundaries: the heaviest line on the map (with a casing so it reads on any fill);
+    // dashed where indefinite / disputed, fine dots at sea (treaty / median lines).
     const a0 = (f, z) => {
       const t = f.properties.t;
-      return t === 0 ? { weight: w(1.5, z, 1.1), dashArray: null, color: '#141922', opacity: 1 }
-        : t === 1 ? { weight: w(1.2, z, 1.0), dashArray: '6 4', color: '#141922', opacity: 1 }
-        : { weight: w(0.9, z, 0.8), dashArray: '1 5', color: '#3b4452', opacity: 0.85 };
+      return t === 0 ? { weight: w(1.5, z, 1.1), dashArray: null, color: th.a0, opacity: 1 }
+        : t === 1 ? { weight: w(1.2, z, 1.0), dashArray: '6 4', color: th.a0, opacity: 1 }
+        : { weight: w(0.9, z, 0.8), dashArray: '1 5', color: th.a0Sea, opacity: 0.85 };
     };
     addLines(admin0, 'admin0c', (f, z) => (f.properties.t === 2
       ? { opacity: 0, weight: 0 }
-      : { color: '#ffffff', weight: a0(f, z).weight + 2.2, opacity: 0.55, dashArray: f.properties.t === 1 ? '6 4' : null, lineCap: 'round' }));
+      : { color: th.a0Case, weight: a0(f, z).weight + 2.2, opacity: th.a0CaseOp, dashArray: f.properties.t === 1 ? '6 4' : null, lineCap: 'round' }));
     addLines(admin0, 'admin0', (f, z) => ({ ...a0(f, z), lineCap: 'butt', lineJoin: 'round' }));
 
     map.on('zoomend', () => {
@@ -175,13 +201,13 @@
     // only the degree labels are drawn on the overlay canvas.
     const gratStep = (z) => (z < 4.6 ? 10 : z < 6 ? 5 : z < 7.5 ? 2 : 1);
     let gratLayer = null, gratLayerStep = 0;
-    function rebuildGraticule() {
+    function rebuildGraticule(force) {
       const step = gratStep(map.getZoom());
-      if (gratLayer && step === gratLayerStep && opts.graticule) return;
+      if (!force && gratLayer && step === gratLayerStep && opts.graticule) return;
       if (gratLayer) { map.removeLayer(gratLayer); gratLayer = null; }
       if (!opts.graticule) return;
       gratLayerStep = step;
-      const st = { pane: 'grat', interactive: false, color: '#141922', opacity: 0.3, weight: 0.7, dashArray: '2 4' };
+      const st = { pane: 'grat', interactive: false, color: th.grat, opacity: th.gratOp, weight: 0.7, dashArray: '2 4' };
       const lines = [];
       for (let lat = Math.ceil(dom.south / step) * step; lat <= dom.north; lat += step) lines.push(L.polyline([[lat, dom.west], [lat, dom.east]], st));
       for (let lon = Math.ceil(dom.west / step) * step; lon <= dom.east; lon += step) lines.push(L.polyline([[dom.south, lon], [dom.north, lon]], st));
@@ -200,8 +226,8 @@
       ctx.lineJoin = 'round';
       ctx.textAlign = 'left';
       const put = (t, x, y) => {
-        ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.strokeText(t, x, y);
-        ctx.fillStyle = '#2a3342'; ctx.fillText(t, x, y);
+        ctx.lineWidth = 3; ctx.strokeStyle = th.gratHalo; ctx.strokeText(t, x, y);
+        ctx.fillStyle = th.gratText; ctx.fillText(t, x, y);
       };
       for (let lat = lat0; lat <= b.getNorth(); lat += step) put(`${Math.abs(lat)}°${lat < 0 ? 'S' : 'N'}`, 5, map.latLngToContainerPoint([lat, b.getWest()]).y - 3);
       for (let lon = lon0; lon <= b.getEast(); lon += step) put(`${Math.abs(lon)}°${lon < 0 ? 'W' : 'E'}`, map.latLngToContainerPoint([b.getSouth(), lon]).x + 3, 14);
@@ -230,9 +256,9 @@
       ctx.lineJoin = 'round';
       ctx.font = `900 ${size}px ${FONT}`;
       // two passes (all halos, then all glyphs) so a tight cluster of members reads as one clean red group
-      ctx.lineWidth = Math.max(3.5, size * 0.18); ctx.strokeStyle = 'rgba(255,255,255,0.96)';
+      ctx.lineWidth = Math.max(3.5, size * 0.18); ctx.strokeStyle = th.halo;
       for (const q of pts) ctx.strokeText('L', q.x, q.y);
-      ctx.fillStyle = LOW_RED;
+      ctx.fillStyle = th.low;
       for (const q of pts) ctx.fillText('L', q.x, q.y);
       // hPa value directly above each L.  Deepest lows are labelled first; a label that would overlap one
       // already placed is skipped (zoom in and more appear; the cursor read-out lists every low under it).
@@ -246,8 +272,8 @@
         const r = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2];
         if (placed.some((o) => r[0] < o[2] && r[2] > o[0] && r[1] < o[3] && r[3] > o[1])) continue;
         placed.push(r);
-        ctx.lineWidth = Math.max(3.5, fs * 0.22); ctx.strokeStyle = 'rgba(255,255,255,0.97)'; ctx.strokeText(t, cx, cy);
-        ctx.fillStyle = LOW_RED; ctx.fillText(t, cx, cy);
+        ctx.lineWidth = Math.max(3.5, fs * 0.22); ctx.strokeStyle = th.halo; ctx.strokeText(t, cx, cy);
+        ctx.fillStyle = th.low; ctx.fillText(t, cx, cy);
       }
     }
 
@@ -290,8 +316,14 @@
     };
     const fmtLat = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'S' : 'N'}`;
     const fmtLon = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'W' : 'E'}`;
+    const sb = { pos: $('#sbPos'), val: $('#sbVal'), low: $('#sbLow'), zoom: $('#sbZoom') };
+    const updateZoomReadout = () => { sb.zoom.textContent = `ZOOM ${map.getZoom().toFixed(2)}`; };
     function updateTip() {
-      if (!lastPt) { tip.hidden = true; return; }
+      if (!lastPt) {
+        tip.hidden = true;
+        sb.pos.textContent = 'LAT —  LON —'; sb.val.textContent = 'MSLP —'; sb.low.textContent = '';
+        return;
+      }
       const { x, y, ll } = lastPt;
       const v = valueAt(ll.lat, ll.lng);
       const hit = Math.max(16, state.lowSize * 0.75);
@@ -310,6 +342,9 @@
           near.slice(0, 6).map(([, , p, mi]) => `<div class="tt-row"><b>L ${p.toFixed(1)}</b><span>${manifest.members[mi]}</span></div>`).join('') +
           (near.length > 6 ? `<div class="tt-more">+${near.length - 6} more</div>` : '') + '</div>';
       }
+      sb.pos.textContent = `LAT ${fmtLat(ll.lat)}  LON ${fmtLon(ll.lng)}`;
+      sb.val.textContent = v != null ? `${state.product === 'min' ? 'MIN MSLP' : 'MEAN MSLP'} ${v.toFixed(1)} hPa` : 'MSLP —';
+      sb.low.textContent = near.length ? `L ${near[0][2].toFixed(1)} hPa ${manifest.members[near[0][3]]}${near.length > 1 ? ` (+${near.length - 1})` : ''}` : '';
       tip.innerHTML = html;
       tip.hidden = false;
       const sz = map.getSize(), tw = tip.offsetWidth, th = tip.offsetHeight;
@@ -322,8 +357,10 @@
     const onPointer = (e) => { lastPt = { x: e.containerPoint.x, y: e.containerPoint.y, ll: e.latlng }; updateTip(); };
     map.on('mousemove', onPointer);
     map.on('click', onPointer);                                   // touch: tap to read a point
-    map.on('mouseout', () => { lastPt = null; tip.hidden = true; });
+    map.on('mouseout', () => { lastPt = null; updateTip(); });
     map.on('zoomstart', () => { tip.hidden = true; });
+    map.on('zoomend moveend', updateZoomReadout);
+    updateZoomReadout();
 
     // ---- data layer ---------------------------------------------------------------------------
     const cache = new Map();
@@ -376,14 +413,15 @@
       }
     }
 
-    // ---- legend --------------------------------------------------------------------------------
+    // ---- legends --------------------------------------------------------------------------------
+    // (1) flat colour bar with numeric labels (bottom-left); (2) CAVE-style three-line header (top-left).
     function buildLegend() {
       const P = manifest.products[state.product];
       const n = P.colors.length;
       const e = P.edges;
       const segs = (manifest.scale && manifest.scale.segments) || [];
       const hinges = segs.map((g) => g.to_hpa).filter((v) => v != null);          // e.g. [980, 1000]
-      const barPx = Math.min(480, window.innerWidth - 20) - 28;
+      const barPx = Math.min(500, window.innerWidth - 20) - 26;
       let want = e.filter((v) => v % 8 === 0);
       if (want.length * 37 > barPx) want = e.filter((v) => v % 16 === 8);        // keeps 1000 on narrow screens
       let ticks = '';
@@ -396,9 +434,17 @@
       const lowsRow = P.has_lows
         ? `<div class="lg-lows"><span class="lg-low"><i>987</i><b>L</b></span><span>${state.product === 'min' ? 'Local minimum of the member-minimum field' : 'Member low centre'} (hPa)</span></div>` : '';
       $('#legend').innerHTML =
-        `<div class="lg-title"><span>${P.title}</span><small>hPa</small></div>` +
         `<div class="lg-bar" role="img" aria-label="Colour scale from below ${e[0]} to above ${e[e.length - 1]} hPa">${P.colors.map((c) => `<i style="background:${c}"></i>`).join('')}</div>` +
         `<div class="lg-ticks">${ticks}</div>${lowsRow}`;
+      updateCaveLegend(frames[state.idx]);
+    }
+    function updateCaveLegend(f) {
+      if (!f) return;
+      const P = manifest.products[state.product];
+      $('#caveLegend').innerHTML =
+        `<div class="cv-1">GEFS ${fmtInit(run.init).toUpperCase()} · ${nMembers} MEMBERS</div>` +
+        `<div class="cv-2">${P.title.toUpperCase()} (hPa)</div>` +
+        `<div class="cv-3">F${pad3(f.fh)} · VALID ${fmtCave(f.valid)}</div>`;
     }
 
     // ---- timeline / transport ------------------------------------------------------------------
@@ -411,7 +457,8 @@
       slider.value = state.idx;
       $('#vFh').textContent = `F${pad3(f.fh)}`;
       $('#vTime').textContent = `Valid ${fmtValid(f.valid)}`;
-      $('#vGrid').textContent = `${f.grid_deg}° grid · ${f.members} members`;
+      updateCaveLegend(f);
+      $('#vGrid').textContent = `${f.grid_deg}° GRID · ${f.members} MEMBERS`;
       writeHash();
     }
     function setIdx(i) { state.idx = clamp(i, 0, frames.length - 1); show(); }
@@ -444,26 +491,87 @@
       else if (e.key === ' ' && !e.target.matches('button')) { e.preventDefault(); setPlaying(!state.playing); }
       else if (e.key === '1') setProduct('mean');
       else if (e.key === '2') setProduct('min');
+      else if (e.key === 't' || e.key === 'T') applyTheme(themeName === 'dark' ? 'light' : 'dark', true);
+      else if (e.key === 'Escape') closeMenus();
     });
 
     // ---- product switch + display options ------------------------------------------------------
+    function syncProductUI() {
+      document.querySelectorAll('[data-act=product]').forEach((b) => {
+        const on = b.dataset.product === state.product;
+        b.setAttribute(b.getAttribute('role') === 'tab' ? 'aria-selected' : 'aria-checked', String(on));
+      });
+    }
     function setProduct(p) {
       if (!manifest.products[p] || p === state.product) return;
       state.product = p;
-      document.querySelectorAll('.seg button').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.product === p)));
+      syncProductUI();
       buildLegend();
       state.lows = []; state.grid = null; drawLows(); updateTip();
       show();
     }
-    document.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => setProduct(b.dataset.product)));
 
-    $('#opacity').addEventListener('input', (e) => { map.getPane('data').style.opacity = e.target.value / 100; });
-    map.getPane('data').style.opacity = $('#opacity').value / 100;
+    let opacityTouched = false;                                   // until the user moves the slider, each theme uses its own default
+    const setDataOpacity = (v) => { $('#opacity').value = v; map.getPane('data').style.opacity = v / 100; };
+    $('#opacity').addEventListener('input', (e) => { opacityTouched = true; setDataOpacity(e.target.value); });
+    setDataOpacity($('#opacity').value);
     $('#optLows').addEventListener('change', (e) => { opts.lows = e.target.checked; drawLows(); });
     $('#optGrat').addEventListener('change', (e) => { opts.graticule = e.target.checked; rebuildGraticule(); drawGraticule(); });
     $('#optStates').addEventListener('change', (e) => layers.states.forEach((l) => e.target.checked ? l.addTo(map) : map.removeLayer(l)));
     $('#optLakes').addEventListener('change', (e) => e.target.checked ? layers.lakes.addTo(map) : map.removeLayer(layers.lakes));
-    if (window.matchMedia('(max-width:720px)').matches) $('#opts').open = false;
+
+    // ---- theme (dark / light) -------------------------------------------------------------------
+    function applyTheme(name, persist) {
+      if (!THEMES[name]) return;
+      themeName = name; th = THEMES[name];
+      document.documentElement.setAttribute('data-theme', name);
+      if (persist) { try { localStorage.setItem('gefs-theme', name); } catch (e) { /* ignore */ } }
+      if (!opacityTouched) setDataOpacity(th.dataOp);
+      landLayer.setStyle({ fillColor: th.land });
+      layers.lakes.setStyle(lakeStyle());
+      const z = map.getZoom();
+      lineLayers.forEach(({ l, styleFn }) => l.setStyle((f) => styleFn(f, z)));
+      rebuildGraticule(true); drawGraticule(); drawLows();
+      document.querySelectorAll('[data-act=theme]').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.theme === name)));
+      $('#themeLabel').textContent = name === 'dark' ? 'Dark' : 'Light';
+    }
+
+    // ---- menu bar + toolbar actions -------------------------------------------------------------
+    const menubar = $('.menubar');
+    const openMenu = (m) => { m.classList.add('open'); m.querySelector('.mb').setAttribute('aria-expanded', 'true'); };
+    function closeMenus() {
+      menubar.querySelectorAll('.menu.open').forEach((m) => { m.classList.remove('open'); m.querySelector('.mb').setAttribute('aria-expanded', 'false'); });
+    }
+    menubar.querySelectorAll('.menu').forEach((m) => {
+      const b = m.querySelector('.mb');
+      b.addEventListener('click', (e) => { e.stopPropagation(); const was = m.classList.contains('open'); closeMenus(); if (!was) openMenu(m); });
+      b.addEventListener('mouseenter', () => { if (menubar.querySelector('.menu.open') && !m.classList.contains('open')) { closeMenus(); openMenu(m); } });
+    });
+    document.addEventListener('click', (e) => { if (!e.target.closest('.dd')) closeMenus(); });   // check-boxes keep the menu open
+
+    async function copyLink() {
+      try { await navigator.clipboard.writeText(location.href); setStatus('Link copied to clipboard'); }
+      catch (e) { setStatus('Copy failed — copy the address bar instead', true); }
+      setTimeout(() => setStatus(''), 1800);
+    }
+    document.addEventListener('click', (e) => {
+      const it = e.target.closest('[data-act]');
+      if (!it) return;
+      switch (it.dataset.act) {
+        case 'product': setProduct(it.dataset.product); break;
+        case 'theme': applyTheme(it.dataset.theme, true); break;
+        case 'toggletheme': applyTheme(themeName === 'dark' ? 'light' : 'dark', true); break;
+        case 'reset': map.fitBounds(initial); break;
+        case 'fullscreen':
+          if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen?.();
+          break;
+        case 'copylink': copyLink(); break;
+        case 'reload': location.reload(); break;
+        case 'help': $('#help').showModal(); break;
+        default: break;
+      }
+      closeMenus();
+    });
 
     // ---- shareable URL state: #p=mean&f=132&v=lat,lon,zoom --------------------------------------
     function writeHash() {
@@ -474,10 +582,9 @@
     }
 
     // ---- go ------------------------------------------------------------------------------------
-    if (hash.p && manifest.products[hash.p]) {
-      state.product = hash.p;
-      document.querySelectorAll('.seg button').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.product === hash.p)));
-    }
+    if (hash.p && manifest.products[hash.p]) state.product = hash.p;
+    syncProductUI();
+    applyTheme(themeName, false);
     if (hash.f != null) {
       const i = frames.findIndex((f) => f.fh === hash.f);
       state.idx = i >= 0 ? i : 0;
