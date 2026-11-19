@@ -197,6 +197,21 @@ ramp    = "RdYlBu"
 reverse = true
 t       = [0.12, 1.0]
 
+# --- probability, tracks and strike probability ----------------------------------------------------
+[prob]                            # product "Probability": share of members with MSLP below a level, at the hour shown
+levels = [925, 950, 965, 975, 990, 1000, 1005, 1010]     # hPa; the intensity thresholds of [scale] plus 1010
+edges  = [5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95]     # % class edges (first class, < 5 %, is left transparent)
+ramp   = "YlOrRd"
+
+[tracks]                          # each member's low centres linked across hours (the low markers' own detector settings: [lows])
+max_speed_kmh = 100               # a low may not move farther than this between two hours
+min_points    = 3                 # drop tracks shorter than this many hours-steps (3 x 6 h = 12-18 h)
+
+[strike]                          # product "Strike": share of members whose low passes within a radius, by the hour shown
+radii_km   = [100, 200, 300, 500]
+default_km = 200                  # NHC's strike-probability radius is 120 nautical miles (~220 km)
+ramp       = "YlGnBu"
+
 # --- data products ---------------------------------------------------------------------------
 [products.mean]
 title    = "Ensemble-mean MSLP + member lows"
@@ -213,3 +228,12 @@ title    = "Accumulated member-wise minimum MSLP (swath)"
 short    = "Swath"
 has_lows = true
 
+[products.prob]
+title    = "Probability: share of members"
+short    = "Probability"
+has_lows = false
+
+[products.strike]
+title    = "Strike probability: share of members"
+short    = "Strike"
+has_lows = false

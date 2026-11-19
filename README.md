@@ -8,7 +8,11 @@ A static, GitHub-Pages-hosted web map of **ensemble mean sea-level pressure (MSL
 | **Product 1 – Ensemble mean + member lows** | Filled contours of the ensemble-mean MSLP, with an **“L” at every low-pressure centre (< 1005 hPa) of every ensemble member** (GEFS `gec00` + `gep01`…`gep30`; ECMWF `ec00` + `ep01`…`ep50`; GEPS `cc00` + `cp01`…`cp20`; AIGEFS `ai00` = `mem000`, `ai01`…`ai30`). Each L is labelled with its central pressure in hPa. |
 | **Product 2 – Member-wise minimum** | Filled contours of the *lowest* MSLP forecast by any member at each grid point (the “deepest-low envelope”), with an **L + hPa value at each local minimum** of that envelope. |
 | **Product 3 – Swath (accumulated minimum)** | The member-wise minimum **accumulated over the forecast so far**: at each point, the lowest MSLP any member forecasts at any hour from F000 to the hour shown. It builds up like a storm-track swath as you step or play through the forecast and never rises. L markers are the deepest points of the swath; the read-out gives the forecast hour (and valid time) at which each minimum was reached and the member that supplies it. Key **3**. |
-| **Viewer** | Pan / zoom (mouse, touch, keyboard), ensemble-family and product switches, forecast-hour slider + animation, opacity, lat/lon grid, state/province and lake toggles, scale bar, shareable URL (`#e=gefs_ifs_geps&p=swath&f=132&v=lat,lon,zoom`; `e` is `gefs`, `ifs`, `geps`, or a blend such as `gefs_ifs`). |
+| **Product 4 – Probability** | Share of members with MSLP **below a chosen level** (925 … 1010 hPa; chips are labelled with the intensity band, e.g. `975 Cat 2+`). Works for every system and blend. |
+| **Product 5 – Strike probability** | Share of members whose **low deeper than a level passes within a radius** (100–500 km) up to the hour shown (cumulative), from the member tracks. |
+| **Member low tracks** | Key **K**: every member's low track, solid up to the hour shown, dashed after; hover for member, hours and deepest pressure. |
+| **Animated GIF** | File ▸ Export animated GIF…: hour range, size, speed; composed and compressed in the browser (global palette + frame differencing + LZW), typically a few hundred kB. |
+| **Viewer** | Pan / zoom (mouse, touch, keyboard), ensemble-family and product switches, forecast-hour slider + animation, opacity, lat/lon grid, state/province and lake toggles, scale bar, shareable URL (`#e=gefs_ifs_geps&p=swath&f=132&v=lat,lon,zoom`, plus `l=` level, `r=` radius, `k=1` tracks; `e` is `gefs`, `ifs`, `geps`, or a blend such as `gefs_ifs`). |
 | **Data** | NOAA GEFS on AWS Open Data (`s3://noaa-gefs-pds`), ECMWF open data on AWS (`s3://ecmwf-forecasts`) the Canadian GEPS on ECCC's MSC Datamart (`dd.weather.gc.ca`) and NOAA AIGEFS on AWS (`s3://noaa-nws-graphcastgfs-pds`); all public, no credentials. |
 
 ```
@@ -44,7 +48,7 @@ python -m pytest -q                                     # 26 tests, no network n
 # quick smoke test: 6 members, first 24 h (≈ 65 requests, ≈ 16 MB)
 python -m gefs_pipeline build --out dist --max-fh 24 --members 6        # --families gefs  (or ifs) to build one system only
 
-# full production build: GEFS 31 + ECMWF 51 + GEPS 21 + AIGEFS 31 members, f000-f240 = 10 days (≈ 8 000 requests, ≈ 3.5 GB downloaded, ~25 min; the published site is only ~15 MB, see *Browser-side processing*)
+# full production build: GEFS 31 + ECMWF 51 + GEPS 21 + AIGEFS 31 members, f000-f240 = 10 days (≈ 8 000 requests, ≈ 3.5 GB downloaded, ~25 min; the published site is only ~18 MB, see *Browser-side processing*)
 python -m gefs_pipeline build --out dist
 
 python -m http.server 8000 --directory dist             # open http://localhost:8000
@@ -68,7 +72,7 @@ Useful flags: `--cycle 2026111806` (pin a run), `--max-fh`, `--members N`, `--rp
 The pipeline only ships those per-system grids; **the browser does the rest** (`site/engine.js`): it inflates and decodes the grids, forms **any blend** of two or more systems (regridding GEPS 0.5° to the first system's grid), accumulates the **swath**, finds the low centres of every derived minimum field (a port of `detect_lows`, verified identical by the tests), smooths the field (Catmull-Rom) and colours it pixel by pixel on a canvas, and builds the tooltips.
 * **Format** (`gefs_pipeline/gridio.py`): Int16 tenths of hPa, each value predicted from its neighbours (left + up − up-left), residuals zig-zag coded and split into byte planes, then gzip. Lossless to 0.1 hPa; a ~113 k-cell field becomes ~30–40 KB. The basemap is shipped as `*.json.gz` as well; only `manifest.json` stays plain (small, and the workflow reads it).
 * **Why `.gz` files rather than relying on Pages' own compression:** the Pages limit (1 GB) applies to the *tar of the site* that is deployed (GitHub's Pages-artifact docs recommend keeping that tar under 1 GB), so JSON counts at its full size, and Pages cannot send `Content-Encoding: gzip` for pre-compressed files. Storing the data already gzip'd makes the stored bytes the compressed bytes, and the browser inflates them itself with `DecompressionStream` (Chrome/Edge 80+, Firefox 113+, Safari 16.4+). A server that has already decoded the file is handled too.
-* **Result:** the published site is ~15 MB per cycle (it was ~700 MB with pre-contoured GeoJSON for every blend), every blend combination and the swath cost nothing, and there is no site-size budget to manage. Downloads are small too: a view loads ~40–80 KB per system per hour; the swath fetches the *min* grids of all earlier hours once (~40 KB × hours × systems).
+* **Result:** the published site is ~18 MB per cycle (it was ~700 MB with pre-contoured GeoJSON for every blend), every blend combination and the swath cost nothing, and there is no site-size budget to manage. Downloads are small too: a view loads ~40–80 KB per system per hour; the swath fetches the *min* grids of all earlier hours once (~40 KB × hours × systems).
 * Because the data are plain numbers in the browser, adding a system or product later needs only the encoder to write another grid and a few lines in `app.js`.
 
 ### ECMWF IFS ENS data
@@ -100,6 +104,16 @@ For every member, MSLP is lightly Gaussian-smoothed (0.5°) *only to locate* min
 **Swath product:** the same detector runs on the accumulated minimum; each L also carries the forecast hour at which that minimum was reached.
 
 **Cursor read-out:** the browser reads the full-resolution grids directly (bilinear), so a popup follows the pointer anywhere on the map for every product, showing the pressure, a colour swatch, each system's own value in a blend, lat/lon and any low-centre markers under the cursor (tap on touch screens). For the swath it also gives the hour the minimum was reached.
+
+### Probability, strike probability and member tracks
+
+**Probability** (key `4`): the share of members whose MSLP is **below a chosen level** at the hour shown. The pipeline writes one extra small file per system and hour (`<system>/prob/fNNN.bin.gz`, a count of members below each level in `[prob] levels`, default 925/950/965/975/990/1000/1005/1010 hPa, coded like the other grids: ≈ 30 kB). The browser turns the counts into percent; a blend shows the equal-weight mean of the systems' fractions (or the pooled share when the blend is set to pooled members), and the tooltip lists each system's own value. The level chips carry the intensity band they belong to (`975 Cat 2+` …). The first class (< 5 %) is left transparent.
+
+**Member low tracks** (`K`, View ▸ Member low tracks): `gefs_pipeline/tracks.py` links every member's detected low centres from hour to hour (predicted position = last position + last motion; a low may not move farther than `[tracks] max_speed_kmh`; tracks shorter than `min_points` are dropped) and writes `<system>/tracks.json.gz` (about 15-50 kB per system). Solid line = the track up to the hour shown, dashed = still to come, one colour per system in blends. Hover a track to highlight it and read the member, its hours and its deepest pressure. Tracks are **only as complete as the low detector** (lows below 1005 hPa, see above), so a track begins when the low first deepens below that threshold.
+
+**Strike probability** (`5`): the share of members with a low **deeper than a chosen level passing within a radius** (`[strike] radii_km`, default 200 km; NHC uses 120 n mi) at any time **up to** the hour shown, i.e. cumulative like the swath. Computed in the browser from the member tracks (`engine.js`: `strikeCounts`): each track is sampled hourly with its pressure interpolated, and every grid cell within the radius of a sample deeper than the level is marked once per member. It is an indicative product built from detected lows, not a verified strike-probability forecast.
+
+**Animated GIF** (File ▸ Export animated GIF…, or the toolbar button): choose the first and last hour, size and speed; the browser steps through the frames, composes the map layers exactly as shown (theme, opacity, overlays, tracks, title and colour legend) and encodes the GIF itself (`site/gif.js`: one global palette chosen by median cut, only the changed pixels of each frame stored, LZW compression). A 9-frame export at 750 px is ≈ 300 kB; nothing is uploaded anywhere.
 
 ### Rate-limit / server-friendliness
 * One global request limiter (`requests_per_second = 8`) shared by all threads; only `workers = 6` keep-alive connections.
