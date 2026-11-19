@@ -67,7 +67,8 @@ def test_build_frame_writes_only_per_system_grids(tmp_path):
     entry = build_frame(cfg, {"gefs": a, "ifs": b}, ["gefs", "ifs"], 12, tmp_path, "r")
     assert set(entry["avail"]) == {"gefs", "ifs"} and entry["avail"]["gefs"]["members"] == 3
     files = sorted(p.relative_to(tmp_path / "r").as_posix() for p in (tmp_path / "r").rglob("*") if p.is_file())
-    assert files == ["gefs/mean/f012.bin.gz", "gefs/min/f012.bin.gz", "ifs/mean/f012.bin.gz", "ifs/min/f012.bin.gz"]
+    assert files == ["gefs/mean/f012.bin.gz", "gefs/min/f012.bin.gz", "gefs/prob/f012.bin.gz",
+                     "ifs/mean/f012.bin.gz", "ifs/min/f012.bin.gz", "ifs/prob/f012.bin.gz"]
 
     h, mean, _ = gridio.decode((tmp_path / "r/gefs/mean/f012.bin.gz").read_bytes())
     assert h["kind"] == "mean" and h["members"] == 3 and h["nx"] == len(LONS) and h["ny"] == len(LATS)
@@ -89,3 +90,28 @@ def test_basemap_json_is_gzipped_in_place(tmp_path):
     gridio.gzip_json_tree(tmp_path)
     assert not (tmp_path / "x" / "a.json").exists() and (tmp_path / "x" / "ATTRIBUTION.txt").exists()
     assert json.loads(gzip.decompress((tmp_path / "x" / "a.json.gz").read_bytes())) == {"k": 1}
+
+
+def test_prob_counts_are_exact_member_counts_below_each_level(tmp_path):
+    cfg = load_config()
+    a = frame("g", [1010.0, 1004.0, 996.0], {2: (-90, 35, 40)})        # member 2 has a deep low planted
+    lows_out = {}
+    build_frame(cfg, {"gefs": a}, ["gefs"], 12, tmp_path, "r", lows_out)
+    h, planes = gridio.decode_counts((tmp_path / "r/gefs/prob/f012.bin.gz").read_bytes())
+    levels = [float(x) for x in cfg.prob.levels]
+    assert h["kind"] == "prob" and h["levels"] == levels and h["members"] == 3 and planes.shape == (len(levels), h["ny"], h["nx"])
+    stack = np.stack([g.values for g in a.grids.values()])
+    for k, lv in enumerate(levels):
+        assert np.array_equal(planes[k], (stack < lv).sum(0)), lv
+    assert planes[levels.index(1010.0)].max() == 3 and planes[levels.index(975.0)].max() == 1   # only the planted deep low gets below 975
+    assert all(planes[k].max() <= planes[k + 1].max() for k in range(len(levels) - 1))          # counts never fall as the level rises
+    assert 12 in lows_out["gefs"] and any(r[3] == 2 for r in lows_out["gefs"][12])               # lows are handed to the tracker
+
+
+def test_count_planes_round_trip_and_are_small():
+    rng = np.random.default_rng(1)
+    base = (np.add.outer(np.arange(180), np.arange(260)) % 17 > 8).astype(np.int32) * 30
+    planes = np.stack([base, base + 1, np.minimum(base + 2, 51)])
+    blob = gridio.encode_counts({"nx": 260, "ny": 180, "levels": [1, 2, 3]}, planes)
+    h, back = gridio.decode_counts(blob)
+    assert np.array_equal(back, planes) and len(blob) < 3 * 260 * 180 / 8
