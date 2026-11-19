@@ -104,7 +104,7 @@ def build_scale(scale_cfg) -> tuple[list[float], list[str], list[dict]]:
         t0, t1 = s.t
         for k, i in enumerate(idx):
             colors[i] = color_at(anchors, t0 if len(idx) == 1 else t0 + (t1 - t0) * k / (len(idx) - 1))
-        summary.append({"name": s.name, "ramp": s.ramp, "classes": len(idx),
+        summary.append({"name": s.name, "label": getattr(s, "label", ""), "phrase": getattr(s, "phrase", ""), "ramp": s.ramp, "classes": len(idx),
                         "from_hpa": None if idx[0] == 0 else edges[idx[0] - 1],
                         "to_hpa": None if idx[-1] == n - 1 else edges[idx[-1]]})
     return edges, colors, summary

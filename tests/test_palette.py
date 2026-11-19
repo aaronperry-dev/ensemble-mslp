@@ -1,3 +1,4 @@
+import numpy as np
 import re
 from types import SimpleNamespace as NS
 
@@ -34,30 +35,55 @@ def test_color_at_endpoints():
 def test_shared_scale_layout():
     cfg = load_config()
     edges, colors, segs = build_scale(cfg.scale)
-    assert edges[0] == 948 and edges[-1] == 1032 and len(colors) == len(edges) + 1 == 23
-    assert [s["classes"] for s in segs] == [9, 5, 9]
-    assert [s["ramp"] for s in segs] == ["RdPu", "Blues", "RdYlBu"]
-    assert (segs[0]["to_hpa"], segs[1]["to_hpa"], segs[2]["from_hpa"]) == (980, 1000, 1000)
+    assert edges[0] == 925 and edges[-1] == 1030 and len(colors) == len(edges) + 1 == 23
+    assert [s["label"] for s in segs] == ["Cat 5", "Cat 4", "Cat 3", "Cat 2", "Cat 1", "Storm", "Gale", ""]
+    assert [s["classes"] for s in segs] == [1, 5, 3, 2, 3, 2, 1, 6]
+    assert [s["ramp"] for s in segs] == ["RdPu"] * 5 + ["Blues", "Blues", "RdYlBu"]
 
 
-def test_at_or_above_1000_is_exactly_colorbrewer_rdylbu9_blue_to_red():
+def test_intensity_thresholds_are_class_boundaries():
+    """Wind thresholds (Cat 5 >=137 kt ... gale 34 kt) mapped through NOAA's Dvorak table, rounded to 5 hPa."""
+    cfg = load_config()
+    edges, colors, segs = build_scale(cfg.scale)
+    assert [(s["from_hpa"], s["to_hpa"]) for s in segs[:7]] == [
+        (None, 925), (925, 950), (950, 965), (965, 975), (975, 990), (990, 1000), (1000, 1005)]
+    for thr in (925, 950, 965, 975, 990, 1000, 1005):
+        i = edges.index(thr)
+        assert colors[i] != colors[i + 1]                       # the colour changes exactly at the threshold
+    assert segs[7]["from_hpa"] == 1005
+    # the five hurricane categories and the storm band all get darker with falling pressure
+    L = [hex_to_oklab(c)[0] for c in colors[: edges.index(990) + 1]]
+    assert L == sorted(L)
+
+
+def test_dvorak_interpolation_gives_the_thresholds():
+    """The edges are not arbitrary: reproduce them from the NOAA Dvorak (Atlantic) wind-pressure table."""
+    kt = [30, 35, 45, 55, 65, 77, 90, 102, 115, 127, 140]
+    mb = [1009, 1005, 1000, 994, 987, 979, 970, 960, 948, 935, 921]
+    want = {34: 1005, 48: 1000, 64: 990, 83: 975, 96: 965, 113: 950, 137: 925}
+    for wind, edge in want.items():
+        p = float(np.interp(wind, kt, mb))
+        assert abs(5 * round(p / 5) - edge) == 0, (wind, p, edge)
+
+
+def test_below_gale_is_diverging_blue_to_red_with_pale_yellow_in_the_middle():
     cfg = load_config()
     edges, colors, _ = build_scale(cfg.scale)
-    first_ge_1000 = edges.index(1000) + 1                      # class [1000, 1004)
-    assert colors[first_ge_1000:] == RAMPS["RdYlBu"][::-1]     # blue (just above 1000) ... red (>= 1032)
-    assert colors[edges.index(1016) + 1] == "#ffffbf"          # neutral pale yellow at 1016-1020 hPa
+    top = colors[edges.index(1005) + 1:]                         # [1005,1010) ... >= 1030
+    assert len(top) == 6
+    L = [hex_to_oklab(c)[0] for c in top]
+    assert max(L) > L[0] and max(L) > L[-1]                      # lightest in the middle (pale yellow), darker at both ends
+    assert top[-1] == RAMPS["RdYlBu"][0]                         # red for >= 1030
 
 
-def test_below_1000_blues_then_rdpu_getting_more_intense_downwards():
+def test_storm_and_gale_blues_get_darker_downwards():
     cfg = load_config()
     edges, colors, _ = build_scale(cfg.scale)
-    blues = colors[edges.index(980) + 1: edges.index(1000) + 1]   # [980,984) .. [996,1000)
-    assert blues[0] == RAMPS["Blues"][8] and blues[-1] == RAMPS["Blues"][6]   # navy at 980, ColorBrewer #2171b5 at ~1000
-    # blues get darker (lower OKLab lightness) as pressure falls
+    blues = colors[edges.index(990) + 1: edges.index(1005) + 1]  # [990,995) .. [1000,1005)
+    assert len(blues) == 3 and blues[0] == RAMPS["Blues"][8]     # navy at 990-995
     L = [hex_to_oklab(c)[0] for c in blues]
     assert L == sorted(L)
-    rdpu = colors[: edges.index(980) + 1]
-    assert rdpu[0] == RAMPS["RdPu"][8] and rdpu[-1] == RAMPS["RdPu"][4]      # darkest purple lowest, bright pink at 976-980
+    assert colors[0] == RAMPS["RdPu"][8]                         # darkest purple: Cat 5
 
 
 def test_edges_inclusive():

@@ -351,6 +351,12 @@
       : state.product === 'swath'
         ? (isBlend(state.family) ? 'Swath: lowest of all members so far' : 'Swath: lowest member so far')
         : (isBlend(state.family) ? 'Lowest of all members' : 'Lowest member MSLP'));
+    // intensity band (hurricane category / storm / gale) whose pressure range contains v, if any
+    const catOf = (v) => {
+      const g = ((manifest.scale && manifest.scale.segments) || []).find((x) => x.phrase
+        && (x.from_hpa == null || v >= x.from_hpa) && v < x.to_hpa);
+      return g ? g.phrase : '';
+    };
     const validOf = (fh) => { const fr = frames.find((x) => x.fh === fh); return fr ? fmtValid(fr.valid) : ''; };
     let lastPt = null;                                           // last pointer position {x, y, ll}
     const valueAt = (lat, lon, g) => E.valueAt(g || state.grid, lat, lon);   // g = a field {lon0, lat0, dlon, dlat, nx, ny, v hPa}
@@ -382,7 +388,8 @@
       let html = '';
       if (v != null) {
         html += `<div class="tt-val"><i style="background:${classColor(v)}"></i><b>${v.toFixed(1)}</b><span>hPa</span></div>` +
-                `<div class="tt-sub">${shortOf(state.family)} · ${tipLabel()}</div>`;
+                `<div class="tt-sub">${shortOf(state.family)} · ${tipLabel()}</div>` +
+                (catOf(v) ? `<div class="tt-cat">\u2248 ${catOf(v)} pressure</div>` : '');
         if (blendVals && blendVals.every(([, x]) => x != null)) {
           const xs = blendVals.map(([, x]) => x);
           const sgn = (d) => `${d >= 0 ? '+' : '\u2212'}${Math.abs(d).toFixed(1)}`;
@@ -585,16 +592,27 @@
       const n = P.colors.length;
       const e = P.edges;
       const segs = (manifest.scale && manifest.scale.segments) || [];
-      const hinges = segs.map((g) => g.to_hpa).filter((v) => v != null);          // e.g. [980, 1000]
       const barPx = Math.min(500, window.innerWidth - 20) - 26;
-      let want = e.filter((v) => v % 8 === 0);
-      if (want.length * 37 > barPx) want = e.filter((v) => v % 16 === 8);        // keeps 1000 on narrow screens
+      const hinges = segs.map((g) => g.to_hpa).filter((v) => v != null);          // every intensity threshold, e.g. [925, 950, ..., 1005]
+      const at = (v) => ((e.indexOf(v) + 1) / n) * 100;                            // legend position (%) of an edge
+      // numbers: thresholds plus round values above them, skipping any that would touch the previous number
+      const pxPerHpa = barPx / n / (e[1] - e[0]);
+      const gap = 36 / pxPerHpa;
+      const want = [];
+      e.filter((v) => hinges.includes(v) || (v > hinges[hinges.length - 1] && v % 10 === 0))
+        .forEach((v) => { if (!want.length || v - want[want.length - 1] >= gap) want.push(v); });
       let ticks = '';
       e.forEach((v, k) => {
         const hinge = hinges.includes(v);
-        const lab = want.includes(v);
-        if (!hinge && !lab) return;
-        ticks += `<span class="${hinge ? 'hinge' : ''}${lab && v === 1000 ? ' b' : ''}" style="left:${(((k + 1) / n) * 100).toFixed(2)}%">${lab ? v : ''}</span>`;
+        if (!hinge && !want.includes(v)) return;
+        ticks += `<span class="${hinge ? 'hinge' : ''}${v === 1000 ? ' b' : ''}" style="left:${(((k + 1) / n) * 100).toFixed(2)}%">${want.includes(v) ? v : ''}</span>`;
+      });
+      // names of the intensity bands, centred under their span of classes (the first one starts at the left edge)
+      let cats = '';
+      segs.forEach((g, i) => {
+        if (!g.label) return;
+        const lo = g.from_hpa == null ? 0 : at(g.from_hpa), hi = g.to_hpa == null ? 100 : at(g.to_hpa);
+        cats += `<span style="left:${i === 0 ? 0 : ((lo + hi) / 2).toFixed(2)}%"${i === 0 ? ' class="first"' : ''} title="${g.name}">${g.label}</span>`;
       });
       const sample = (col) => `<span class="lg-low"${col ? ` style="--c:${col}"` : ''}><i>987</i><b>L</b></span>`;
       const bySys = byFamily() ? curParts() : null;
@@ -603,7 +621,7 @@
             state.product === 'swath' ? 'Deepest point of the swath' : state.product === 'min' ? 'Local minimum of the lowest-member field' : (isBlend(state.family) ? 'Low centre of any member' : 'Member low centre')} (hPa)</span></div>` : '';
       $('#legend').innerHTML =
         `<div class="lg-bar" role="img" aria-label="Colour scale from below ${e[0]} to above ${e[e.length - 1]} hPa">${P.colors.map((c) => `<i style="background:${c}"></i>`).join('')}</div>` +
-        `<div class="lg-ticks">${ticks}</div>${lowsRow}`;
+        `<div class="lg-ticks">${ticks}</div>${cats ? `<div class="lg-cats" title="Typical pressure for each wind-intensity class (NOAA Dvorak wind-pressure table, rounded to 5 hPa) - a rough guide only">${cats}</div>` : ''}${lowsRow}`;
       updateCaveLegend(vframes[state.idx]);
     }
     function updateCaveLegend(f) {

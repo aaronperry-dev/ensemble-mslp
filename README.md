@@ -118,13 +118,22 @@ A flat, operational-workstation layout: title bar, **menu bar** (File · View ·
 
 * **Basemap**: Natural Earth 1:10m (public domain), clipped to the data domain and simplified at build time. Stacking order, bottom → top: land fill · **data** · lakes · coastline · state/province lines · international boundaries.
 * **Line hierarchy** (standard practice – weight and contrast follow administrative rank): international boundaries are the heaviest and darkest, with a light casing so they stay legible over both dark and light fills; disputed/indefinite boundaries are dashed; treaty/median maritime lines are fine grey dots; first-order divisions (states, provinces) are thinner mid-grey with a faint casing; coastlines are finest. **All widths scale ≈ 20 % per zoom level.** Lakes are drawn as water cut-outs above the data. The lat/lon graticule is a thin dotted vector layer drawn *beneath* the coast/state/country lines (only its degree labels sit on top), with density adapting to zoom (10° → 1°). State/province lines use every Natural Earth admin-1 class (including "statistical" and "meta bounds" classes, which are real state borders for the US and Canada), so no border segments are dropped.
-* **Colour** – one shared 4 hPa-class scale for both products (edges and ramps are set in `config.toml` → `[scale]`; official hex values are unit-tested against `palettable`):
-  * **≥ 1000 hPa:** ColorBrewer diverging **RdYlBu (9-class)**, reversed so blue is just above 1000 hPa, pale yellow ≈ 1016–1020 and red ≥ 1032.
-  * **980–1000 hPa:** sequential **Blues**, darkening steadily as pressure falls (navy at 980).
-  * **< 980 hPa:** sequential **RdPu**, from bright pink at 976–980 to deep purple below 948, so deep lows read as a distinct, intense tier.
-  * Colours are interpolated in OKLab between the ColorBrewer anchors. The legend marks the 980 and 1000 hPa hinges.
+* **Colour** – one shared 5 hPa-class scale for all products (edges, ramps and labels are in `config.toml` → `[scale]`). The class edges sit exactly on standard storm-intensity thresholds, so a colour change *is* a threshold crossing:
+
+  | Pressure (hPa) | Band | Wind it stands for | Ramp |
+  |---|---|---|---|
+  | < 925 | Cat 5 | ≥ 137 kt | RdPu (darkest purple) |
+  | 925–949 | Cat 4 | 113–136 kt | RdPu |
+  | 950–964 | Cat 3 | 96–112 kt | RdPu |
+  | 965–974 | Cat 2 | 83–95 kt | RdPu |
+  | 975–989 | Cat 1 / hurricane-force | 64–82 kt | RdPu (pink) |
+  | 990–999 | Storm force | 48–63 kt | Blues (navy) |
+  | 1000–1004 | Gale force | 34–47 kt | Blues |
+  | ≥ 1005 | below gale | < 34 kt | RdYlBu (diverging; pale yellow ≈ 1015–1020, red ≥ 1030) |
+
+  The wind thresholds are the NWS marine-warning categories (gale 34–47 kt, storm 48–63 kt, hurricane-force ≥ 64 kt) and the Saffir-Simpson hurricane wind scale. They are translated to pressure with NOAA's Dvorak current-intensity table (Atlantic), linearly interpolated and rounded to 5 hPa (a unit test reproduces the edges from the table). **Treat it as a guide, not a classification:** pressure does not fix wind speed (gradient, storm size and latitude matter, and the NW Pacific table is ~10 hPa lower), so a 985 hPa nor'easter is not a Cat 1 hurricane and extratropical gales happen at higher pressures; model MSLP at 0.25° also under-represents the deepest tropical-cyclone pressures. The legend names the bands under the bar and the cursor read-out says "≈ gale-force pressure" etc. Colours are interpolated in OKLab between ColorBrewer anchors.
 * **Low markers** – a bold red **L** (ColorBrewer Reds) with a white halo and the member's central pressure in hPa directly above it. Markers and labels are large and grow with zoom; labels are de-cluttered (deepest lows labelled first; more appear as you zoom in). The cursor read-out lists every low under the pointer with its member and exact value. Both products show L + hPa.
-  Change `palette`, `reverse`, `edges`, `diverging_center` in `config.toml`; available ramps are listed in `gefs_pipeline/palette.py`.
+  Change `edges` and the `[[scale.segments]]` in `config.toml`; available ramps are listed in `gefs_pipeline/palette.py`.
 * Web-Mercator projection (the web-map standard). The projection of your reference images is not reproduced.
 
 ## 4. Publish on GitHub Pages (exact steps)

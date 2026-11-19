@@ -111,32 +111,91 @@ smooth_deg    = 0.5
 min_separation_deg = 3.0
 
 # --- colour scale ----------------------------------------------------------------------------
-# ONE scale shared by both products so they can be compared directly.  Classes are `step` hPa wide between
+# ONE scale shared by every product so they can be compared directly.  Classes are `step` hPa wide between
 # `start` and `stop` (first class is open below, last is open above); each class gets one colour sampled
 # (in OKLab) from a ColorBrewer ramp.  Segments are listed LOWEST pressure first:
-#   upto = highest class upper-edge (hPa) that belongs to the segment (omit for the last segment)
-#   t    = [position on the ramp at the lowest-pressure class, position at the highest-pressure class], 0..1
-#          measured along the ramp *after* `reverse`.
+#   upto   = highest class upper-edge (hPa) that belongs to the segment (omit for the last segment)
+#   t      = [position on the ramp at the lowest-pressure class, position at the highest-pressure class], 0..1
+#            measured along the ramp *after* `reverse`.
+#   label  = short name shown under the legend bar (optional)
+#   phrase = wording used in the cursor read-out, "~ <phrase> pressure" (optional)
+#
+# The class edges sit exactly ON the standard wind-intensity thresholds, translated to pressure:
+#   wind thresholds  - NWS marine warnings: gale 34-47 kt, storm 48-63 kt, hurricane-force >= 64 kt;
+#                      Saffir-Simpson hurricane wind scale: Cat 1 64-82 kt, Cat 2 83-95, Cat 3 96-112,
+#                      Cat 4 113-136, Cat 5 >= 137 kt.
+#   wind -> pressure - NOAA's Dvorak current-intensity table (Atlantic), linearly interpolated and rounded
+#                      to 5 hPa:   34 kt ~ 1005,  48 kt ~ 1000,  64 kt ~ 990,  83 kt ~ 975,  96 kt ~ 965,
+#                      113 kt ~ 950,  137 kt ~ 925 hPa.
+# That relation is for tropical cyclones.  Pressure does not fix the wind speed (it depends on the pressure
+# gradient, storm size and latitude, and the NW Pacific table is ~10 hPa lower), and the classes are only
+# 5 hPa wide, so read every band as "pressure typical of ..." - a 985 hPa nor'easter is not a Cat 1
+# hurricane, and extratropical winds can be gale/storm force at higher pressures.  Model MSLP at 0.25 deg
+# (and any ensemble mean) also under-represents the deepest tropical-cyclone pressures.
 [scale]
-edges = { start = 948, stop = 1032, step = 4 }
+edges = { start = 925, stop = 1030, step = 5 }
 
-[[scale.segments]]                # deep lows: bright pink -> deep purple as pressure falls
-name  = "Deep lows (<980 hPa)"
-ramp  = "RdPu"
-upto  = 980
-t     = [1.0, 0.5]
+[[scale.segments]]
+name   = "Cat 5 pressure (below 925 hPa; >= 137 kt)"
+label  = "Cat 5"
+phrase = "Cat 5 hurricane"
+ramp   = "RdPu"
+upto   = 925
+t      = [1.0, 1.0]
 
-[[scale.segments]]                # moderate lows: mid blue -> navy as pressure falls
-name  = "Lows (980-1000 hPa)"
-ramp  = "Blues"
-upto  = 1000
-t     = [1.0, 0.75]
+[[scale.segments]]
+name   = "Cat 4 pressure (925-949 hPa; 113-136 kt)"
+label  = "Cat 4"
+phrase = "Cat 4 hurricane"
+ramp   = "RdPu"
+upto   = 950
+t      = [0.93, 0.83]
 
-[[scale.segments]]                # >= 1000 hPa: ColorBrewer RdYlBu (9), blue = lower, pale yellow ~ 1016-1020, red = higher
-name    = "1000 hPa and above"
+[[scale.segments]]
+name   = "Cat 3 pressure (950-964 hPa; 96-112 kt)"
+label  = "Cat 3"
+phrase = "Cat 3 hurricane"
+ramp   = "RdPu"
+upto   = 965
+t      = [0.76, 0.68]
+
+[[scale.segments]]
+name   = "Cat 2 pressure (965-974 hPa; 83-95 kt)"
+label  = "Cat 2"
+phrase = "Cat 2 hurricane"
+ramp   = "RdPu"
+upto   = 975
+t      = [0.60, 0.54]
+
+[[scale.segments]]
+name   = "Cat 1 / hurricane-force pressure (975-989 hPa; 64-82 kt)"
+label  = "Cat 1"
+phrase = "Cat 1 / hurricane-force"
+ramp   = "RdPu"
+upto   = 990
+t      = [0.46, 0.36]
+
+[[scale.segments]]                # blues: navy = storm force, lighter = gale force
+name   = "Storm-force pressure (990-999 hPa; 48-63 kt)"
+label  = "Storm"
+phrase = "storm-force"
+ramp   = "Blues"
+upto   = 1000
+t      = [1.0, 0.88]
+
+[[scale.segments]]
+name   = "Gale-force pressure (1000-1004 hPa; 34-47 kt)"
+label  = "Gale"
+phrase = "gale-force"
+ramp   = "Blues"
+upto   = 1005
+t      = [0.72, 0.72]
+
+[[scale.segments]]                # >= 1005 hPa: ColorBrewer RdYlBu (9), blue = lower, pale yellow ~ 1015-1020, red = higher
+name    = "Below gale strength (1005 hPa and above)"
 ramp    = "RdYlBu"
 reverse = true
-t       = [0.0, 1.0]
+t       = [0.12, 1.0]
 
 # --- data products ---------------------------------------------------------------------------
 [products.mean]
