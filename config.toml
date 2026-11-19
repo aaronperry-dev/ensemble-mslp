@@ -214,12 +214,12 @@ ramp       = "YlGnBu"
 
 # --- data products ---------------------------------------------------------------------------
 [products.mean]
-title    = "Ensemble-mean MSLP + member lows"
+title    = "Ensemble mean MSLP with member low centres"
 short    = "Mean + lows"
 has_lows = true
 
 [products.min]
-title    = "Member-wise minimum MSLP"
+title    = "Member-wise minimum MSLP (lowest of any member)"
 short    = "Member minimum"
 has_lows = true
 
@@ -229,11 +229,11 @@ short    = "Swath"
 has_lows = true
 
 [products.prob]
-title    = "Probability: share of members"
+title    = "Probability of MSLP below a chosen level"
 short    = "Probability"
 has_lows = false
 
 [products.strike]
-title    = "Strike probability: share of members"
+title    = "Strike probability: low below a chosen level within a chosen radius"
 short    = "Strike"
 has_lows = false

@@ -1,4 +1,4 @@
-# Ensemble MSLP Viewer — NOAA GEFS · ECMWF IFS ENS · Canadian GEPS · NOAA AIGEFS · Blends
+# Ensemble MSLP viewer — NOAA GEFS · ECMWF IFS ENS · Canadian GEPS · NOAA AIGEFS · Blends
 
 A static, GitHub-Pages-hosted web map of **ensemble mean sea-level pressure (MSLP)** from four ensemble systems — **NOAA GEFS (31 members)**, **ECMWF IFS ENS (51 members)**, the **Canadian GEPS (21 members)** and **NOAA AIGEFS (31 members, AI-based)** — viewable **per system or as a blend of any two or more**, rebuilt automatically every model cycle by a GitHub Action.
 
@@ -124,7 +124,7 @@ For every member, MSLP is lightly Gaussian-smoothed (0.5°) *only to locate* min
 
 ### Interface
 
-A flat, operational-workstation layout: title bar, **menu bar** (File · View · Ensemble · Products · Help), **toolbar** (ensemble-system switch GEFS / ECMWF IFS ENS / CMC GEPS / NOAA AIGEFS / Blend, product switch, data opacity, reset view, theme), map with a CAVE-style three-line header legend (run · product · forecast hour/valid time), a flat colour bar, a time bar, and a **status bar** showing the cursor's lat/lon, pressure and nearest low. A cursor-following pop-up gives the same read-out on the map; in a blend, tick-boxes on the map choose the systems.
+A flat, operational-workstation layout: title bar, **menu bar** (File · View · Ensemble · Products · Help), **toolbar** (ensemble-system switch GEFS / ECMWF IFS ENS / CMC GEPS / NOAA AIGEFS / Blend, product switch, data opacity, reset view, theme), map with a two-line title block in the standard model-graphic layout (line 1: system | product title, with units at the right; line 2: init time · forecast hour · valid time · member count, all in sentence case), a flat colour bar, a time bar, and a **status bar** showing the cursor's lat/lon, pressure and nearest low. A cursor-following pop-up gives the same read-out on the map; in a blend, tick-boxes on the map choose the systems.
 
 **Dark / light theme:** View ▸ Theme, the toolbar button, or the **T** key. Dark is the default; the choice is remembered in the browser. Map colours per theme (land, borders, graticule, L markers) live in `THEMES` at the top of `site/app.js`; page chrome colours are CSS variables at the top of `site/style.css`.
 

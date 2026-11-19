@@ -62,7 +62,8 @@
   const state = { family: 'gefs', product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [], grid: null, when: null, tipGrids: null, lowSize: 24 };
   const fmtCave = (iso) => {
     const d = new Date(iso);
-    return `${DOW[d.getUTCDay()]} ${d.getUTCDate()} ${MON[d.getUTCMonth()]} ${d.getUTCFullYear()} ${iso.slice(11, 16)}Z`.toUpperCase();
+    const mm = iso.slice(14, 16);                                    // '06Z' like the init time; minutes only if not on the hour
+    return `${DOW[d.getUTCDay()]} ${d.getUTCDate()} ${MON[d.getUTCMonth()]} ${d.getUTCFullYear()} ${iso.slice(11, 13)}${mm && mm !== '00' ? ':' + mm : ''}Z`;
   };
 
   // ---------------------------------------------------------------------------------------------
@@ -133,7 +134,7 @@
     rebuildViewFrames();
 
     $('#runline').textContent =
-      `${fmtInit(run.init)} · ${bases.map((k) => `${shortOf(k)} ${fams[k].members.length}`).join(' + ')} members · ${gridSummary(frames, bases)}`;
+      `Init: ${fmtInit(run.init)} · ${bases.map((k) => `${shortOf(k)} ${fams[k].members.length}`).join(' + ')} members · ${gridSummary(frames, bases)}`;
 
     // ---- map ----------------------------------------------------------------------------------
     const map = L.map('map', {
@@ -798,21 +799,34 @@
         `<div class="lg-ticks">${ticks}</div><div class="lg-note">${what} (%)</div>`;
       updateCaveLegend(vframes[state.idx]);
     }
+    // Map header: a two-line title block in the standard model-graphic layout.
+    //   line 1  <system> | <product title>                                   <units>
+    //   line 2  Init: <run> · F<hh> · Valid: <time> · <n> members
+    // Everything is sentence case; the product title says what the map shows, including the chosen level / radius.
+    function productTitle() {
+      const P = manifest.products[state.product];
+      if (state.product === 'mean' && curParts()) {
+        return `${fams[state.family].weighting === 'equal' ? 'Equal-weight' : 'Pooled-member'} ensemble mean MSLP with member low centres`;
+      }
+      if (state.product === 'prob') return `Probability of MSLP below ${state.level.prob} hPa`;
+      if (state.product === 'strike') return `Strike probability: low below ${state.level.strike} hPa within ${state.radius} km`;
+      return P.title;
+    }
     function updateCaveLegend(f) {
       if (!f) return;
       const P = manifest.products[state.product];
       const F = fams[state.family];
       const ps = curParts();
-      const who = ps ? `BLEND: ${ps.map((k) => (ps.length > 2 ? shortOf(k) : fams[k].label)).join(' + ')}`.toUpperCase() : F.label.toUpperCase();
+      const sys = ps ? `${ps.map((k) => shortOf(k)).join(' + ')} blend` : F.label;
       const nm = ps ? ps.map((k) => fams[k].members.length).join(' + ') : F.members.length;
-      const suffix = ps && state.product === 'mean'
-        ? ` — ${F.weighting === 'equal' ? 'EQUAL-WEIGHT' : 'POOLED MEMBERS'}`
-        : state.product === 'prob' ? ` — MSLP BELOW ${state.level.prob} hPa`
-        : state.product === 'strike' ? ` — LOW BELOW ${state.level.strike} hPa WITHIN ${state.radius} km` : '';
+      const cumulative = state.product === 'swath' || state.product === 'strike';
+      const when = cumulative
+        ? `F${pad3(vframes[0].fh)}\u2013F${pad3(f.fh)} \u00b7 Valid through: ${fmtCave(f.valid)}`
+        : `F${pad3(f.fh)} \u00b7 Valid: ${fmtCave(f.valid)}`;
       $('#caveLegend').innerHTML =
-        `<div class="cv-1">${who} · ${fmtInit(run.init).toUpperCase()} · ${nm} MEMBERS</div>` +
-        `<div class="cv-2">${P.title.toUpperCase()}${suffix} (${P.units === '%' ? '%' : 'hPa'})</div>` +
-        `<div class="cv-3">${state.product === 'swath' || state.product === 'strike' ? `F${pad3(vframes[0].fh)}\u2013F${pad3(f.fh)} · THROUGH` : `F${pad3(f.fh)} · VALID`} ${fmtCave(f.valid)}</div>`;
+        `<div class="cv-top"><div class="cv-title"><span class="cv-sys">${sys}</span><span class="cv-sep">|</span><span class="cv-prod">${productTitle()}</span></div>` +
+        `<span class="cv-units">${P.units === '%' ? '% of members' : 'hPa'}</span></div>` +
+        `<div class="cv-sub"><span>Init: ${fmtInit(run.init)}</span> <span>\u00b7 ${when}</span> <span class="cv-m">\u00b7 ${nm} members</span></div>`;
     }
 
     // ---- timeline / transport ------------------------------------------------------------------
@@ -1260,7 +1274,7 @@
     const have = frames.filter((f) => bases.some((x) => f.avail[x]));
     const g = [...new Set(have.map(deg))].sort((a, b) => a - b);
     const lo = (r) => have.filter((f) => deg(f) === r).map((f) => f.fh);
-    return g.map((r) => `${r}\u00b0 f${pad3(Math.min(...lo(r)))}\u2013f${pad3(Math.max(...lo(r)))}`).join(' \u00b7 ');
+    return g.map((r) => `${r}\u00b0 grid, F${pad3(Math.min(...lo(r)))}\u2013F${pad3(Math.max(...lo(r)))}`).join(' \u00b7 ');
   }
   function parseHash() {
     const h = {};
