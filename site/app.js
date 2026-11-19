@@ -119,6 +119,13 @@
     };
     state.family = bases[0] || availableViews[0];
     state.blendSel = blendViews.length ? fams[blendViews[0]].parts.slice() : [];   // systems currently ticked for the blend
+    // Probability / strike options: pressure level (hPa) and strike radius (km)
+    const probLevels = (manifest.prob && manifest.prob.levels) || [];
+    const strikeLevels = probLevels.filter((v) => v <= (manifest.lows_threshold_hpa == null ? 1005 : manifest.lows_threshold_hpa));
+    const radii = (manifest.strike && manifest.strike.radii_km) || [];
+    state.level = { prob: probLevels.includes(1000) ? 1000 : probLevels[0], strike: strikeLevels.includes(1005) ? 1005 : strikeLevels[strikeLevels.length - 1] };
+    state.radius = manifest.strike ? manifest.strike.default_km : 200;
+    const hasProduct = (p) => !!manifest.products[p] && (p === 'prob' ? probLevels.length > 0 : p === 'strike' ? (strikeLevels.length > 0 && !!manifest.tracks) : true);
 
     // frames available for the selected family (the ECMWF 06/18Z runs, e.g., stop at F144)
     let vframes = frames;
@@ -236,10 +243,11 @@
       return c;
     };
     const gratCv = mkCanvas('grat');
+    const tracksCv = mkCanvas('tracks');
     const lowsCv = mkCanvas('lows');
     const sizeCv = () => {
       const s = map.getSize(), dpr = window.devicePixelRatio || 1;
-      [gratCv, lowsCv].forEach((c) => {
+      [gratCv, tracksCv, lowsCv].forEach((c) => {
         c.width = Math.round(s.x * dpr); c.height = Math.round(s.y * dpr);
         c.style.width = `${s.x}px`; c.style.height = `${s.y}px`;
         c.getContext('2d').setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -247,7 +255,7 @@
     };
     sizeCv();
 
-    const opts = { graticule: true, lows: true, states: true, lakes: true, byFamily: true };
+    const opts = { graticule: true, lows: true, states: true, lakes: true, byFamily: true, tracks: false };
 
     // Graticule LINES are vector layers in the 'grat' pane (below coast/state/country lines, as is standard);
     // only the degree labels are drawn on the overlay canvas.
@@ -329,13 +337,95 @@
       }
     }
 
+
+    // ---- member low tracks (canvas overlay below the L markers) -----------------------------------
+    // data/<run>/<system>/tracks.json.gz: every member's low centres linked from hour to hour (pipeline: tracks.py).
+    const trackData = new Map(), trackLoaded = new Map();            // system -> Promise / loaded {tracks, members}
+    function tracksFor(sys) {
+      if (!trackData.has(sys)) {
+        const meta = manifest.tracks && manifest.tracks[sys];
+        const p = meta
+          ? fetch(`data/${meta.file}`).then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.arrayBuffer(); })
+            .then(E.inflate).then((b) => JSON.parse(new TextDecoder().decode(b)))
+          : Promise.resolve({ tracks: [], members: [] });
+        p.then((d) => trackLoaded.set(sys, d)).catch(() => trackData.delete(sys));
+        trackData.set(sys, p);
+      }
+      return trackData.get(sys);
+    }
+    let trackPx = [], hoverTrack = null;                             // projected tracks of the last draw / the one under the pointer
+    function drawTracks() {
+      const ctx = tracksCv.getContext('2d');
+      const s = map.getSize();
+      ctx.clearRect(0, 0, s.x, s.y);
+      trackPx = [];
+      if (!opts.tracks) return;
+      const f = vframes[state.idx];
+      if (!f) return;
+      const parts = isBlend(state.family) ? fams[state.family].parts : [state.family];
+      let missing = false;
+      for (const k of parts) {
+        const d = trackLoaded.get(k);
+        if (!d) { missing = true; tracksFor(k).then(() => drawTracks()).catch(() => {}); continue; }
+        const col = byFamily() ? sysColor(k) : th.low;
+        for (const t of d.tracks) {
+          const xy = t.pts.map((p) => { const q = map.latLngToContainerPoint([p[2], p[1]]); return [q.x, q.y]; });
+          trackPx.push({ sys: k, t, xy });
+        }
+        trackPx.forEach((q) => { if (q.sys === k) q.col = col; });
+      }
+      ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+      const stroke = (q, from, to, w, col, alpha, dash) => {
+        if (to - from < 1) return;
+        ctx.beginPath();
+        ctx.moveTo(q.xy[from][0], q.xy[from][1]);
+        for (let i = from + 1; i <= to; i++) ctx.lineTo(q.xy[i][0], q.xy[i][1]);
+        ctx.globalAlpha = alpha; ctx.lineWidth = w; ctx.strokeStyle = col; ctx.setLineDash(dash || []);
+        ctx.stroke();
+      };
+      for (const q of trackPx) {                                     // future part: faint, dashed
+        let last = -1;
+        q.t.pts.forEach((p, i) => { if (p[0] <= f.fh) last = i; });
+        q.last = last;
+        stroke(q, Math.max(last, 0), q.t.pts.length - 1, 1.1, q.col, 0.32, [3, 4]);
+      }
+      for (const q of trackPx) {                                     // up to the hour shown: dark casing + solid line
+        stroke(q, 0, q.last, 3.6, th.halo, 0.55);
+        stroke(q, 0, q.last, 1.9, q.col, 0.95);
+      }
+      ctx.setLineDash([]);
+      if (hoverTrack) {
+        const q = trackPx.find((x) => x.t === hoverTrack);
+        if (q) { stroke(q, 0, q.xy.length - 1, 6, th.halo, 0.8); stroke(q, 0, q.xy.length - 1, 3.2, q.col, 1); }
+      }
+      ctx.globalAlpha = 1;
+    }
+    // pointer proximity -> highlight the member track under the cursor
+    function pickTrack(x, y) {
+      let best = null, bd = 9;
+      for (const q of trackPx) {
+        for (let i = 1; i < q.xy.length; i++) {
+          const [x0, y0] = q.xy[i - 1], [x1, y1] = q.xy[i];
+          const dx = x1 - x0, dy = y1 - y0, L2 = dx * dx + dy * dy;
+          const u = L2 ? Math.max(0, Math.min(1, ((x - x0) * dx + (y - y0) * dy) / L2)) : 0;
+          const d = Math.hypot(x - (x0 + u * dx), y - (y0 + u * dy));
+          if (d < bd) { bd = d; best = q; }
+        }
+      }
+      return best;
+    }
+    function trackInfo(q) {
+      const pts = q.t.pts, deep = pts.reduce((a, p) => (p[3] < a[3] ? p : a));
+      return `${fams[q.sys].members[q.t.m]} · F${pad3(pts[0][0])}–F${pad3(pts[pts.length - 1][0])} · deepest ${deep[3].toFixed(1)} hPa at F${pad3(deep[0])}`;
+    }
+
     let raf = 0;
-    const redrawOverlays = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(() => { drawGraticule(); drawLows(); }); };
+    const redrawOverlays = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(() => { drawGraticule(); drawTracks(); drawLows(); }); };
     map.on('move moveend zoomend viewreset', redrawOverlays);
     map.on('zoomend', rebuildGraticule);
     map.on('resize', () => { lockZoom(); sizeCv(); redrawOverlays(); });
-    map.on('zoomstart', () => { gratCv.style.opacity = 0; lowsCv.style.opacity = 0; });   // avoid mis-registered overlays during the zoom animation
-    map.on('zoomend', () => { gratCv.style.opacity = 1; lowsCv.style.opacity = 1; });
+    map.on('zoomstart', () => { gratCv.style.opacity = 0; lowsCv.style.opacity = 0; tracksCv.style.opacity = 0; });   // avoid mis-registered overlays during the zoom animation
+    map.on('zoomend', () => { gratCv.style.opacity = 1; lowsCv.style.opacity = 1; tracksCv.style.opacity = 1; });
     map.on('moveend', () => {
       const c = map.getCenter();
       state.view = [+c.lat.toFixed(3), +c.lng.toFixed(3), +map.getZoom().toFixed(2)];
@@ -348,6 +438,10 @@
     const tip = $('#tip');
     const tipLabel = () => (state.product === 'mean'
       ? (isBlend(state.family) ? 'Blended ensemble mean' : 'Ensemble-mean MSLP')
+      : state.product === 'prob'
+        ? `Members with MSLP below ${state.level.prob} hPa`
+        : state.product === 'strike'
+          ? `Low below ${state.level.strike} hPa within ${state.radius} km, through F${pad3(vframes[state.idx].fh)}`
       : state.product === 'swath'
         ? (isBlend(state.family) ? 'Swath: lowest of all members so far' : 'Swath: lowest member so far')
         : (isBlend(state.family) ? 'Lowest of all members' : 'Lowest member MSLP'));
@@ -364,12 +458,14 @@
       const P = manifest.products[state.product];
       let k = 0;
       while (k < P.edges.length && v >= P.edges[k]) k++;
-      return P.colors[k];
+      return P.colors[k] === 'transparent' ? 'rgba(128,128,128,0.25)' : P.colors[k];
     };
+    const isPct = () => manifest.products[state.product].units === '%';
+    const fmtVal = (x) => (isPct() ? x.toFixed(0) : x.toFixed(1));
     const fmtLat = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'S' : 'N'}`;
     const fmtLon = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'W' : 'E'}`;
     const memberName = (mi) => fams[state.family].members[mi];
-    const PTAG = { mean: 'MEAN', min: 'MIN', swath: 'SWATH' };
+    const PTAG = { mean: 'MEAN', min: 'MIN', swath: 'SWATH', prob: 'P(<' + 'LEVEL)', strike: 'STRIKE' };
     const sb = { pos: $('#sbPos'), val: $('#sbVal'), low: $('#sbLow'), zoom: $('#sbZoom') };
     const updateZoomReadout = () => { sb.zoom.textContent = `ZOOM ${map.getZoom().toFixed(2)}`; };
     function updateTip() {
@@ -387,17 +483,19 @@
       const near = state.lowsPx.filter(([px, py]) => Math.hypot(px - x, py - y - state.lowSize * 0.15) < hit).sort((a, b) => a[2] - b[2]);
       let html = '';
       if (v != null) {
-        html += `<div class="tt-val"><i style="background:${classColor(v)}"></i><b>${v.toFixed(1)}</b><span>hPa</span></div>` +
+        const pct = isPct();
+        html += `<div class="tt-val"><i style="background:${classColor(v)}"></i><b>${fmtVal(v)}</b><span>${pct ? '%' : 'hPa'}</span></div>` +
                 `<div class="tt-sub">${shortOf(state.family)} · ${tipLabel()}</div>` +
-                (catOf(v) ? `<div class="tt-cat">\u2248 ${catOf(v)} pressure</div>` : '');
+                (!pct && catOf(v) ? `<div class="tt-cat">\u2248 ${catOf(v)} pressure</div>` : '') +
+                (pct && state.members && !(isBlend(state.family) && fams[state.family].weighting === 'equal') ? `<div class="tt-cat">\u2248 ${Math.round(v * state.members.total / 100)} of ${state.members.total} members</div>` : '');
         if (blendVals && blendVals.every(([, x]) => x != null)) {
           const xs = blendVals.map(([, x]) => x);
-          const sgn = (d) => `${d >= 0 ? '+' : '\u2212'}${Math.abs(d).toFixed(1)}`;
+          const sgn = (d) => `${d >= 0 ? '+' : '\u2212'}${pct ? Math.abs(d).toFixed(0) : Math.abs(d).toFixed(1)}`;
           const diff = blendVals.length === 2
             ? [`${shortOf(blendVals[1][0])} \u2212 ${shortOf(blendVals[0][0])}`, sgn(xs[1] - xs[0])]
-            : ['Spread (max \u2212 min)', (Math.max(...xs) - Math.min(...xs)).toFixed(1)];
+            : ['Spread (max \u2212 min)', fmtVal(Math.max(...xs) - Math.min(...xs))];
           html += '<div class="tt-fams">' +
-            blendVals.map(([k, x]) => `<div class="tt-frow"><span class="sw" style="background:${sysColor(k)}"></span><span>${shortOf(k)}</span><b>${x.toFixed(1)}</b></div>`).join('') +
+            blendVals.map(([k, x]) => `<div class="tt-frow"><span class="sw" style="background:${sysColor(k)}"></span><span>${shortOf(k)}</span><b>${fmtVal(x)}${pct ? '%' : ''}</b></div>`).join('') +
             `<div class="tt-frow tt-d"><span></span><span>${diff[0]}</span><b>${diff[1]}</b></div></div>`;
         }
       } else {
@@ -405,6 +503,7 @@
       }
       if (v != null && reached != null && reached >= 0) html += `<div class="tt-sub">Lowest reached at F${pad3(reached)} · ${validOf(reached)}</div>`;
       html += `<div class="tt-ll">${fmtLat(ll.lat)}  ${fmtLon(ll.lng)}</div>`;
+      if (hoverTrack) { const q = trackPx.find((z) => z.t === hoverTrack); if (q) html += `<div class="tt-lows"><div class="tt-h">Member low track</div><div class="tt-row"><span style="color:${q.col}">${trackInfo(q)}</span></div></div>`; }
       if (near.length) {
         const who = state.product === 'min' ? 'Envelope low (lowest member)' : state.product === 'swath' ? 'Swath low (deepest so far)' : 'Member lows here';
         html += `<div class="tt-lows"><div class="tt-h">${who}</div>` +
@@ -413,8 +512,8 @@
       }
       sb.pos.textContent = `LAT ${fmtLat(ll.lat)}  LON ${fmtLon(ll.lng)}`;
       sb.val.textContent = v != null
-        ? `${shortOf(state.family).toUpperCase()} ${PTAG[state.product]} ${v.toFixed(1)} hPa` +
-          (blendVals && blendVals.every(([, x]) => x != null) ? `  (${blendVals.map(([k, x]) => `${shortOf(k)} ${x.toFixed(1)}`).join(' | ')})` : '')
+        ? `${shortOf(state.family).toUpperCase()} ${state.product === 'prob' ? `P(MSLP<${state.level.prob})` : PTAG[state.product]} ${fmtVal(v)} ${isPct() ? '%' : 'hPa'}` +
+          (blendVals && blendVals.every(([, x]) => x != null) ? `  (${blendVals.map(([k, x]) => `${shortOf(k)} ${fmtVal(x)}`).join(' | ')})` : '')
         : 'MSLP —';
       sb.low.textContent = near.length ? `L ${near[0][2].toFixed(1)} hPa ${memberName(near[0][3])}${near.length > 1 ? ` (+${near.length - 1})` : ''}` : '';
       tip.innerHTML = html;
@@ -426,7 +525,14 @@
       tip.style.left = `${Math.max(6, left)}px`;
       tip.style.top = `${Math.max(6, top)}px`;
     }
-    const onPointer = (e) => { lastPt = { x: e.containerPoint.x, y: e.containerPoint.y, ll: e.latlng }; updateTip(); };
+    const onPointer = (e) => {
+      lastPt = { x: e.containerPoint.x, y: e.containerPoint.y, ll: e.latlng };
+      if (opts.tracks) {
+        const q = pickTrack(e.containerPoint.x, e.containerPoint.y), t = q ? q.t : null;
+        if (t !== hoverTrack) { hoverTrack = t; drawTracks(); }
+      }
+      updateTip();
+    };
     map.on('mousemove', onPointer);
     map.on('click', onPointer);                                   // touch: tap to read a point
     map.on('mouseout', () => { lastPt = null; updateTip(); });
@@ -470,12 +576,56 @@
       return next;
     };
 
-    /** Everything needed to draw one view / product / hour: {field, lows, tips{system: field}, when?} */
-    async function buildResult(view, prod, fh) {
+    // strike probability: per system / level / radius, computed once from that system's member tracks (all hours at once)
+    const strikeGeom = (() => {
+      const d = 0.25;
+      return { nx: Math.round((dom.east - dom.west) / d) + 1, ny: Math.round((dom.north - dom.south) / d) + 1, lon0: dom.west, lat0: dom.south, dlon: d, dlat: d };
+    })();
+    const strikeCache = new Map();
+    function strikeFor(sys, level, radius) {
+      const key = `${sys}/${level}/${radius}`;
+      if (!strikeCache.has(key)) {
+        const p = tracksFor(sys).then((d) => {
+          const fhs = frames.filter((f) => f.avail[sys]).map((f) => f.fh);
+          return { res: E.strikeCounts(d.tracks, strikeGeom, radius, level, fhs), fhs };
+        });
+        strikeCache.set(key, p);
+        p.catch(() => strikeCache.delete(key));
+        if (strikeCache.size > 12) strikeCache.delete(strikeCache.keys().next().value);
+      }
+      return strikeCache.get(key);
+    }
+
+    /** Everything needed to draw one view / product / hour: {field, lows, tips{system: field}, when?, members?} */
+    async function buildResult(view, prod, fh, opt) {
       const parts = isBlend(view) ? fams[view].parts : [view];
       const off = []; let o = 0;
       for (const k of parts) { off.push(o); o += fams[k].members.length; }   // each system's member indices inside this view's member list
       const tips = {};
+      if (prod === 'prob') {
+        const gs = await Promise.all(parts.map((k) => fetchGrid(k, 'prob', fh)));
+        const li = gs[0].levels.indexOf(opt.level);
+        const fields = gs.map((g, i) => { const f = E.fieldOf(g, E.probPercent(g, li)); tips[parts[i]] = f; return f; });
+        let field = fields[0];
+        if (parts.length > 1) {
+          const vs = fields.map((f, i) => (i ? E.regridLinear(f.v, E.regridPlan(f, fields[0])) : f.v));
+          field = Object.assign(E.geomOf(fields[0]), { v: E.blendMean(vs, weighting === 'equal' ? parts.map(() => 1) : gs.map((g) => g.members)) });
+        }
+        return { field, lows: [], tips, members: { total: gs.reduce((n, g) => n + g.members, 0) } };
+      }
+      if (prod === 'strike') {
+        const per = await Promise.all(parts.map((k) => strikeFor(k, opt.level, opt.radius)));
+        const fields = per.map((st, i) => {
+          const fi = st.fhs.indexOf(fh), nm = fams[parts[i]].members.length;
+          const f = Object.assign({}, st.res.geom, { v: E.strikePercent(st.res, fi, nm) });
+          tips[parts[i]] = f;
+          return f;
+        });
+        const field = parts.length > 1
+          ? Object.assign({}, fields[0], { v: E.blendMean(fields.map((f) => f.v), weighting === 'equal' ? parts.map(() => 1) : parts.map((k) => fams[k].members.length)) })
+          : fields[0];
+        return { field, lows: [], tips, members: { total: parts.reduce((n, k) => n + fams[k].members.length, 0) } };
+      }
       if (prod === 'mean') {
         const gs = await Promise.all(parts.map((k) => fetchGrid(k, 'mean', fh)));
         const fields = gs.map((g, i) => { const f = E.fieldOf(g, E.toHpa(g.t)); tips[parts[i]] = f; return f; });
@@ -515,13 +665,19 @@
       return { field, lows, tips, when: low.when };
     }
     const resultCache = new Map();
+    const optOf = (prod) => ({ level: state.level[prod], radius: state.radius });     // options that change a product's values
+    const optKey = (prod) => (prod === 'prob' ? `${state.level.prob}` : prod === 'strike' ? `${state.level.strike}/${state.radius}` : '');
     function computeView(view, prod, fh) {
-      const key = `${view}/${prod}/${fh}`;
+      const key = `${view}/${prod}/${optKey(prod)}/${fh}`;
       if (resultCache.has(key)) return resultCache.get(key);
-      const p = buildResult(view, prod, fh).then((R) => { R.disp = E.upsample(R.field, R.field.dlon < 0.4 ? 2 : 4); return R; });
+      const p = buildResult(view, prod, fh, optOf(prod)).then((R) => {
+        // probabilities are smooth enough to be shown bilinearly; pressure fields get Catmull-Rom smoothing
+        R.disp = (prod === 'prob' || prod === 'strike') ? R.field : E.upsample(R.field, R.field.dlon < 0.4 ? 2 : 4);
+        return R;
+      });
       resultCache.set(key, p);
       p.catch(() => resultCache.delete(key));
-      if (resultCache.size > 10) resultCache.delete(resultCache.keys().next().value);
+      if (resultCache.size > 12) resultCache.delete(resultCache.keys().next().value);
       return p;
     }
 
@@ -557,7 +713,7 @@
       const f = vframes[state.idx];
       const prod = state.product, fam = state.family;
       updateTimeline(f);
-      const slow = setTimeout(() => setStatus(prod === 'swath' ? `Accumulating the swath to F${pad3(f.fh)}…` : `Loading F${pad3(f.fh)}…`), 250);
+      const slow = setTimeout(() => setStatus(prod === 'swath' ? `Accumulating the swath to F${pad3(f.fh)}…` : prod === 'strike' ? 'Computing strike probability…' : `Loading F${pad3(f.fh)}…`), 250);
       try {
         const R = await computeView(fam, prod, f.fh);
         if (my !== token) return;
@@ -565,8 +721,10 @@
         state.lows = R.lows;
         state.grid = R.field;
         state.when = R.when || null;
+        state.members = R.members || null;
         state.tipGrids = isBlend(fam) ? R.tips : null;
         drawData();
+        drawTracks();
         drawLows();
         updateTip();
         setStatus('');
@@ -581,7 +739,8 @@
       const parts = isBlend(state.family) ? fams[state.family].parts : [state.family];
       for (let k = 1; k <= 2; k++) {
         const nf = vframes[(state.idx + k) % vframes.length];
-        parts.forEach((p) => fetchGrid(p, state.product === 'mean' ? 'mean' : 'min', nf.fh).catch(() => {}));
+        const kind = { mean: 'mean', prob: 'prob', strike: null }[state.product] === undefined ? 'min' : { mean: 'mean', prob: 'prob', strike: null }[state.product];
+        if (kind) parts.forEach((p) => fetchGrid(p, kind, nf.fh).catch(() => {}));
       }
     }
 
@@ -591,6 +750,7 @@
       const P = manifest.products[state.product];
       const n = P.colors.length;
       const e = P.edges;
+      if (P.units === '%') { buildPctLegend(P); return; }
       const segs = (manifest.scale && manifest.scale.segments) || [];
       const barPx = Math.min(500, window.innerWidth - 20) - 26;
       const hinges = segs.map((g) => g.to_hpa).filter((v) => v != null);          // every intensity threshold, e.g. [925, 950, ..., 1005]
@@ -624,6 +784,20 @@
         `<div class="lg-ticks">${ticks}</div>${cats ? `<div class="lg-cats" title="Typical pressure for each wind-intensity class (NOAA Dvorak wind-pressure table, rounded to 5 hPa) - a rough guide only">${cats}</div>` : ''}${lowsRow}`;
       updateCaveLegend(vframes[state.idx]);
     }
+    // probability products: one class per step of the percentage scale, no pressure bands
+    function buildPctLegend(P) {
+      const e = P.edges, n = P.colors.length;
+      const barPx = Math.min(500, window.innerWidth - 20) - 26;
+      const every = barPx / n < 30 ? 2 : 1;
+      const ticks = e.map((v, k) => (k % every ? '' : `<span style="left:${(((k + 1) / n) * 100).toFixed(2)}%">${v}</span>`)).join('');
+      const what = state.product === 'prob'
+        ? `Share of ${isBlend(state.family) ? 'the systems\u2019 members' : 'members'} with MSLP below ${state.level.prob} hPa${levelName(state.level.prob) ? ` (${levelName(state.level.prob)} pressure)` : ''}`
+        : `Share of members with a low below ${state.level.strike} hPa within ${state.radius} km, through the hour shown`;
+      $('#legend').innerHTML =
+        `<div class="lg-bar" role="img" aria-label="Probability scale from below ${e[0]} % to above ${e[e.length - 1]} %">${P.colors.map((c) => `<i${c === 'transparent' ? ' class="none"' : ` style="background:${c}"`}></i>`).join('')}</div>` +
+        `<div class="lg-ticks">${ticks}</div><div class="lg-note">${what} (%)</div>`;
+      updateCaveLegend(vframes[state.idx]);
+    }
     function updateCaveLegend(f) {
       if (!f) return;
       const P = manifest.products[state.product];
@@ -632,11 +806,13 @@
       const who = ps ? `BLEND: ${ps.map((k) => (ps.length > 2 ? shortOf(k) : fams[k].label)).join(' + ')}`.toUpperCase() : F.label.toUpperCase();
       const nm = ps ? ps.map((k) => fams[k].members.length).join(' + ') : F.members.length;
       const suffix = ps && state.product === 'mean'
-        ? ` — ${F.weighting === 'equal' ? 'EQUAL-WEIGHT' : 'POOLED MEMBERS'}` : '';
+        ? ` — ${F.weighting === 'equal' ? 'EQUAL-WEIGHT' : 'POOLED MEMBERS'}`
+        : state.product === 'prob' ? ` — MSLP BELOW ${state.level.prob} hPa`
+        : state.product === 'strike' ? ` — LOW BELOW ${state.level.strike} hPa WITHIN ${state.radius} km` : '';
       $('#caveLegend').innerHTML =
         `<div class="cv-1">${who} · ${fmtInit(run.init).toUpperCase()} · ${nm} MEMBERS</div>` +
-        `<div class="cv-2">${P.title.toUpperCase()}${suffix} (hPa)</div>` +
-        `<div class="cv-3">${state.product === 'swath' ? `F${pad3(vframes[0].fh)}\u2013F${pad3(f.fh)} · THROUGH` : `F${pad3(f.fh)} · VALID`} ${fmtCave(f.valid)}</div>`;
+        `<div class="cv-2">${P.title.toUpperCase()}${suffix} (${P.units === '%' ? '%' : 'hPa'})</div>` +
+        `<div class="cv-3">${state.product === 'swath' || state.product === 'strike' ? `F${pad3(vframes[0].fh)}\u2013F${pad3(f.fh)} · THROUGH` : `F${pad3(f.fh)} · VALID`} ${fmtCave(f.valid)}</div>`;
     }
 
     // ---- timeline / transport ------------------------------------------------------------------
@@ -694,6 +870,9 @@
       else if (e.key === '1') setProduct('mean');
       else if (e.key === '2') setProduct('min');
       else if (e.key === '3') setProduct('swath');
+      else if (e.key === '4') setProduct('prob');
+      else if (e.key === '5') setProduct('strike');
+      else if (e.key === 'k' || e.key === 'K') setTracks(!opts.tracks);
       else if (e.key === 'g' || e.key === 'G') setFamily('gefs');
       else if (e.key === 'e' || e.key === 'E') setFamily('ifs');
       else if (e.key === 'c' || e.key === 'C') setFamily('geps');
@@ -775,13 +954,188 @@
       setFamily(key);
     }
 
+
+    // ---- animated GIF export ----------------------------------------------------------------------
+    // The picture is composed from what is on screen: every map canvas (in pane order, with the pane's opacity), then the
+    // title block and the colour legend, which are copied from their HTML (position, colours, fonts), so the GIF always
+    // matches the current theme and product. Frames are stepped through with the normal show() path.
+    const gifdlg = $('#gifdlg');
+    const gif = { busy: false, cancel: false };
+    const gifEls = { from: $('#gifFrom'), to: $('#gifTo'), size: $('#gifSize'), prog: $('#gifProg'), msg: $('#gifMsg'), go: $('#gifGo'), close: $('#gifCancel'), what: $('#gifWhat') };
+    const nextPaint = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const mapPx = () => { const r = map.getContainer().getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height) }; };
+    function gifSizes() {
+      const m = mapPx(), base = Math.min(1, 1000 / m.w);
+      return [1, 0.75, 0.5, 0.35].map((k) => { const sc = base * k; return { sc, w: Math.max(2, Math.round(m.w * sc)), h: Math.max(2, Math.round(m.h * sc)) }; });
+    }
+    function openGif() {
+      if (gif.busy) { gifdlg.showModal && !gifdlg.open && gifdlg.showModal(); return; }
+      setPlaying(false);
+      const opt = vframes.map((f, i) => `<option value="${i}">F${pad3(f.fh)} · ${fmtCave(f.valid)}</option>`).join('');
+      gifEls.from.innerHTML = opt; gifEls.to.innerHTML = opt;
+      gifEls.from.value = 0; gifEls.to.value = vframes.length - 1;
+      const sizes = gifSizes();
+      gifEls.size.innerHTML = sizes.map((z, i) => `<option value="${i}">${z.w} × ${z.h} px</option>`).join('');
+      gifEls.size.value = Math.max(0, sizes.findIndex((z) => z.w <= 800));
+      const P = manifest.products[state.product];
+      gifEls.what.textContent = `${shortOf(state.family)} · ${P.short || P.title}${state.product === 'prob' ? ` (below ${state.level.prob} hPa)` : state.product === 'strike' ? ` (below ${state.level.strike} hPa, ${state.radius} km)` : ''} · the map as currently shown (view, layers, theme and opacity).`;
+      gifEls.msg.textContent = ''; gifEls.prog.hidden = true; gifEls.go.disabled = false;
+      if (!gifdlg.open) gifdlg.showModal();
+    }
+    // draw text/boxes of an HTML subtree onto ctx (coordinates relative to the map container)
+    function paintDom(ctx, root, origin) {
+      const rr = root.getBoundingClientRect();
+      const box = (el) => { const r = el.getBoundingClientRect(); return { x: r.left - origin.left, y: r.top - origin.top, w: r.width, h: r.height }; };
+      const walk = (el, top) => {
+        const cs = getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden') return;
+        const b = box(el);
+        if (b.w <= 0 || b.h <= 0) return;
+        const bg = cs.backgroundColor;
+        if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') { ctx.fillStyle = bg; ctx.fillRect(b.x, b.y, b.w, b.h); }
+        else if (el.classList.contains('none') && cs.backgroundImage !== 'none') {        // hatched "no colour" class
+          ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--line') || '#888';
+          ctx.save(); ctx.beginPath(); ctx.rect(b.x, b.y, b.w, b.h); ctx.clip();
+          for (let x = -b.h; x < b.w; x += 4) { ctx.beginPath(); ctx.moveTo(b.x + x, b.y + b.h); ctx.lineTo(b.x + x + b.h, b.y); ctx.stroke(); }
+          ctx.restore();
+        }
+        const bw = parseFloat(cs.borderTopWidth);
+        if (bw > 0 && cs.borderTopStyle !== 'none') { ctx.strokeStyle = cs.borderTopColor; ctx.lineWidth = bw; ctx.strokeRect(b.x + bw / 2, b.y + bw / 2, b.w - bw, b.h - bw); }
+        if (el.matches('.lg-ticks > span')) {                                               // tick marks (CSS pseudo-elements are not readable)
+          const hinge = el.classList.contains('hinge'), cx = b.x + b.w / 2;
+          ctx.fillStyle = hinge ? cs.color : 'rgba(128,128,128,0.9)';
+          const th_ = hinge ? 19 : 4, w_ = hinge ? 1.5 : 1;
+          ctx.fillRect(cx - w_ / 2, b.y - th_, w_, th_);
+        }
+        for (const n of el.childNodes) {
+          if (n.nodeType === 3 && n.textContent.trim()) {
+            ctx.font = cs.font; ctx.fillStyle = cs.color; ctx.textBaseline = 'middle';
+            const range = document.createRange(); range.selectNodeContents(n);
+            const t = range.getBoundingClientRect();
+            ctx.textAlign = 'left';
+            ctx.fillText(n.textContent.trim(), t.left - origin.left, t.top - origin.top + t.height / 2 + 0.5);
+          }
+        }
+        for (const c of el.children) walk(c, false);
+      };
+      walk(root, true);
+    }
+    function composeFrame(out, sc, withText) {
+      const ctx = out.getContext('2d', { willReadFrequently: true });
+      const mc = map.getContainer(), origin = mc.getBoundingClientRect();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = getComputedStyle(mc).backgroundColor; ctx.fillRect(0, 0, out.width, out.height);
+      ctx.setTransform(sc, 0, 0, sc, 0, 0);
+      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+      const layers = [];
+      mc.querySelectorAll('canvas').forEach((cv) => {
+        const pn = cv.closest('.leaflet-pane:not(.leaflet-map-pane)');
+        const z = pn ? +getComputedStyle(pn).zIndex || 0 : +getComputedStyle(cv).zIndex || 0;
+        let op = parseFloat(getComputedStyle(cv).opacity);
+        if (pn) op *= parseFloat(getComputedStyle(pn).opacity);
+        if (cv.width && cv.height && op > 0 && getComputedStyle(cv).display !== 'none') layers.push({ cv, z, op, i: layers.length });
+      });
+      layers.sort((a, b) => a.z - b.z || a.i - b.i);
+      for (const L_ of layers) {
+        const r = L_.cv.getBoundingClientRect();
+        ctx.globalAlpha = L_.op;
+        ctx.drawImage(L_.cv, r.left - origin.left, r.top - origin.top, r.width, r.height);
+      }
+      ctx.globalAlpha = 1;
+      if (withText) { paintDom(ctx, $('#caveLegend'), origin); paintDom(ctx, $('#legend'), origin); }
+      return ctx.getImageData(0, 0, out.width, out.height);
+    }
+    async function runGif() {
+      if (gif.busy) return;
+      let a = +gifEls.from.value, b = +gifEls.to.value;
+      if (a > b) [a, b] = [b, a];
+      const z = gifSizes()[+gifEls.size.value] || gifSizes()[0];
+      const delay = +$('#gifSpeed').value, hold = +$('#gifHold').value, withText = $('#gifLegend').checked;
+      const startIdx = state.idx, wasTracks = hoverTrack;
+      gif.busy = true; gif.cancel = false;
+      gifEls.go.disabled = true; gifEls.prog.hidden = false; gifEls.prog.max = b - a + 1; gifEls.prog.value = 0;
+      for (const el of [gifEls.from, gifEls.to, gifEls.size]) el.disabled = true;
+      const out = document.createElement('canvas');
+      out.width = z.w; out.height = z.h;
+      const enc = MslpGif.createGif(z.w, z.h, { loop: 0 });
+      hoverTrack = null; tip.hidden = true;
+      try {
+        for (let i = a; i <= b; i++) {
+          if (gif.cancel) throw new Error('cancelled');
+          gifEls.msg.textContent = `Rendering frame ${i - a + 1} of ${b - a + 1} (F${pad3(vframes[i].fh)})…`;
+          state.idx = i;
+          await show();
+          await nextPaint();
+          const img = composeFrame(out, z.sc, withText);
+          enc.addFrame(img.data, delay + (i === b ? hold : 0));
+          gifEls.prog.value = i - a + 1;
+        }
+        gifEls.msg.textContent = 'Optimising colours and compressing…';
+        await new Promise((r) => setTimeout(r, 30));
+        const bytes = enc.finish();
+        const blob = new Blob([bytes], { type: 'image/gif' });
+        const nm = ['ensemble-mslp', state.family, state.product, state.product === 'prob' || state.product === 'strike' ? state.level[state.product] : '', run.id].filter((x) => x !== '').join('_').replace(/[^\w.-]+/g, '-') + '.gif';
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a'); link.href = url; link.download = nm; document.body.appendChild(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        const mb = bytes.length / 1048576;
+        gifEls.msg.textContent = `Done: ${b - a + 1} frames, ${z.w} × ${z.h} px, ${mb >= 1 ? mb.toFixed(1) + ' MB' : Math.round(bytes.length / 1024) + ' kB'} — saved as ${nm}`;
+        window.gifLast = { frames: b - a + 1, width: z.w, height: z.h, bytes: bytes.length, name: nm };
+      } catch (e) {
+        gifEls.msg.textContent = e.message === 'cancelled' ? 'Cancelled.' : `Could not create the GIF: ${e.message}`;
+      } finally {
+        gif.busy = false;
+        for (const el of [gifEls.from, gifEls.to, gifEls.size]) el.disabled = false;
+        gifEls.go.disabled = false; gifEls.prog.hidden = true;
+        state.idx = startIdx; hoverTrack = wasTracks; show();
+      }
+    }
+    gifEls.go.addEventListener('click', runGif);
+    gifEls.close.addEventListener('click', () => { if (gif.busy) gif.cancel = true; else gifdlg.close(); });
+    gifdlg.addEventListener('cancel', (e) => { if (gif.busy) { e.preventDefault(); gif.cancel = true; } });
+
+    // ---- probability / strike options (pressure level, radius) -----------------------------------
+    // a level's name = the intensity band whose upper edge it is ("1000" -> Storm+, "975" -> Cat 2+, "925" -> Cat 5)
+    function levelName(lv) {
+      const g = ((manifest.scale && manifest.scale.segments) || []).find((x) => x.label && x.to_hpa === lv);
+      return g ? `${g.label}${g.label === 'Cat 5' ? '' : '+'}` : '';
+    }
+    function syncOptBar() {
+      const prod = state.product, isP = prod === 'prob', isS = prod === 'strike';
+      $('#optGroup').hidden = !(isP || isS);
+      if (!(isP || isS)) return;
+      const lvls = isP ? probLevels : strikeLevels, cur = state.level[prod];
+      $('#lvlLabel').textContent = isP ? 'MSLP below' : 'Low deeper than';
+      $('#optLevels').innerHTML = lvls.map((lv) =>
+        `<button type="button" class="chip plain" data-act="level" data-level="${lv}" aria-pressed="${lv === cur}" title="${lv}${levelName(lv) ? ` hPa: ${levelName(lv)} pressure` : ' hPa'}">${lv}${levelName(lv) ? ` <small>${levelName(lv)}</small>` : ''}</button>`).join('');
+      $('#radLabel').hidden = !isS; $('#optRadii').hidden = !isS;
+      $('#optRadii').innerHTML = isS ? radii.map((r) => `<button type="button" class="chip plain" data-act="radius" data-radius="${r}" aria-pressed="${r === state.radius}">${r} km</button>`).join('') : '';
+    }
+    function setLevel(lv) {
+      const prod = state.product;
+      if (!(prod === 'prob' || prod === 'strike') || state.level[prod] === lv) return;
+      state.level[prod] = lv;
+      syncOptBar(); buildLegend(); writeHash(); show();
+    }
+    function setRadius(r) {
+      if (state.radius === r) return;
+      state.radius = r;
+      syncOptBar(); buildLegend(); writeHash(); show();
+    }
     function setProduct(p) {
-      if (!manifest.products[p] || p === state.product) return;
+      if (!hasProduct(p) || p === state.product) return;
       state.product = p;
       syncProductUI();
+      syncOptBar();
       buildLegend();
-      state.lows = []; state.grid = null; state.when = null; state.tipGrids = null; drawLows(); updateTip();
+      state.lows = []; state.grid = null; state.when = null; state.tipGrids = null; state.members = null; drawLows(); updateTip();
+      writeHash();
       show();
+    }
+    function setTracks(on) {
+      opts.tracks = on; $('#optTracks').checked = on;
+      hoverTrack = null; drawTracks(); updateTip(); writeHash();
     }
 
     let opacityTouched = false;                                   // until the user moves the slider, each theme uses its own default
@@ -789,6 +1143,7 @@
     $('#opacity').addEventListener('input', (e) => { opacityTouched = true; setDataOpacity(e.target.value); });
     setDataOpacity($('#opacity').value);
     $('#optLows').addEventListener('change', (e) => { opts.lows = e.target.checked; drawLows(); });
+    $('#optTracks').addEventListener('change', (e) => setTracks(e.target.checked));
     $('#optFam').addEventListener('change', (e) => { opts.byFamily = e.target.checked; buildLegend(); drawLows(); updateTip(); });
     $('#optGrat').addEventListener('change', (e) => { opts.graticule = e.target.checked; rebuildGraticule(); drawGraticule(); });
     $('#optStates').addEventListener('change', (e) => layers.states.forEach((l) => e.target.checked ? l.addTo(map) : map.removeLayer(l)));
@@ -833,6 +1188,9 @@
       if (!it) return;
       switch (it.dataset.act) {
         case 'product': setProduct(it.dataset.product); break;
+        case 'level': setLevel(+it.dataset.level); break;
+        case 'radius': setRadius(+it.dataset.radius); break;
+        case 'gif': openGif(); break;
         case 'family': setFamily(it.dataset.family); break;
         case 'blendpart': toggleBlendPart(it.dataset.part); break;
         case 'theme': applyTheme(it.dataset.theme, true); break;
@@ -853,12 +1211,18 @@
     function writeHash() {
       const f = vframes[state.idx];
       const hp = [`e=${state.family}`, `p=${state.product}`, `f=${f ? f.fh : 0}`];
+      if (state.product === 'prob' || state.product === 'strike') hp.push(`l=${state.level[state.product]}`);
+      if (state.product === 'strike') hp.push(`r=${state.radius}`);
+      if (opts.tracks) hp.push('k=1');
       if (state.view) hp.push(`v=${state.view.join(',')}`);
       history.replaceState(null, '', `#${hp.join('&')}`);
     }
 
     // ---- go ------------------------------------------------------------------------------------
-    if (hash.p && manifest.products[hash.p]) state.product = hash.p;
+    if (hash.p && hasProduct(hash.p)) state.product = hash.p;
+    if (hash.l != null) { if (probLevels.includes(hash.l)) state.level.prob = hash.l; if (strikeLevels.includes(hash.l)) state.level.strike = hash.l; }
+    if (hash.r != null && radii.includes(hash.r)) state.radius = hash.r;
+    if (hash.k) { opts.tracks = true; $('#optTracks').checked = true; }
     const hv = hash.e === 'blend' ? blendViews[0] : hash.e;                  // '#e=blend' (old links) = blend of everything
     if (hv && availableViews.includes(hv)) {
       state.family = hv;
@@ -866,6 +1230,7 @@
       rebuildViewFrames(); buildTicks();
     }
     syncProductUI();
+    syncOptBar();
     syncFamilyUI();
     applyTheme(themeName, false);
     if (hash.f != null) {
@@ -894,6 +1259,9 @@
       const [k, v] = kv.split('=');
       if (k === 'p') h.p = v;
       else if (k === 'e') h.e = v;
+      else if (k === 'l' && v !== undefined && !isNaN(+v)) h.l = +v;
+      else if (k === 'r' && v !== undefined && !isNaN(+v)) h.r = +v;
+      else if (k === 'k') h.k = v === '1';
       else if (k === 'f' && v !== undefined && !isNaN(+v)) h.f = +v;
       else if (k === 'v' && v) { const a = v.split(',').map(Number); if (a.length === 3 && a.every(Number.isFinite)) h.v = a; }
     });

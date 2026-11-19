@@ -7,6 +7,7 @@
  *   - the swath: running minimum of the member-wise minimum over the forecast hours, with the hour it was reached
  *   - low-pressure centres of any derived minimum field (a port of gefs_pipeline.products.detect_lows)
  *   - smooth upsampling + colour-class rasterisation of a field onto the map canvas
+ *   - probability planes (members below a pressure level) and strike probability from member low tracks
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
@@ -52,6 +53,10 @@
     const n = hdr.nx * hdr.ny;
     let off = 8 + hl;
     const g = Object.assign({}, hdr);
+    if (hdr.kind === 'prob') {                                 // one Int16 plane of member counts per pressure level
+      g.planes = hdr.levels.map((_, k) => unpackField(u8.subarray(off + k * 2 * n, off + (k + 1) * 2 * n), hdr.nx, hdr.ny));
+      return g;
+    }
     g.t = unpackField(u8.subarray(off, off + 2 * n), hdr.nx, hdr.ny);
     off += 2 * n;
     if (u8.length >= off + n) g.owner = u8.slice(off, off + n);
@@ -285,6 +290,7 @@
   function makeLut(edges, colors) {
     const lo = Math.floor(edges[0]) - 60, hi = Math.ceil(edges[edges.length - 1]) + 60, n = (hi - lo) * 10 + 1;
     const rgba = colors.map((h) => {
+      if (!h || h[0] !== '#') return 0;                                                           // 'transparent'
       const x = parseInt(h.slice(1), 16);
       return ((255 << 24) | ((x & 255) << 16) | (((x >> 8) & 255) << 8) | (x >> 16)) >>> 0;       // ABGR for a little-endian Uint32 view
     });
@@ -345,7 +351,78 @@
     return arr[j * f.nx + i];
   }
 
-  return { MISSING, inflate, unpackField, decodeBin, geomOf, sameGeom, toHpa, fieldOf, regridPlan, regridLinear, regridNearest,
+
+  // ---------------------------------------------------------------------------------------------
+  // probability and strike probability
+  // ---------------------------------------------------------------------------------------------
+  /** Percentage of a system's members below the level with index k, as a Float32 field value array. */
+  function probPercent(g, k) {
+    const plane = g.planes[k], n = plane.length, v = new Float32Array(n), scale = 100 / g.members;
+    for (let i = 0; i < n; i++) v[i] = plane[i] * scale;
+    return v;
+  }
+
+  const KM_PER_DEG = 111.195;
+  /**
+   * Strike probability from member low tracks.
+   *   tracks   [{m, pts: [[fh, lon, lat, hPa], ...]}]  (m = member index; every member counts once per cell)
+   *   geom     {nx, ny, lon0, lat0, dlon, dlat}        grid the result lives on
+   *   radiusKm a member "strikes" a cell when one of its lows passes within this distance of the cell centre
+   *   levelHpa only lows deeper than this (hPa, strictly below) count; the pressure is interpolated between hours
+   *   frameFhs ascending forecast hours of the frames (a hit at hour t is counted from the first frame with fh >= t)
+   * Returns {geom, cum: Uint8Array[frame]} - cum[f][cell] = number of distinct members that have struck the cell by frame f.
+   * Distances use a local equirectangular approximation (cos of the sample latitude), accurate to <1 % at these scales.
+   */
+  function strikeCounts(tracks, geom, radiusKm, levelHpa, frameFhs) {
+    const { nx, ny, lon0, lat0, dlon, dlat } = geom, ncell = nx * ny, nf = frameFhs.length;
+    const maxFh = frameFhs[nf - 1], binOf = new Uint8Array(maxFh + 2);
+    for (let h = 0, f = 0; h <= maxFh + 1; h++) { while (f < nf - 1 && frameFhs[f] < h) f++; binOf[h] = frameFhs[f] >= h ? f : nf; }
+    const cnt = [];
+    for (let f = 0; f < nf; f++) cnt.push(new Uint8Array(ncell));
+    const byMember = new Map();
+    for (const t of tracks) { if (!byMember.has(t.m)) byMember.set(t.m, []); byMember.get(t.m).push(t); }
+    const first = new Uint8Array(ncell), NONE = 255, R2 = radiusKm * radiusKm;
+    const mark = (lon, lat, b) => {
+      const cl = Math.max(0.05, Math.cos(lat * Math.PI / 180));
+      const dyDeg = radiusKm / KM_PER_DEG, dxDeg = dyDeg / cl;
+      const j0 = Math.max(0, Math.ceil((lat - dyDeg - lat0) / dlat)), j1 = Math.min(ny - 1, Math.floor((lat + dyDeg - lat0) / dlat));
+      const i0 = Math.max(0, Math.ceil((lon - dxDeg - lon0) / dlon)), i1 = Math.min(nx - 1, Math.floor((lon + dxDeg - lon0) / dlon));
+      for (let j = j0; j <= j1; j++) {
+        const dy = (lat0 + j * dlat - lat) * KM_PER_DEG, dy2 = dy * dy;
+        if (dy2 > R2) continue;
+        for (let i = i0; i <= i1; i++) {
+          const dx = (lon0 + i * dlon - lon) * KM_PER_DEG * cl;
+          if (dx * dx + dy2 <= R2) { const c = j * nx + i; if (b < first[c]) first[c] = b; }
+        }
+      }
+    };
+    for (const trs of byMember.values()) {
+      first.fill(NONE);
+      for (const t of trs) {
+        const pts = t.pts;
+        for (let i = 0; i < pts.length; i++) {
+          const a = pts[i], z = pts[i + 1];
+          if (!z) { if (a[3] < levelHpa) mark(a[1], a[2], binOf[a[0]]); continue; }
+          for (let h = a[0]; h < z[0]; h++) {                  // hourly samples along the segment (the end point starts the next one)
+            const u = (h - a[0]) / (z[0] - a[0]);
+            const p = a[3] + (z[3] - a[3]) * u;
+            if (p < levelHpa) mark(a[1] + (z[1] - a[1]) * u, a[2] + (z[2] - a[2]) * u, binOf[h]);
+          }
+        }
+      }
+      for (let c = 0; c < ncell; c++) { const b = first[c]; if (b < nf) cnt[b][c]++; }
+    }
+    for (let f = 1; f < nf; f++) { const a = cnt[f], b = cnt[f - 1]; for (let c = 0; c < ncell; c++) a[c] += b[c]; }
+    return { geom: { nx, ny, lon0, lat0, dlon, dlat }, cum: cnt };
+  }
+  /** Percentage field values (Float32) for frame index f of a strikeCounts result with n members. */
+  function strikePercent(res, f, n) {
+    const a = res.cum[f], v = new Float32Array(a.length), k = 100 / n;
+    for (let c = 0; c < a.length; c++) v[c] = a[c] * k;
+    return v;
+  }
+
+  return { MISSING, probPercent, strikeCounts, strikePercent, KM_PER_DEG, inflate, unpackField, decodeBin, geomOf, sameGeom, toHpa, fieldOf, regridPlan, regridLinear, regridNearest,
     blendMean, lowestOf, swathStart, swathFold, swathCopy, gaussSmooth, minSquare, detectLows, upsample, makeLut, rasterize,
     valueAt, nearestAt };
 });

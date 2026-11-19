@@ -27,6 +27,7 @@
       <div class="dd" role="menu">
         <button type="button" class="mi" role="menuitem" data-act="copylink"><span class="ck"></span>Copy link to this view</button>
         <button type="button" class="mi" role="menuitem" data-act="reload"><span class="ck"></span>Reload latest data</button>
+        <button type="button" class="mi" role="menuitem" data-act="gif"><span class="ck"></span>Export animated GIF…</button>
       </div>
     </div>
     <div class="menu">
@@ -38,6 +39,7 @@
         <div class="ms"></div>
         <div class="mh">Layers</div>
         <label class="mi chk"><span class="ck"><input id="optLows" type="checkbox" checked></span>Low centres (L + hPa)</label>
+        <label class="mi chk"><span class="ck"><input id="optTracks" type="checkbox"></span>Member low tracks<kbd>K</kbd></label>
         <label class="mi chk" id="optFamRow"><span class="ck"><input id="optFam" type="checkbox" checked></span>Colour blend lows by system</label>
         <label class="mi chk"><span class="ck"><input id="optStates" type="checkbox" checked></span>State / province borders</label>
         <label class="mi chk"><span class="ck"><input id="optGrat" type="checkbox" checked></span>Lat / lon grid</label>
@@ -57,6 +59,8 @@
         <button type="button" class="mi" role="menuitemradio" data-act="product" data-product="mean" aria-checked="true"><span class="ck"></span>Ensemble mean + member lows<kbd>1</kbd></button>
         <button type="button" class="mi" role="menuitemradio" data-act="product" data-product="min" aria-checked="false"><span class="ck"></span>Member-wise minimum<kbd>2</kbd></button>
         <button type="button" class="mi" role="menuitemradio" data-act="product" data-product="swath" aria-checked="false"><span class="ck"></span>Accumulated minimum (swath)<kbd>3</kbd></button>
+        <button type="button" class="mi" role="menuitemradio" data-act="product" data-product="prob" aria-checked="false"><span class="ck"></span>Probability of MSLP below a level<kbd>4</kbd></button>
+        <button type="button" class="mi" role="menuitemradio" data-act="product" data-product="strike" aria-checked="false"><span class="ck"></span>Strike probability (low within a radius)<kbd>5</kbd></button>
       </div>
     </div>
     <div class="menu">
@@ -79,6 +83,8 @@
         <button type="button" role="tab" data-act="product" data-product="mean" aria-selected="true" title="Ensemble mean + member lows (1)"><span class="seg-main">Ensemble mean</span><span class="seg-sub">+ member lows</span></button>
         <button type="button" role="tab" data-act="product" data-product="min" aria-selected="false" title="Member-wise minimum (2)"><span class="seg-main">Member minimum</span><span class="seg-sub">lowest member</span></button>
         <button type="button" role="tab" data-act="product" data-product="swath" aria-selected="false" title="Accumulated member-wise minimum, a swath of the forecast so far (3)"><span class="seg-main">Swath</span><span class="seg-sub">accumulated min</span></button>
+        <button type="button" role="tab" data-act="product" data-product="prob" aria-selected="false" title="Probability that MSLP is below a chosen level: share of members (4)"><span class="seg-main">Probability</span><span class="seg-sub">below a level</span></button>
+        <button type="button" role="tab" data-act="product" data-product="strike" aria-selected="false" title="Strike probability: share of members whose low passes within a radius, through the hour shown (5)"><span class="seg-main">Strike</span><span class="seg-sub">low within radius</span></button>
       </div>
     </div>
     <div class="tgroup opacity">
@@ -86,6 +92,7 @@
       <input id="opacity" title="Data opacity" type="range" min="20" max="100" value="85" aria-label="Data opacity">
     </div>
     <div class="tgroup tright">
+      <button type="button" class="tbtn" data-act="gif" title="Export an animated GIF of this view" aria-label="Export animated GIF">&#127910; <span class="tb-text">GIF</span></button>
       <button type="button" class="tbtn" data-act="reset" title="Reset view" aria-label="Reset view">&#8962; <span class="tb-text">Reset</span></button>
       <button type="button" class="tbtn" id="btnTheme" data-act="toggletheme" title="Switch dark / light theme (T)" aria-label="Switch dark or light theme"><span class="th-ico" aria-hidden="true"></span> <span class="tb-text" id="themeLabel">Dark</span></button>
     </div>
@@ -95,9 +102,17 @@
   <main class="stage">
     <div id="map" role="application" aria-label="Interactive map of ensemble mean sea level pressure"></div>
     <div class="cave-legend" id="caveLegend" aria-live="polite"></div>
-    <div class="blendbar" id="blendGroup" hidden>
-      <span class="tlabel">Blend of</span>
-      <div class="chips" id="blendChips" role="group" aria-label="Systems in the blend"></div>
+    <div class="stackbars">
+      <div class="blendbar" id="blendGroup" hidden>
+        <span class="tlabel">Blend of</span>
+        <div class="chips" id="blendChips" role="group" aria-label="Systems in the blend"></div>
+      </div>
+      <div class="blendbar" id="optGroup" hidden>
+        <span class="tlabel" id="lvlLabel">Below</span>
+        <div class="chips" id="optLevels" role="group" aria-label="Pressure level"></div>
+        <span class="tlabel" id="radLabel">Within</span>
+        <div class="chips" id="optRadii" role="group" aria-label="Strike radius"></div>
+      </div>
     </div>
     <section class="legend" id="legend" aria-label="Colour legend"></section>
     <div class="status" id="status" role="status" hidden></div>
@@ -138,7 +153,8 @@
         <tr><td>Move cursor</td><td>Pressure at the pointer, plus any L markers under it</td></tr>
         <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>Previous / next forecast hour</td></tr>
         <tr><td><kbd>Space</kbd></td><td>Play / pause</td></tr>
-        <tr><td><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></td><td>Ensemble mean + lows / Member minimum / Swath</td></tr>
+        <tr><td><kbd>1</kbd> … <kbd>5</kbd></td><td>Ensemble mean + lows / Member minimum / Swath / Probability / Strike probability</td></tr>
+        <tr><td><kbd>K</kbd></td><td>Show / hide each member's low tracks (hover a track to highlight it)</td></tr>
         <tr><td><kbd>G</kbd> <kbd>E</kbd> <kbd>C</kbd> <kbd>A</kbd> <kbd>B</kbd></td><td>GEFS / ECMWF IFS ENS / Canadian GEPS / NOAA AIGEFS / Blend</td></tr>
         <tr><td><kbd>T</kbd></td><td>Switch dark / light theme</td></tr>
       </table>
@@ -146,6 +162,9 @@
       <p><b>GEFS</b> – NOAA/NCEP Global Ensemble Forecast System, 31 members (control + 30), 0.25°. <b>ECMWF IFS ENS</b> – 51 members (the IFS control, which is the HRES run, plus 50 perturbed members), 0.25°. <b>CMC GEPS</b> – Canada's Global Ensemble Prediction System, 21 members (control + 20), published at 0.5°. <b>NOAA AIGEFS</b> – NOAA's AI-based Global Ensemble Forecast System (a GraphCast-derived model, 31 members: control + 30, 0.25°, 6-hourly). AIGEFS is started from GEFS initial conditions, so its members are <em>not</em> independent of GEFS, and it is published irregularly: when it is not yet available for a cycle the site is built without it and rebuilt once it arrives. All systems are shown on the same cycle and valid times.</p>
       <p><b>Blend</b> – choose <em>Blend</em>, then tick which systems to include (any two or more). The blended ensemble mean is the equal-weight average of the system means (each system counts once, whatever its size); the member minimum is the lowest value over every member of the chosen systems. L markers are the low centres of every member of the chosen systems, coloured by system (red GEFS, yellow ECMWF, teal GEPS, violet AIGEFS). In the minimum product each L is credited to the member that supplies the lowest value there. The cursor read-out lists each system's value and their difference (or, for three or more systems, the spread between the highest and lowest). GEPS is regridded from 0.5° to the finer grid when blended. Because AIGEFS shares GEFS's starting state, a GEFS + AIGEFS blend is not a blend of independent ensembles.</p>
       <p><b>Swath</b> – the accumulated member-wise minimum: at every point, the lowest pressure that <em>any</em> member of the chosen system(s) forecasts at <em>any</em> hour from F000 up to the hour shown. It builds up like a storm-track swath as you step or play through the forecast, and never rises. The L markers are the deepest points of the swath; the cursor read-out says at which forecast hour (and valid time) the minimum was reached and which member supplies it.</p>
+      <p><b>Probability</b> – the share of members (or, in a blend, the equal-weight average of the systems' shares) whose pressure is <em>below the chosen level</em> at the hour shown. The levels are the storm-intensity thresholds of the colour scale (1005 gale … 925 hPa Cat 5) plus 1010. Hover for the count; in a blend the read-out lists each system.</p>
+      <p><b>Member low tracks and strike probability</b> – every member's low centres are linked from hour to hour into tracks (switch them on with <kbd>K</kbd>; the part up to the hour shown is solid, the rest faint). <em>Strike</em> counts, at each point, the share of members that had a low <em>deeper than the chosen level</em> pass within the chosen radius at any hour from F000 up to the hour shown (like the swath it accumulates). A low in one member is counted once however long it lingers. Tracks are short-lived and only follow lows that the detector finds (below 1005 hPa), so read the percentages as indicative.</p>
+      <p><b>Animated GIF</b> – <em>File ▸ Export animated GIF</em> (or the GIF button) renders the current map view, product, ensemble and options for a range of forecast hours entirely in your browser and downloads a compressed GIF: one shared palette, and after the first frame only the pixels that change are stored.</p>
       <p><b>Colour scale</b> – the colour changes fall on storm-intensity thresholds: <em>Gale</em> (34–47 kt) ≈ 1000–1004 hPa, <em>Storm</em> (48–63 kt) ≈ 990–999, then hurricane categories <em>Cat 1</em> ≈ 975–989, <em>Cat 2</em> 965–974, <em>Cat 3</em> 950–964, <em>Cat 4</em> 925–949 and <em>Cat 5</em> below 925 hPa. Wind thresholds come from the NWS marine warnings and the Saffir-Simpson wind scale, converted to pressure with NOAA’s Dvorak table (rounded to 5 hPa). It is a rough guide only: pressure does not determine wind speed, so an extratropical low can be gale or storm force at higher pressure, and a low in a band is not a hurricane.</p>
       <p>All data are stored as compressed per-system grids; the blends, the swath, the colouring and the L markers of the minimum products are computed in your browser, so any combination of systems can be blended without extra downloads of pre-built maps.</p>
       <p>ECMWF's 06/18Z runs only reach 6 days, so on such a cycle the ECMWF and blend views end at F144.</p>
@@ -156,8 +175,33 @@
     </form>
   </dialog>
 
+  <dialog id="gifdlg" aria-label="Export animated GIF">
+    <form method="dialog" id="gifform">
+      <h2>Export animated GIF</h2>
+      <p id="gifWhat"></p>
+      <div class="gifgrid">
+        <label for="gifFrom">From</label><select id="gifFrom"></select>
+        <label for="gifTo">To</label><select id="gifTo"></select>
+        <label for="gifSize">Size</label><select id="gifSize"></select>
+        <label for="gifSpeed">Speed</label>
+        <select id="gifSpeed"><option value="500">Slow (0.5 s / frame)</option><option value="300" selected>Normal (0.3 s)</option><option value="150">Fast (0.15 s)</option></select>
+        <label for="gifHold">Last frame</label>
+        <select id="gifHold"><option value="0">No pause</option><option value="1500" selected>Hold 1.5 s</option><option value="3000">Hold 3 s</option></select>
+        <label for="gifLegend">Title &amp; legend</label>
+        <label class="chk2"><input id="gifLegend" type="checkbox" checked> include them in the picture</label>
+      </div>
+      <progress id="gifProg" value="0" max="1" hidden></progress>
+      <p id="gifMsg" aria-live="polite"></p>
+      <div class="dlg-actions">
+        <button type="button" class="tbtn" id="gifGo">Create GIF</button>
+        <button type="button" class="tbtn" id="gifCancel">Close</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="vendor/leaflet/leaflet.js"></script>
   <script src="engine.js"></script>
+  <script src="gif.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
