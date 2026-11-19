@@ -11,6 +11,9 @@ Layout (little endian), then the whole file is gzip'd:
             into a low-byte plane followed by a high-byte plane.  Smooth pressure fields become long runs of
             zeros, which gzip squeezes to a few bits per cell.  The browser reverses it exactly (lossless).
 * owner   - (min files) nx*ny Uint8: index of the member that supplies the minimum at each cell.
+
+Probability files (kind "prob") carry K planes instead of one field: header {levels:[hPa,...], members:N, ...} and,
+for every level, an Int16 plane of "number of members with MSLP below that level" coded exactly like `field` above.
 """
 from __future__ import annotations
 
@@ -25,10 +28,9 @@ MAGIC = b"GMS1"
 MISSING = -32768
 
 
-def pack_field(values: np.ndarray) -> bytes:
-    """float hPa (ny, nx) -> predicted, zig-zagged, byte-plane-split Int16 residuals."""
-    v = np.where(np.isfinite(values), np.rint(values * 10.0), MISSING).astype(np.int32)
-    ny, nx = v.shape
+def _pack_ints(v: np.ndarray) -> bytes:
+    """int (ny, nx) -> predicted (left + up - up-left), zig-zagged, byte-plane-split Int16 residuals."""
+    v = v.astype(np.int32)
     left = np.zeros_like(v); left[:, 1:] = v[:, :-1]
     up = np.zeros_like(v); up[1:, :] = v[:-1, :]
     ul = np.zeros_like(v); ul[1:, 1:] = v[:-1, :-1]
@@ -37,20 +39,25 @@ def pack_field(values: np.ndarray) -> bytes:
     return (z & 0xFF).astype(np.uint8).tobytes() + (z >> 8).astype(np.uint8).tobytes()
 
 
-def unpack_field(buf: bytes, nx: int, ny: int) -> np.ndarray:
-    """Inverse of pack_field (used by the tests; the browser has its own copy). Returns tenths as int32 (-32768 = missing)."""
+def pack_field(values: np.ndarray) -> bytes:
+    """float hPa (ny, nx) -> tenths of hPa (-32768 = missing), then `_pack_ints`."""
+    return _pack_ints(np.where(np.isfinite(values), np.rint(values * 10.0), MISSING))
+
+
+def _unpack_ints(buf: bytes, nx: int, ny: int, offset: int = 0) -> np.ndarray:
+    """Inverse of `_pack_ints`.  The predictor makes the value a 2-D running sum of the residuals (mod 2^16)."""
     n = nx * ny
-    lo = np.frombuffer(buf, np.uint8, n).astype(np.int32)
-    hi = np.frombuffer(buf, np.uint8, n, offset=n).astype(np.int32)
+    lo = np.frombuffer(buf, np.uint8, n, offset=offset).astype(np.int64)
+    hi = np.frombuffer(buf, np.uint8, n, offset=offset + n).astype(np.int64)
     z = lo | (hi << 8)
     r = ((z >> 1) ^ -(z & 1)).reshape(ny, nx)
-    out = np.zeros((ny, nx), np.int32)
-    wrap = lambda a: ((a + 32768) & 0xFFFF) - 32768
-    for j in range(ny):
-        for i in range(nx):
-            pred = (out[j, i - 1] if i else 0) + (out[j - 1, i] if j else 0) - (out[j - 1, i - 1] if i and j else 0)
-            out[j, i] = wrap(pred + r[j, i])
-    return out
+    out = np.cumsum(np.cumsum(r, axis=0), axis=1)
+    return (((out + 32768) & 0xFFFF) - 32768).astype(np.int32)
+
+
+def unpack_field(buf: bytes, nx: int, ny: int) -> np.ndarray:
+    """Used by the tests (the browser has its own copy). Returns tenths as int32 (-32768 = missing)."""
+    return _unpack_ints(buf, nx, ny)
 
 
 def encode(header: dict, field: np.ndarray, owner: np.ndarray | None = None) -> bytes:
@@ -61,6 +68,23 @@ def encode(header: dict, field: np.ndarray, owner: np.ndarray | None = None) -> 
     return gzip.compress(body, compresslevel=9, mtime=0)
 
 
+def encode_counts(header: dict, planes: np.ndarray) -> bytes:
+    """planes: (K, ny, nx) member counts, one plane per entry of header["levels"]."""
+    h = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    body = MAGIC + struct.pack("<I", len(h)) + h + b"".join(_pack_ints(p) for p in planes)
+    return gzip.compress(body, compresslevel=9, mtime=0)
+
+
+def decode_counts(blob: bytes) -> tuple[dict, np.ndarray]:
+    raw = gzip.decompress(blob)
+    assert raw[:4] == MAGIC
+    (hl,) = struct.unpack_from("<I", raw, 4)
+    hdr = json.loads(raw[8:8 + hl])
+    nx, ny, k = hdr["nx"], hdr["ny"], len(hdr["levels"])
+    off = 8 + hl
+    return hdr, np.stack([_unpack_ints(raw, nx, ny, off + i * 2 * nx * ny) for i in range(k)])
+
+
 def decode(blob: bytes) -> tuple[dict, np.ndarray, np.ndarray | None]:
     raw = gzip.decompress(blob)
     assert raw[:4] == MAGIC
@@ -68,11 +92,18 @@ def decode(blob: bytes) -> tuple[dict, np.ndarray, np.ndarray | None]:
     hdr = json.loads(raw[8:8 + hl])
     nx, ny = hdr["nx"], hdr["ny"]
     off = 8 + hl
-    tenths = unpack_field(raw[off:off + 2 * nx * ny], nx, ny)
+    tenths = _unpack_ints(raw, nx, ny, off)
     off += 2 * nx * ny
     field = np.where(tenths == MISSING, np.nan, tenths / 10.0)
     owner = np.frombuffer(raw, np.uint8, nx * ny, offset=off).reshape(ny, nx) if len(raw) > off else None
     return hdr, field, owner
+
+
+def write_counts(path: Path, header: dict, planes: np.ndarray) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    blob = encode_counts(header, planes)
+    path.write_bytes(blob)
+    return len(blob)
 
 
 def write(path: Path, header: dict, field: np.ndarray, owner: np.ndarray | None = None) -> int:
