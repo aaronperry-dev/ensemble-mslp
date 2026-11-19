@@ -205,6 +205,53 @@
     if (hash.v) map.setView([hash.v[0], hash.v[1]], hash.v[2]);
     else map.fitBounds(initial);
 
+    // ---- grid fetching (declared before the basemap so the first frame's data can download while the basemap loads) ----------
+    // The per-system grids are fetched as .bin.gz, inflated and decoded here.  Blends, the swath, the lows of derived
+    // minimum fields and the colour classes are all computed in the browser (engine.js).  The cache is bounded by decoded
+    // BYTES (a mean grid is ~0.2 MB, a member-wise-minimum grid ~0.35 MB), oldest first, and keeps what a swath or a GIF is
+    // using; a probability file is decoded for ONE pressure level only (the other seven planes would be unused memory).
+    const gridCache = new Map(), gridSize = new Map();               // `${system}/${kind}/${fh}[/${level}]` -> Promise<decoded grid>, bytes
+    let gridTotal = 0;
+    const GRID_BUDGET = Math.max(60, Math.min(200, (navigator.deviceMemory || 4) * 30)) * 1048576;
+    const gridBytes = (g) => {
+      let n = 0;
+      for (const k in g) { const v = g[k]; if (ArrayBuffer.isView(v)) n += v.byteLength; else if (Array.isArray(v)) for (const x of v) if (ArrayBuffer.isView(x)) n += x.byteLength; }
+      return n;
+    };
+    function fetchGrid(sys, kind, fh, level) {
+      const key = `${sys}/${kind}/${fh}${kind === 'prob' ? `/${level}` : ''}`;
+      if (gridCache.has(key)) { const hit = gridCache.get(key); gridCache.delete(key); gridCache.set(key, hit); return hit; }   // LRU refresh
+      const dopt = kind === 'prob' ? { level } : undefined;
+      const p = fetch(`data/${run.id}/${sys}/${kind}/f${pad3(fh)}.bin.gz`)
+        .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.arrayBuffer(); })
+        .then(E.inflate).then((buf) => E.decodeBin(buf, dopt))
+        .then((g) => {
+          if (gridCache.get(key) === p) {
+            const n = gridBytes(g); gridSize.set(key, n); gridTotal += n;
+            for (const k of gridCache.keys()) {                        // evict oldest finished grids until under budget (never this one)
+              if (gridTotal <= GRID_BUDGET) break;
+              if (k !== key && gridSize.has(k)) { gridTotal -= gridSize.get(k); gridSize.delete(k); gridCache.delete(k); }
+            }
+          }
+          return g;
+        });
+      gridCache.set(key, p);
+      p.catch(() => { gridCache.delete(key); });
+      return p;
+    }
+    // the first frame's grids start downloading now (hash-addressed view/product/hour when valid, else the defaults), in
+    // parallel with the basemap files, instead of after them
+    {
+      const hv0 = hash.e === 'blend' ? blendViews[0] : hash.e;
+      const fam0 = hv0 && availableViews.includes(hv0) ? hv0 : state.family;
+      const prod0 = hash.p && hasProduct(hash.p) ? hash.p : state.product;
+      const parts0 = isBlend(fam0) ? fams[fam0].parts : [fam0];
+      const fr0 = frames.find((f) => (hash.f != null ? f.fh === hash.f : true) && viewHas(f, fam0)) || frames.find((f) => viewHas(f, fam0));
+      const kind0 = { mean: 'mean', prob: 'prob', strike: null }[prod0] === undefined ? 'min' : { mean: 'mean', prob: 'prob', strike: null }[prod0];
+      const lv0 = hash.l != null && probLevels.includes(hash.l) ? hash.l : state.level.prob;
+      if (fr0 && kind0 && prod0 !== 'swath') parts0.forEach((k) => fetchGrid(k, kind0, fr0.fh, lv0).catch(() => {}));
+    }
+
     // ---- basemap (vector, cartographic hierarchy; colours from the active theme) ---------------
     const lineLayers = [];
     const w = (base, z, min) => Math.max(min, base * Math.pow(1.2, z - 4));   // width grows ~20 % per zoom level
@@ -562,19 +609,6 @@
     // ---- data layer ---------------------------------------------------------------------------
     // The per-system grids are fetched as .bin.gz, inflated and decoded here.  Blends, the swath, the lows of derived
     // minimum fields and the colour classes are all computed in the browser (engine.js).
-    const gridCache = new Map();                                      // `${system}/${kind}/${fh}` -> Promise<decoded grid>
-    function fetchGrid(sys, kind, fh) {
-      const key = `${sys}/${kind}/${fh}`;
-      if (gridCache.has(key)) return gridCache.get(key);
-      const p = fetch(`data/${run.id}/${sys}/${kind}/f${pad3(fh)}.bin.gz`)
-        .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.arrayBuffer(); })
-        .then(E.inflate).then(E.decodeBin);
-      gridCache.set(key, p);
-      p.catch(() => gridCache.delete(key));
-      if (gridCache.size > 360) gridCache.delete(gridCache.keys().next().value);   // ~0.3 MB each once decoded
-      return p;
-    }
-
     // swath = running minimum of each system's member-wise minimum over the forecast hours; one running state per system,
     // calls are serialised so playback folds in one hour at a time and a jump back restarts from the first hour.
     const swathRec = new Map(), swathChain = new Map();
@@ -622,7 +656,7 @@
       for (const k of parts) { off.push(o); o += fams[k].members.length; }   // each system's member indices inside this view's member list
       const tips = {};
       if (prod === 'prob') {
-        const gs = await Promise.all(parts.map((k) => fetchGrid(k, 'prob', fh)));
+        const gs = await Promise.all(parts.map((k) => fetchGrid(k, 'prob', fh, opt.level)));
         const li = gs[0].levels.indexOf(opt.level);
         const fields = gs.map((g, i) => { const f = E.fieldOf(g, E.probPercent(g, li)); tips[parts[i]] = f; return f; });
         let field = fields[0];
@@ -781,14 +815,15 @@
         clearTimeout(slow);
       }
     }
-    function prefetch() {
-      const parts = isBlend(state.family) ? fams[state.family].parts : [state.family];
-      for (let k = 1; k <= 2; k++) {
-        const nf = vframes[(state.idx + k) % vframes.length];
-        const kind = { mean: 'mean', prob: 'prob', strike: null }[state.product] === undefined ? 'min' : { mean: 'mean', prob: 'prob', strike: null }[state.product];
-        if (kind) parts.forEach((p) => fetchGrid(p, kind, nf.fh).catch(() => {}));
-      }
+    // start downloading the grids of the frame at index i of the current view (a no-op if they are cached / in flight)
+    function warmFrame(i) {
+      const nf = vframes[i % vframes.length];
+      const kind = { mean: 'mean', prob: 'prob', strike: null }[state.product];
+      const k = kind === undefined ? 'min' : kind;                    // 'min' and 'swath' both read the member-wise-minimum grids
+      if (!k) return;
+      (isBlend(state.family) ? fams[state.family].parts : [state.family]).forEach((p) => fetchGrid(p, k, nf.fh, state.level.prob).catch(() => {}));
     }
+    function prefetch() { for (let k = 1; k <= 2; k++) warmFrame(state.idx + k); }
 
     // ---- legends --------------------------------------------------------------------------------
     // (1) flat colour bar with numeric labels (bottom-left); (2) CAVE-style three-line header (top-left).
@@ -857,21 +892,28 @@
       if (state.product === 'strike') return `Strike probability: low below ${state.level.strike} hPa within ${state.radius} km`;
       return P.title;
     }
-    function updateCaveLegend(f) {
-      if (!f) return;
+    /** The words of the title block for forecast hour f of the current view/product: used by the on-screen header and the GIF. */
+    function caveParts(f) {
       const P = manifest.products[state.product];
       const F = fams[state.family];
       const ps = curParts();
-      const sys = ps ? `${ps.map((k) => shortOf(k)).join(' + ')} blend` : F.label;
-      const nm = ps ? ps.map((k) => fams[k].members.length).join(' + ') : F.members.length;
       const cumulative = state.product === 'swath' || state.product === 'strike';
-      const when = cumulative
-        ? `F${pad3(vframes[0].fh)}\u2013F${pad3(f.fh)} \u00b7 Valid through: ${fmtCave(f.valid)}`
-        : `F${pad3(f.fh)} \u00b7 Valid: ${fmtCave(f.valid)}`;
+      return {
+        sys: ps ? `${ps.map((k) => shortOf(k)).join(' + ')} blend` : F.label,
+        prod: productTitle(),
+        units: P.units === '%' ? '% of members' : 'hPa',
+        init: `Init: ${fmtInit(run.init)}`,
+        when: cumulative ? `F${pad3(vframes[0].fh)}\u2013F${pad3(f.fh)} \u00b7 Valid through: ${fmtCave(f.valid)}` : `F${pad3(f.fh)} \u00b7 Valid: ${fmtCave(f.valid)}`,
+        members: `${ps ? ps.map((k) => fams[k].members.length).join(' + ') : F.members.length} members`,
+      };
+    }
+    function updateCaveLegend(f) {
+      if (!f) return;
+      const c = caveParts(f);
       $('#caveLegend').innerHTML =
-        `<div class="cv-top"><div class="cv-title"><span class="cv-sys">${sys}</span><span class="cv-sep">|</span><span class="cv-prod">${productTitle()}</span></div>` +
-        `<span class="cv-units">${P.units === '%' ? '% of members' : 'hPa'}</span></div>` +
-        `<div class="cv-sub"><span>Init: ${fmtInit(run.init)}</span> <span>\u00b7 ${when}</span> <span class="cv-m">\u00b7 ${nm} members</span></div>`;
+        `<div class="cv-top"><div class="cv-title"><span class="cv-sys">${c.sys}</span><span class="cv-sep">|</span><span class="cv-prod">${c.prod}</span></div>` +
+        `<span class="cv-units">${c.units}</span></div>` +
+        `<div class="cv-sub"><span>${c.init}</span> <span>\u00b7 ${c.when}</span> <span class="cv-m">\u00b7 ${c.members}</span></div>`;
     }
 
     // ---- timeline / transport ------------------------------------------------------------------
@@ -1015,18 +1057,22 @@
 
 
     // ---- animated GIF export ----------------------------------------------------------------------
-    // The picture is composed from what is on screen: every map canvas (in pane order, with the pane's opacity), then the
-    // title block and the colour legend, which are copied from their HTML (position, colours, fonts), so the GIF always
-    // matches the current theme and product. Frames are stepped through with the normal show() path.
+    // The picture is composed from what is on screen: every map canvas (in pane order, with the pane's opacity) and the colour
+    // legend.  The title and subtitle are always drawn (on the canvas, in a fixed layout that does not depend on the screen
+    // size), per frame, so every GIF names its system, product, units, run, forecast hour and valid time.  For speed the layers
+    // that do not change between frames (land, lakes, borders, graticule, the legend) are flattened ONCE into a few cached
+    // canvases; only the data, track and low-centre canvases are drawn per frame.  Frames are stepped through with the normal
+    // show() path, with the next grids downloading ahead of it.
     const gifdlg = $('#gifdlg');
     const gif = { busy: false, cancel: false };
     const gifEls = { from: $('#gifFrom'), to: $('#gifTo'), size: $('#gifSize'), prog: $('#gifProg'), msg: $('#gifMsg'), go: $('#gifGo'), close: $('#gifCancel'), what: $('#gifWhat') };
-    const nextPaint = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const macroTask = () => new Promise((r) => setTimeout(r, 0));     // lets the progress bar repaint (rAF would stall in a background tab)
     const mapPx = () => { const r = map.getContainer().getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height) }; };
     function gifSizes() {
       const m = mapPx(), base = Math.min(1, 1000 / m.w);
       return [1, 0.75, 0.5, 0.35].map((k) => { const sc = base * k; return { sc, w: Math.max(2, Math.round(m.w * sc)), h: Math.max(2, Math.round(m.h * sc)) }; });
     }
+    const gifSummary = () => `${caveParts(vframes[state.idx]).sys} \u00b7 ${productTitle()}`;
     function openGif() {
       if (gif.busy) { gifdlg.showModal && !gifdlg.open && gifdlg.showModal(); return; }
       setPlaying(false);
@@ -1036,16 +1082,14 @@
       const sizes = gifSizes();
       gifEls.size.innerHTML = sizes.map((z, i) => `<option value="${i}">${z.w} × ${z.h} px</option>`).join('');
       gifEls.size.value = Math.max(0, sizes.findIndex((z) => z.w <= 800));
-      const P = manifest.products[state.product];
-      gifEls.what.textContent = `${shortOf(state.family)} · ${P.short || P.title}${state.product === 'prob' ? ` (below ${state.level.prob} hPa)` : state.product === 'strike' ? ` (below ${state.level.strike} hPa, ${state.radius} km)` : ''} · the map as currently shown (view, layers, theme and opacity).`;
+      gifEls.what.textContent = `${gifSummary()} — the map as currently shown (view, layers, theme and opacity), with a title and subtitle on every frame.`;
       gifEls.msg.textContent = ''; gifEls.prog.hidden = true; gifEls.go.disabled = false;
       if (!gifdlg.open) gifdlg.showModal();
     }
-    // draw text/boxes of an HTML subtree onto ctx (coordinates relative to the map container)
+    // draw text/boxes of an HTML subtree onto ctx (coordinates relative to the map container); used for the colour legend
     function paintDom(ctx, root, origin) {
-      const rr = root.getBoundingClientRect();
       const box = (el) => { const r = el.getBoundingClientRect(); return { x: r.left - origin.left, y: r.top - origin.top, w: r.width, h: r.height }; };
-      const walk = (el, top) => {
+      const walk = (el) => {
         const cs = getComputedStyle(el);
         if (cs.display === 'none' || cs.visibility === 'hidden') return;
         const b = box(el);
@@ -1068,73 +1112,159 @@
         }
         for (const n of el.childNodes) {
           if (n.nodeType === 3 && n.textContent.trim()) {
-            ctx.font = cs.font; ctx.fillStyle = cs.color; ctx.textBaseline = 'middle';
+            ctx.font = cs.font; ctx.fillStyle = cs.color; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
             const range = document.createRange(); range.selectNodeContents(n);
             const t = range.getBoundingClientRect();
-            ctx.textAlign = 'left';
             ctx.fillText(n.textContent.trim(), t.left - origin.left, t.top - origin.top + t.height / 2 + 0.5);
           }
         }
-        for (const c of el.children) walk(c, false);
+        for (const c of el.children) walk(c);
       };
-      walk(root, true);
+      walk(root);
     }
-    function composeFrame(out, sc, withText) {
-      const ctx = out.getContext('2d', { willReadFrequently: true });
-      const mc = map.getContainer(), origin = mc.getBoundingClientRect();
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.globalAlpha = 1;
-      ctx.fillStyle = getComputedStyle(mc).backgroundColor; ctx.fillRect(0, 0, out.width, out.height);
-      ctx.setTransform(sc, 0, 0, sc, 0, 0);
-      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    // word-wrap text into lines no wider than maxW (the font must already be set on ctx)
+    function wrapLines(ctx, text, maxW) {
+      const lines = []; let cur = '';
+      for (const word of text.split(' ')) {
+        const t = cur ? `${cur} ${word}` : word;
+        if (cur && ctx.measureText(t).width > maxW) { lines.push(cur); cur = word; } else cur = t;
+      }
+      if (cur) lines.push(cur);
+      return lines;
+    }
+    /** Title block in output pixels: "SYSTEM | Product title" + units on the right, then a muted monospaced init/valid/members line.
+     *  Sizes follow the picture width (not the screen), long titles wrap, so the block is the same on a phone and a desktop. */
+    function paintTitle(ctx, W, c) {
+      const cs = getComputedStyle(document.documentElement), v = (n) => cs.getPropertyValue(n).trim();
+      const u = Math.max(11, Math.min(18, Math.round(W / 58)));            // title size: 13 px at 750 wide, 11 px at 390 wide, 17 px at 1000 wide
+      const fT = `700 ${u}px ${v('--font')}`, fS = `${Math.round(u * 0.78 * 10) / 10}px ${v('--mono')}`, fU = `600 ${Math.round(u * 0.78 * 10) / 10}px ${v('--mono')}`;
+      const m = Math.round(u * 0.65), pad = Math.round(u * 0.6), gap = Math.round(u * 0.5), lh = Math.round(u * 1.3), sh = Math.round(u * 0.78 * 1.45);
+      const maxInner = W - 2 * m - 2 * pad;
+      ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+      ctx.font = fU; const uw = ctx.measureText(c.units).width;
+      ctx.font = fT;
+      const sep = '|', sepW = ctx.measureText(sep).width, sysW = ctx.measureText(c.sys).width;
+      const prodLines = wrapLines(ctx, c.prod, maxInner - sysW - sepW - 2 * gap - uw - gap).slice(0, 3);
+      // if the product title is too long to sit beside the system name, it takes its own lines underneath
+      const beside = ctx.measureText(prodLines[0] || '').width + sysW + sepW + 2 * gap + uw + gap <= maxInner;
+      const lines = beside ? prodLines : wrapLines(ctx, c.prod, maxInner).slice(0, 3);
+      const wTitle = beside ? sysW + gap + sepW + gap + Math.max(...lines.map((l) => ctx.measureText(l).width)) : Math.max(sysW, ...lines.map((l) => ctx.measureText(l).width));
+      ctx.font = fS;
+      const sub = wrapLines(ctx, `${c.init} · ${c.when} · ${c.members}`, maxInner).slice(0, 3);
+      const wSub = Math.max(...sub.map((l) => ctx.measureText(l).width));
+      const inner = Math.min(maxInner, Math.max(wTitle + gap + uw, wSub));
+      const nTitle = beside ? lines.length : 1 + lines.length;
+      const bw = Math.ceil(inner + 2 * pad), bh = Math.ceil(pad * 0.9 + nTitle * lh + Math.round(u * 0.15) + sub.length * sh + pad * 0.6);
+      ctx.fillStyle = v('--panel'); ctx.fillRect(m, m, bw, bh);
+      ctx.strokeStyle = v('--line'); ctx.lineWidth = 1; ctx.strokeRect(m + 0.5, m + 0.5, bw - 1, bh - 1);
+      let y = m + Math.round(pad * 0.9) + Math.round(u * 1.0);
+      const x0 = m + pad;
+      ctx.font = fT;
+      if (beside) {
+        ctx.fillStyle = v('--ink'); ctx.fillText(c.sys, x0, y);
+        ctx.fillStyle = v('--ink-3'); ctx.font = `400 ${u}px ${v('--font')}`; ctx.fillText(sep, x0 + sysW + gap, y);
+        ctx.font = fT; ctx.fillStyle = v('--ink');
+        lines.forEach((l, i) => ctx.fillText(l, x0 + sysW + gap + sepW + gap, y + i * lh));
+      } else {
+        ctx.fillStyle = v('--ink-2'); ctx.fillText(c.sys, x0, y); y += lh; ctx.fillStyle = v('--ink');
+        lines.forEach((l, i) => ctx.fillText(l, x0, y + i * lh));
+        y -= lh;
+      }
+      ctx.font = fU; ctx.fillStyle = v('--ink-3'); ctx.textAlign = 'right'; ctx.fillText(c.units, m + bw - pad, m + Math.round(pad * 0.9) + Math.round(u * 1.0)); ctx.textAlign = 'left';
+      y += (beside ? lines.length - 1 : lines.length) * lh + Math.round(u * 0.15) + sh;
+      ctx.font = fS; ctx.fillStyle = v('--ink-2');
+      sub.forEach((l, i) => ctx.fillText(l, x0, y - Math.round(sh * 0.2) + i * sh));
+    }
+    // the map's canvases bottom to top, each marked as changing from frame to frame or not
+    function gifLayers(mc) {
       const layers = [];
       mc.querySelectorAll('canvas').forEach((cv) => {
         const pn = cv.closest('.leaflet-pane:not(.leaflet-map-pane)');
-        const z = pn ? +getComputedStyle(pn).zIndex || 0 : +getComputedStyle(cv).zIndex || 0;
-        let op = parseFloat(getComputedStyle(cv).opacity);
+        const cs = getComputedStyle(cv);
+        const z = pn ? +getComputedStyle(pn).zIndex || 0 : +cs.zIndex || 0;
+        let op = parseFloat(cs.opacity);
         if (pn) op *= parseFloat(getComputedStyle(pn).opacity);
-        if (cv.width && cv.height && op > 0 && getComputedStyle(cv).display !== 'none') layers.push({ cv, z, op, i: layers.length });
+        if (cv.width && cv.height && op > 0 && cs.display !== 'none') {
+          layers.push({ cv, z, op, i: layers.length, dyn: cv.classList.contains('data-cv') || cv.classList.contains('tracks') || cv.classList.contains('lows') });
+        }
       });
-      layers.sort((a, b) => a.z - b.z || a.i - b.i);
-      for (const L_ of layers) {
-        const r = L_.cv.getBoundingClientRect();
+      return layers.sort((a, b) => a.z - b.z || a.i - b.i);
+    }
+    /** Flatten the unchanging layers into cached canvases once; returns {steps, legend} for composeFrame. */
+    function gifPlan(w, h, sc, withLegend) {
+      const mc = map.getContainer(), origin = mc.getBoundingClientRect();
+      const mk = () => { const c = document.createElement('canvas'); c.width = w; c.height = h; const x = c.getContext('2d'); x.setTransform(sc, 0, 0, sc, 0, 0); x.imageSmoothingEnabled = true; x.imageSmoothingQuality = 'high'; return [c, x]; };
+      const place = (L_) => { const r = L_.cv.getBoundingClientRect(); return [r.left - origin.left, r.top - origin.top, r.width, r.height]; };
+      const steps = [];
+      let [seg, sx] = mk();
+      sx.fillStyle = getComputedStyle(mc).backgroundColor; sx.fillRect(0, 0, w / sc, h / sc);
+      for (const L_ of gifLayers(mc)) {
+        if (!L_.dyn) { sx.globalAlpha = L_.op; sx.drawImage(L_.cv, ...place(L_)); sx.globalAlpha = 1; continue; }
+        steps.push({ seg }); steps.push({ L: L_ });                    // a changing layer ends the cached run below it
+        [seg, sx] = mk();
+      }
+      if (withLegend) paintDom(sx, $('#legend'), origin);               // the colour bar sits above every map layer
+      steps.push({ seg });
+      return { steps, origin };
+    }
+    function composeFrame(ctx, plan, sc, w, h, c) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1;
+      const mc = map.getContainer(), origin = plan.origin;
+      for (const s_ of plan.steps) {
+        if (s_.seg) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.drawImage(s_.seg, 0, 0); continue; }
+        const L_ = s_.L, r = L_.cv.getBoundingClientRect();
+        ctx.setTransform(sc, 0, 0, sc, 0, 0); ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
         ctx.globalAlpha = L_.op;
         ctx.drawImage(L_.cv, r.left - origin.left, r.top - origin.top, r.width, r.height);
       }
-      ctx.globalAlpha = 1;
-      if (withText) { paintDom(ctx, $('#caveLegend'), origin); paintDom(ctx, $('#legend'), origin); }
-      return ctx.getImageData(0, 0, out.width, out.height);
+      ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1;
+      paintTitle(ctx, w, c);
+      return ctx.getImageData(0, 0, w, h);
+    }
+    // a self-describing file name: system, product (+ level / radius), run and the forecast-hour range
+    function gifFileName(a, b) {
+      const lv = state.product === 'prob' || state.product === 'strike' ? `${state.level[state.product]}hPa` : '';
+      const rad = state.product === 'strike' ? `${state.radius}km` : '';
+      return ['ensemble-mslp', state.family, state.product, lv, rad, run.id, `F${pad3(vframes[a].fh)}-F${pad3(vframes[b].fh)}`].filter((x) => x !== '').join('_').replace(/[^\w.-]+/g, '-') + '.gif';
     }
     async function runGif() {
       if (gif.busy) return;
       let a = +gifEls.from.value, b = +gifEls.to.value;
       if (a > b) [a, b] = [b, a];
       const z = gifSizes()[+gifEls.size.value] || gifSizes()[0];
-      const delay = +$('#gifSpeed').value, hold = +$('#gifHold').value, withText = $('#gifLegend').checked;
+      const delay = +$('#gifSpeed').value, hold = +$('#gifHold').value, withLegend = $('#gifLegend').checked;
       const startIdx = state.idx, wasTracks = hoverTrack;
       gif.busy = true; gif.cancel = false;
       gifEls.go.disabled = true; gifEls.prog.hidden = false; gifEls.prog.max = b - a + 1; gifEls.prog.value = 0;
       for (const el of [gifEls.from, gifEls.to, gifEls.size]) el.disabled = true;
-      const out = document.createElement('canvas');
-      out.width = z.w; out.height = z.h;
-      const enc = MslpGif.createGif(z.w, z.h, { loop: 0 });
       hoverTrack = null; tip.hidden = true;
       try {
+        const AHEAD = 6;                                               // frames of grids kept downloading ahead of the one being drawn
+        const warm = (i) => { for (let k = 0; k <= AHEAD && i + k <= b; k++) warmFrame(i + k); };
+        state.idx = a; warm(a);
+        await show();                                                  // first frame also settles the layers before they are flattened
+        const out = document.createElement('canvas');
+        out.width = z.w; out.height = z.h;
+        const ctx = out.getContext('2d', { willReadFrequently: true });
+        const plan = gifPlan(z.w, z.h, z.sc, withLegend);
+        const first = caveParts(vframes[a]), last = caveParts(vframes[b]);
+        const enc = MslpGif.createGif(z.w, z.h, { loop: 0,
+          comment: `${first.sys} | ${first.prod} (${first.units}). ${first.init}; ${first.when.split(' · ')[0]} to ${last.when.split(' · ')[0]}; ${first.members}. Ensemble MSLP viewer.` });
         for (let i = a; i <= b; i++) {
           if (gif.cancel) throw new Error('cancelled');
           gifEls.msg.textContent = `Rendering frame ${i - a + 1} of ${b - a + 1} (F${pad3(vframes[i].fh)})…`;
-          state.idx = i;
-          await show();
-          await nextPaint();
-          const img = composeFrame(out, z.sc, withText);
+          gifEls.prog.value = i - a;
+          if (i > a) { state.idx = i; warm(i); await show(); }
+          const img = composeFrame(ctx, plan, z.sc, z.w, z.h, caveParts(vframes[i]));
           enc.addFrame(img.data, delay + (i === b ? hold : 0));
-          gifEls.prog.value = i - a + 1;
+          if ((i - a) % 2 === 1) await macroTask();                    // keep the page (progress bar, Cancel) responsive without waiting on a paint
         }
+        gifEls.prog.value = b - a + 1;
         gifEls.msg.textContent = 'Optimising colours and compressing…';
-        await new Promise((r) => setTimeout(r, 30));
+        await macroTask();
         const bytes = enc.finish();
         const blob = new Blob([bytes], { type: 'image/gif' });
-        const nm = ['ensemble-mslp', state.family, state.product, state.product === 'prob' || state.product === 'strike' ? state.level[state.product] : '', run.id].filter((x) => x !== '').join('_').replace(/[^\w.-]+/g, '-') + '.gif';
+        const nm = gifFileName(a, b);
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a'); link.href = url; link.download = nm; document.body.appendChild(link); link.click(); link.remove();
         setTimeout(() => URL.revokeObjectURL(url), 60000);

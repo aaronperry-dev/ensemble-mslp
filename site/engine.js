@@ -44,8 +44,10 @@
     return out;
   }
 
-  /** ArrayBuffer of an (inflated) .bin file -> {header fields..., t: Int16Array tenths, owner?: Uint8Array}. */
-  function decodeBin(buf) {
+  /** ArrayBuffer of an (inflated) .bin file -> {header fields..., t: Int16Array tenths, owner?: Uint8Array}.
+   *  A probability file holds one plane per pressure level; opts.level = hPa (or opts.plane = k) decodes only that level (planes[k]), which is all a view
+   *  ever needs - the other levels would cost memory (7 of 8 planes unused) and time. Without opts every plane is decoded. */
+  function decodeBin(buf, opts) {
     const u8 = new Uint8Array(buf);
     if (u8[0] !== 0x47 || u8[1] !== 0x4d || u8[2] !== 0x53 || u8[3] !== 0x31) throw new Error('not a grid file');
     const hl = new DataView(buf).getUint32(4, true);
@@ -54,7 +56,9 @@
     let off = 8 + hl;
     const g = Object.assign({}, hdr);
     if (hdr.kind === 'prob') {                                 // one Int16 plane of member counts per pressure level
-      g.planes = hdr.levels.map((_, k) => unpackField(u8.subarray(off + k * 2 * n, off + (k + 1) * 2 * n), hdr.nx, hdr.ny));
+      const only = opts && opts.level != null ? hdr.levels.indexOf(opts.level) : opts && opts.plane != null ? opts.plane : -1;
+      g.planes = [];
+      hdr.levels.forEach((_, k) => { if (only < 0 || k === only) g.planes[k] = unpackField(u8.subarray(off + k * 2 * n, off + (k + 1) * 2 * n), hdr.nx, hdr.ny); });
       return g;
     }
     g.t = unpackField(u8.subarray(off, off + 2 * n), hdr.nx, hdr.ny);

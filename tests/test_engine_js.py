@@ -153,3 +153,16 @@ def test_prob_planes_and_strike_probability_match_python(tmp_path):
         assert (np.diff(got, axis=0) >= 0).all() and got.max() <= 3
         if level == 995.0:
             assert got[-1].max() == 2 and got[0].max() == 0          # member 2 never gets below 995; hits start after F000's frame
+
+
+def test_decoding_one_probability_level_gives_the_same_plane(tmp_path):
+    cfg = load_config()
+    a = mkframe("g", [1010.0, 1004.0, 996.0], LATS, LONS, {2: (-90, 35, 40)})
+    build_frame(cfg, {"gefs": a}, ["gefs"], 12, tmp_path, "r")
+    level = float(cfg.prob.levels[2])
+    r = subprocess.run(["node", str(ROOT / "tests/js/plane_only.js"), str(tmp_path / "r/gefs/prob/f012.bin.gz"), str(level)],
+                       capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    js = json.loads(r.stdout)
+    assert js["filled"] == [2] and js["nfull"] == len(cfg.prob.levels)      # only the requested plane is decoded
+    assert js["same"] and js["pct"] and js["members"] == 3

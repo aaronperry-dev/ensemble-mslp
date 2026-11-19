@@ -1,6 +1,6 @@
 /* Animated GIF encoder tuned for map animations (no DOM; runs in the browser and under Node for the tests).
  *
- *   const g = MslpGif.createGif(width, height, { loop: 0 });
+ *   const g = MslpGif.createGif(width, height, { loop: 0, comment: 'title | subtitle' });   // comment is optional
  *   g.addFrame(rgbaUint8, delayMs);            // as many as needed (stored as 15-bit colour, 2 bytes per pixel)
  *   const bytes = g.finish();                  // Uint8Array containing the .gif file
  *
@@ -127,6 +127,12 @@
         out.byte(0x80 | ((bits - 1) << 4) | (bits - 1)); out.byte(0); out.byte(0);
         const table = new Uint8Array(tsize * 3); table.set(pal); out.bytes(table);
         out.byte(0x21); out.byte(0xff); out.byte(11); out.str('NETSCAPE2.0'); out.byte(3); out.byte(1); out.u16(opts.loop || 0); out.byte(0);
+        if (opts.comment) {                                                // Comment Extension: the file describes itself (title, subtitle, run, hours)
+          const text = String(opts.comment).replace(/[^\x20-\x7e]/g, '?');           // GIF comments are 7-bit ASCII
+          out.byte(0x21); out.byte(0xfe);
+          for (let i = 0; i < text.length; i += 255) { const part = text.slice(i, i + 255); out.byte(part.length); out.str(part); }
+          out.byte(0);
+        }
         let prev = null;
         for (const f of frames) {
           const idx = new Uint8Array(npx);

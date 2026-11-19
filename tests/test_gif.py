@@ -63,3 +63,14 @@ def test_static_frames_cost_almost_nothing(tmp_path):
     js1 = js.replace("f<30", "f<1").replace(str(out), str(out1))
     subprocess.run(["node", "-e", js1], check=True, cwd=ROOT)
     assert one - out1.stat().st_size < 30 * 40                       # each repeated frame is a few bytes
+
+
+def test_comment_extension_describes_the_file_and_frames_still_decode(tmp_path):
+    out = tmp_path / "c.gif"
+    js = """const G=require('%s/site/gif.js');const g=G.createGif(40,30,{loop:0,comment:'GEFS | Ensemble mean MSLP (hPa). Init: 19 Nov 2026 00Z; F000 to F240 \u00b7 31 members. '+'x'.repeat(300)});
+    const px=new Uint8Array(40*30*4).fill(200);for(let f=0;f<3;f++){px[f*4]=10;g.addFrame(px,100)}require('fs').writeFileSync('%s',g.finish());""" % (ROOT, out)
+    subprocess.run(["node", "-e", js], check=True, cwd=ROOT)
+    im, got, _ = decode(out)
+    assert im.n_frames == 3 and im.info.get("loop") == 0
+    c = im.info["comment"].decode()
+    assert c.startswith("GEFS | Ensemble mean MSLP (hPa). Init: 19 Nov 2026 00Z; F000 to F240 ? 31 members.") and len(c) > 300   # >255 bytes spans sub-blocks; non-ASCII becomes '?'
