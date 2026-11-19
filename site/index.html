@@ -93,7 +93,7 @@
     </div>
     <div class="tgroup tright">
       <button type="button" class="tbtn" data-act="gif" title="Export an animated GIF of this view" aria-label="Export animated GIF">&#127910; <span class="tb-text">GIF</span></button>
-      <button type="button" class="tbtn" data-act="reset" title="Reset view" aria-label="Reset view">&#8962; <span class="tb-text">Reset</span></button>
+      <button type="button" class="tbtn tb-reset" data-act="reset" title="Reset view" aria-label="Reset view">&#8962; <span class="tb-text">Reset</span></button>
       <button type="button" class="tbtn" id="btnTheme" data-act="toggletheme" title="Switch dark / light theme (T)" aria-label="Switch dark or light theme"><span class="th-ico" aria-hidden="true"></span> <span class="tb-text" id="themeLabel">Dark</span></button>
     </div>
   </div>
@@ -102,7 +102,8 @@
   <main class="stage">
     <div id="map" role="application" aria-label="Interactive map of ensemble mean sea level pressure"></div>
     <div class="cave-legend" id="caveLegend" aria-live="polite"></div>
-    <div class="stackbars">
+    <div class="stackbars" id="stackbars">
+      <button type="button" class="tbtn" id="stackToggle" aria-expanded="false" aria-controls="blendGroup optGroup" hidden>Options &#9662;</button>
       <div class="blendbar" id="blendGroup" hidden>
         <span class="tlabel">Blend of</span>
         <div class="chips" id="blendChips" role="group" aria-label="Systems in the blend"></div>

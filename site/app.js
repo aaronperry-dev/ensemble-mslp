@@ -1095,6 +1095,15 @@
     gifEls.close.addEventListener('click', () => { if (gif.busy) gif.cancel = true; else gifdlg.close(); });
     gifdlg.addEventListener('cancel', (e) => { if (gif.busy) { e.preventDefault(); gif.cancel = true; } });
 
+    // phones: the blend / level bars sit behind an "Options" toggle (collapsed by default) so the map stays visible
+    const stackToggle = $('#stackToggle'), stackbars = $('#stackbars');
+    const narrow = window.matchMedia('(max-width: 720px)');
+    const setStackOpen = (open) => { stackbars.classList.toggle('collapsed', !open); stackToggle.setAttribute('aria-expanded', String(open)); stackToggle.innerHTML = open ? 'Options &#9652;' : 'Options &#9662;'; };
+    stackToggle.hidden = false;
+    setStackOpen(!narrow.matches);
+    stackToggle.addEventListener('click', () => setStackOpen(stackbars.classList.contains('collapsed')));
+    narrow.addEventListener('change', (e) => setStackOpen(!e.matches));
+
     // ---- probability / strike options (pressure level, radius) -----------------------------------
     // a level's name = the intensity band whose upper edge it is ("1000" -> Storm+, "975" -> Cat 2+, "925" -> Cat 5)
     function levelName(lv) {
