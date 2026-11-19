@@ -133,6 +133,14 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
     site_src = ROOT / "site"
     out.mkdir(parents=True, exist_ok=True)
     shutil.copytree(site_src, out, dirs_exist_ok=True)               # viewer + basemap
+    # cache-busting: phones keep old CSS/JS for a long time, so every build stamps the asset URLs in index.html
+    idx = out / "index.html"
+    if idx.exists():
+        import re
+        stamp = f"{run:%Y%m%d%H}-{int(time.time())}"
+        html = idx.read_text(encoding="utf-8")
+        html = re.sub(r'((?:href|src)="(?:style\.css|engine\.js|gif\.js|app\.js))(?:\?v=[^"]*)?"', lambda m: f'{m.group(1)}?v={stamp}"', html)
+        idx.write_text(html, encoding="utf-8")
     gridio.gzip_json_tree(out / "data" / "basemap")                  # the viewer inflates *.json.gz itself
     data_dir = out / "data"
     run_id = f"{run:%Y%m%d}_{run:%H}"
