@@ -108,6 +108,22 @@
       ? { grid_deg: f.avail[fams[k].parts[0]].grid_deg, members: fams[k].parts.reduce((n, p) => n + f.avail[p].members, 0) }
       : f.avail[k]);
     const shortOf = (k) => (isBlend(k) ? 'Blend' : ({ gefs: 'GEFS', ifs: 'ECMWF', geps: 'GEPS', aigefs: 'AIGEFS' }[k] || fams[k].label));
+    // Flat vector flag of the organisation that publishes each system (USA for NOAA's GEFS and AIGEFS, EU for ECMWF, Canada for GEPS).
+    // Drawn as inline SVG rather than emoji, so they are flat (no waving) and look the same on every platform.
+    const SVG_OPEN = '<svg viewBox="0 0 30 20" aria-hidden="true" focusable="false">';
+    const FLAG_SVG = {
+      us: SVG_OPEN + '<rect width="30" height="20" fill="#fff"/>' +
+        [0, 2, 4, 6, 8, 10, 12].map((i) => `<rect y="${(i * 20 / 13).toFixed(3)}" width="30" height="${(20 / 13).toFixed(3)}" fill="#b22234"/>`).join('') +
+        '<rect width="12.3" height="10.77" fill="#3c3b6e"/>' +
+        [0, 1, 2, 3].flatMap((r) => [0, 1, 2, 3, 4].map((c) => `<circle cx="${(1.6 + c * 2.3 + (r % 2 ? 1.15 : 0)).toFixed(2)}" cy="${(1.7 + r * 2.4).toFixed(2)}" r=".7" fill="#fff"/>`)).join('') + '</svg>',
+      eu: SVG_OPEN + '<rect width="30" height="20" fill="#039"/>' +
+        Array.from({ length: 12 }, (_, i) => { const t = i * Math.PI / 6; return `<circle cx="${(15 + 6 * Math.sin(t)).toFixed(2)}" cy="${(10 - 6 * Math.cos(t)).toFixed(2)}" r="1.15" fill="#fc0"/>`; }).join('') + '</svg>',
+      ca: SVG_OPEN + '<rect width="30" height="20" fill="#fff"/><rect width="7.5" height="20" fill="#d52b1e"/><rect x="22.5" width="7.5" height="20" fill="#d52b1e"/>' +
+        '<polygon fill="#d52b1e" transform="translate(15 9.6) scale(.95)" points="0,-6 1.3,-3.5 2.6,-4 2.2,-1.2 5,-2.2 4.4,.2 5.6,1 2.6,2.6 3,3.8 .4,3.2 .4,6.4 -.4,6.4 -.4,3.2 -3,3.8 -2.6,2.6 -5.6,1 -4.4,.2 -5,-2.2 -2.2,-1.2 -2.6,-4 -1.3,-3.5"/></svg>',
+    };
+    const FLAGS = { gefs: ['us', 'United States'], aigefs: ['us', 'United States'], ifs: ['eu', 'European Union'], geps: ['ca', 'Canada'] };
+    const flagOf = (k) => (FLAGS[k] ? `<span class="flag" role="img" aria-label="${FLAGS[k][1]} flag">${FLAG_SVG[FLAGS[k][0]]}</span>` : '');
+    const keyOf = (k) => flagOf(k) || `<i style="--c:${sysColor(k)}"></i>`;   // legend key: flag (coloured square if a system has none)
     const curParts = () => (isBlend(state.family) ? fams[state.family].parts : null);
     const SYS_FALLBACK = ['#ff3a3a', '#ffd23f', '#37e8cf', '#c792ea'];
     const sysColor = (k) => (th.sys && th.sys[k]) || SYS_FALLBACK[Math.max(0, bases.indexOf(k))];
@@ -128,6 +144,8 @@
     state.radius = manifest.strike ? manifest.strike.default_km : 200;
     const hasProduct = (p) => !!manifest.products[p] && (p === 'prob' ? probLevels.length > 0 : p === 'strike' ? (strikeLevels.length > 0 && !!manifest.tracks) : true);
 
+    const HASH_EVERY_MS = 750;                                       // see writeHash(); declared early because map events can reach it during set-up
+    let hashTimer = 0, hashLast = 0;
     // frames available for the selected family (the ECMWF 06/18Z runs, e.g., stop at F144)
     let vframes = frames;
     const rebuildViewFrames = () => { vframes = frames.filter((f) => viewHas(f, state.family)); };
@@ -496,7 +514,7 @@
             ? [`${shortOf(blendVals[1][0])} \u2212 ${shortOf(blendVals[0][0])}`, sgn(xs[1] - xs[0])]
             : ['Spread (max \u2212 min)', fmtVal(Math.max(...xs) - Math.min(...xs))];
           html += '<div class="tt-fams">' +
-            blendVals.map(([k, x]) => `<div class="tt-frow"><span class="sw" style="background:${sysColor(k)}"></span><span>${shortOf(k)}</span><b>${fmtVal(x)}${pct ? '%' : ''}</b></div>`).join('') +
+            blendVals.map(([k, x]) => `<div class="tt-frow">${keyOf(k)}<span>${shortOf(k)}</span><b>${fmtVal(x)}${pct ? '%' : ''}</b></div>`).join('') +
             `<div class="tt-frow tt-d"><span></span><span>${diff[0]}</span><b>${diff[1]}</b></div></div>`;
         }
       } else {
@@ -665,20 +683,39 @@
       });
       return { field, lows, tips, when: low.when };
     }
-    const resultCache = new Map();
+    // Finished views are kept for replays and loops: least-recently-used first out, limited by memory rather than a fixed count
+    // (a 41-frame loop used to be evicted before it came round again). ~40 MB per GB of device RAM, between 80 and 320 MB.
+    const resultCache = new Map(), resultBytes = new Map();
+    const RESULT_BUDGET = Math.max(80, Math.min(320, (navigator.deviceMemory || 4) * 40)) * 1048576;
+    const bytesOf = (R) => {
+      const seen = new Set(); let n = 0;
+      const add = (a) => { if (a && a.buffer && !seen.has(a.buffer)) { seen.add(a.buffer); n += a.byteLength; } };
+      add(R.field.v); add(R.disp.v); add(R.when); Object.values(R.tips || {}).forEach((f) => add(f.v));
+      return n;
+    };
+    function trimResults(keep) {
+      let total = 0;
+      resultBytes.forEach((v) => { total += v; });
+      for (const k of resultCache.keys()) {
+        if (total <= RESULT_BUDGET) break;
+        if (k === keep || !resultBytes.has(k)) continue;           // never drop the newest or one still being computed
+        total -= resultBytes.get(k); resultCache.delete(k); resultBytes.delete(k);
+      }
+    }
     const optOf = (prod) => ({ level: state.level[prod], radius: state.radius });     // options that change a product's values
     const optKey = (prod) => (prod === 'prob' ? `${state.level.prob}` : prod === 'strike' ? `${state.level.strike}/${state.radius}` : '');
     function computeView(view, prod, fh) {
       const key = `${view}/${prod}/${optKey(prod)}/${fh}`;
-      if (resultCache.has(key)) return resultCache.get(key);
+      if (resultCache.has(key)) { const hit = resultCache.get(key); resultCache.delete(key); resultCache.set(key, hit); return hit; }   // refresh its place
       const p = buildResult(view, prod, fh, optOf(prod)).then((R) => {
         // probabilities are smooth enough to be shown bilinearly; pressure fields get Catmull-Rom smoothing
         R.disp = (prod === 'prob' || prod === 'strike') ? R.field : E.upsample(R.field, R.field.dlon < 0.4 ? 2 : 4);
+        resultBytes.set(key, bytesOf(R));
+        trimResults(key);
         return R;
       });
       resultCache.set(key, p);
-      p.catch(() => resultCache.delete(key));
-      if (resultCache.size > 12) resultCache.delete(resultCache.keys().next().value);
+      p.catch(() => { resultCache.delete(key); resultBytes.delete(key); });
       return p;
     }
 
@@ -708,16 +745,24 @@
     const scheduleData = () => { cancelAnimationFrame(rafData); rafData = requestAnimationFrame(drawData); };
     map.on('move moveend zoomend viewreset resize', scheduleData);
 
-    let token = 0;
-    async function show() {
+    let token = 0, showLoop = null, showAgain = false;
+    // show() = "display whatever state now asks for". While one view is being computed, further calls (dragging the slider, key repeat)
+    // only update the time read-out and set a flag: when the running one finishes the loop goes round once more for the LATEST request,
+    // so frames that were skipped over are never computed. The returned promise resolves when the latest request is on screen.
+    function show() {
+      if (showLoop) { showAgain = true; if (vframes[state.idx]) updateTimeline(vframes[state.idx]); return showLoop; }
+      showLoop = (async () => { try { do { showAgain = false; await showOnce(); } while (showAgain); } finally { showLoop = null; } })();
+      return showLoop;
+    }
+    async function showOnce() {
       const my = ++token;
       const f = vframes[state.idx];
       const prod = state.product, fam = state.family;
-      updateTimeline(f);
       const slow = setTimeout(() => setStatus(prod === 'swath' ? `Accumulating the swath to F${pad3(f.fh)}…` : prod === 'strike' ? 'Computing strike probability…' : `Loading F${pad3(f.fh)}…`), 250);
       try {
+        updateTimeline(f);
         const R = await computeView(fam, prod, f.fh);
-        if (my !== token) return;
+        if (my !== token || showAgain) return;                      // superseded while computing: do not draw it
         dispField = R.disp;
         state.lows = R.lows;
         state.grid = R.field;
@@ -912,7 +957,7 @@
     $('#famMenu').innerHTML = seg.map((e) =>
       `<button type="button" class="mi" role="menuitemradio" data-act="family" data-family="${e.k}" aria-checked="false"><span class="ck"></span>${e.name}<kbd>${e.key}</kbd></button>`).join('');
     $('#blendChips').innerHTML = bases.map((k) =>
-      `<button type="button" class="chip" data-act="blendpart" data-part="${k}" aria-pressed="false" style="--c:${sysColor(k)}"><i></i>${shortOf(k)}</button>`).join('');
+      `<button type="button" class="chip" data-act="blendpart" data-part="${k}" aria-pressed="false" style="--c:${sysColor(k)}">${keyOf(k)}${shortOf(k)}</button>`).join('');
     const blendKeyFor = (sel) => bases.filter((k) => sel.includes(k)).join('_');
     function syncFamilyUI() {
       const inBlend = isBlend(state.family);
@@ -1202,6 +1247,7 @@
     document.addEventListener('click', (e) => { if (!e.target.closest('.dd')) closeMenus(); });   // check-boxes keep the menu open
 
     async function copyLink() {
+      writeHashNow();                                              // make sure the copied link has the current view
       try { await navigator.clipboard.writeText(location.href); setStatus('Link copied to clipboard'); }
       catch (e) { setStatus('Copy failed — copy the address bar instead', true); }
       setTimeout(() => setStatus(''), 1800);
@@ -1231,14 +1277,22 @@
     });
 
     // ---- shareable URL state: #p=mean&f=132&v=lat,lon,zoom --------------------------------------
-    function writeHash() {
+    // Called on every frame / pan, so it is throttled (at most one history write per HASH_EVERY_MS): Safari and every iOS browser throw
+    // a SecurityError after 100 history.replaceState calls in 30 s, which used to abort the redraw mid-way. A failed write is ignored.
+    function writeHashNow() {
+      clearTimeout(hashTimer); hashTimer = 0; hashLast = performance.now();
       const f = vframes[state.idx];
       const hp = [`e=${state.family}`, `p=${state.product}`, `f=${f ? f.fh : 0}`];
       if (state.product === 'prob' || state.product === 'strike') hp.push(`l=${state.level[state.product]}`);
       if (state.product === 'strike') hp.push(`r=${state.radius}`);
       if (opts.tracks) hp.push('k=1');
       if (state.view) hp.push(`v=${state.view.join(',')}`);
-      history.replaceState(null, '', `#${hp.join('&')}`);
+      try { history.replaceState(null, '', `#${hp.join('&')}`); } catch (e) { /* rate-limited or unavailable: the URL just lags behind */ }
+    }
+    function writeHash() {
+      if (hashTimer) return;                                       // a write is already scheduled; it will read the latest state
+      const wait = HASH_EVERY_MS - (performance.now() - hashLast);
+      if (wait <= 0) writeHashNow(); else hashTimer = setTimeout(writeHashNow, wait);
     }
 
     // ---- go ------------------------------------------------------------------------------------

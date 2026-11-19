@@ -31,6 +31,10 @@ button,select,input{font:inherit;color:inherit}
 :focus-visible{outline:2px solid #5aa9e6;outline-offset:1px}
 kbd{font:12px var(--mono);border:1px solid var(--line);border-bottom-width:2px;border-radius:3px;padding:0 5px;background:var(--btn);color:var(--ink)}
 
+/* country / union flag emoji next to each model system */
+.flag{display:inline-flex;align-items:center;margin-right:.4em;line-height:1;vertical-align:middle}
+.flag svg{display:block;width:1.45em;height:.97em;outline:1px solid rgba(128,128,128,.55);outline-offset:-1px}
+
 /* ---------- title bar ---------- */
 .titlebar{display:flex;align-items:center;gap:12px;padding:6px 14px;background:var(--chrome-2);border-bottom:1px solid var(--line);min-width:0}
 .brand-mark{width:26px;height:26px;color:var(--cy);flex:none}
@@ -73,6 +77,9 @@ h1{margin:0;font-size:20px;font-weight:700;letter-spacing:.01em;white-space:nowr
 .blendbar{display:flex;flex-wrap:wrap;row-gap:6px;align-items:center;gap:9px;background:var(--panel);border:1px solid var(--line);border-radius:2px;padding:5px 9px}
 .chips{display:flex;gap:6px}
 .chip{display:flex;align-items:center;gap:7px;border:1px solid var(--line);background:var(--btn);padding:5px 12px;border-radius:3px;cursor:pointer;font-size:15px;font-weight:600}
+.chip .flag,.tt-frow .flag{margin-right:0}
+.chip:not([aria-pressed=true]) .flag{opacity:.4;filter:grayscale(1)}   /* an unticked system's flag is dimmed */
+.tt-frow .flag{flex:none;font-size:14px}
 .chip i{width:11px;height:11px;border:2px solid var(--c);background:transparent;display:inline-block;border-radius:2px}
 .chip.plain{padding:5px 10px}
 .chip.plain[aria-pressed=true]{background:var(--sel,#2d6fb3);color:#fff;border-color:var(--sel,#2d6fb3)}
