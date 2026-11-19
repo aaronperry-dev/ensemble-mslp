@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from gefs_pipeline.products import contour_bands, detect_lows, ensemble_mean, ensemble_min, upsample
+from gefs_pipeline.products import detect_lows, ensemble_mean, ensemble_min
 
 LATS = np.arange(15, 65.01, 0.25)
 LONS = np.arange(-140, -49.99, 0.25)
@@ -40,57 +40,3 @@ def test_detect_lows_ignores_border_and_outside_domain():
     f = field((-90, 40, 30))
     assert detect_lows(LATS, LONS, f, threshold_hpa=1005, radius_deg=2, smooth_deg=0.5, min_sep_deg=1.5,
                        domain=(-80, -50, 15, 65)) == []   # outside requested domain
-
-
-def test_contour_bands_partition_the_domain():
-    f = field((-90, 40, 36))                                        # 982 hPa centre -> below the 988 first edge
-    edges = list(range(988, 1045, 4))
-    feats = contour_bands(LATS, LONS, f, edges)
-    idx = [x["properties"]["i"] for x in feats]
-    assert idx == sorted(idx) and 0 in idx                          # open-ended lowest class exists
-    assert feats[-1]["properties"]["hi"] is None or feats[-1]["properties"]["hi"] > 1000
-    # polygons carry [lon, lat] pairs inside the domain
-    pts = np.array([c for ft in feats for poly in ft["geometry"]["coordinates"] for ring in poly for c in ring])
-    assert pts[:, 0].min() >= -140 and pts[:, 0].max() <= -50 and pts[:, 1].min() >= 15 and pts[:, 1].max() <= 65
-    # every ring is closed
-    for ft in feats:
-        for poly in ft["geometry"]["coordinates"]:
-            for ring in poly:
-                assert ring[0] == ring[-1]
-
-
-def test_contour_area_adds_up():
-    """Sum of band polygon areas (shoelace, outer minus holes) equals the grid area."""
-    f = field((-90, 40, 30), (-110, 30, -8))
-    feats = contour_bands(LATS, LONS, f, list(range(988, 1045, 4)), precision=4)
-
-    def area(ring):
-        r = np.array(ring)
-        return 0.5 * (np.dot(r[:-1, 0], r[1:, 1]) - np.dot(r[1:, 0], r[:-1, 1]))
-    total = sum(abs(area(poly[0])) - sum(abs(area(h)) for h in poly[1:])
-                for ft in feats for poly in ft["geometry"]["coordinates"])
-    assert total == pytest.approx((LONS[-1] - LONS[0]) * (LATS[-1] - LATS[0]), rel=2e-3)
-
-
-def test_upsample_doubles_half_degree_grid_only():
-    la, lo = LATS[::2], LONS[::2]
-    f = field((-90, 40, 30))[::2, ::2]
-    la2, lo2, f2 = upsample(la, lo, f, 0.25)
-    assert f2.shape == (2 * len(la) - 1, 2 * len(lo) - 1) and la2[0] == la[0] and lo2[-1] == lo[-1]
-    la3, lo3, f3 = upsample(LATS, LONS, field(), 0.25)              # already 0.25 -> untouched
-    assert f3.shape == (len(LATS), len(LONS))
-
-
-def test_sample_grid_decimates_and_roundtrips():
-    from gefs_pipeline.products import sample_grid
-    lats = np.arange(0, 10.01, 0.25)
-    lons = np.arange(-20, -9.99, 0.25)
-    field = 1000 + lats[:, None] + 0.1 * (lons[None, :] + 20)
-    field[3, 3] = np.nan
-    g = sample_grid(lats, lons, field, domain=(-18, -12, 2, 8), step_deg=0.5)
-    assert g["d"] == 0.5 and g["lat0"] == 2.0 and g["lon0"] == -18.0
-    assert g["nx"] == 13 and g["ny"] == 13 and len(g["v"]) == 13 * 13
-    assert g["v"][0] == round((1000 + 2.0 + 0.1 * 2.0) * 10)          # south-west corner, tenths of hPa
-    assert g["v"][-1] == round((1000 + 8.0 + 0.1 * 8.0) * 10)         # north-east corner
-    g2 = sample_grid(lats, lons, np.where(lats[:, None] == 4, np.nan, field), domain=(-18, -12, 2, 8), step_deg=0.5)
-    assert None in g2["v"]

@@ -89,7 +89,7 @@ jobs:
           fi
           python -m gefs_pipeline resolve-cycle "${args[@]}"
 
-      # Raw GRIB messages (~0.5 MB each, ~3.5 GB per cycle for the four ensembles) are only cached when a build FAILS, so a re-run of the
+      # Raw GRIB messages (~0.5 MB each, ~3.5 GB downloaded per cycle for the four ensembles (the published site is only ~15 MB of gzip'd grids)) are only cached when a build FAILS, so a re-run of the
       # same cycle resumes instead of re-downloading - without burning the repository's 10 GB cache quota every run.
       - name: Restore cached GRIB messages (resume after a failed run)
         if: steps.resolve.outputs.skip != 'true'

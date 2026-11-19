@@ -1,6 +1,5 @@
 numpy>=1.26
 scipy>=1.11
-contourpy>=1.2
 requests>=2.31
 eccodes>=2.38        # ships its own ecCodes binaries in the PyPI wheel (Linux/macOS/Windows)
 shapely>=2.0         # only used by `basemap` (build-time clipping of Natural Earth data)

@@ -1,12 +1,14 @@
 /* Ensemble MSLP viewer (NOAA GEFS, ECMWF IFS ENS, Canadian GEPS, NOAA AIGEFS, and blends of any two or more of them) — Leaflet, no build step, no runtime deps.
  *
- * Data contract (written by gefs_pipeline, manifest schema 2):
- *   data/manifest.json                         run info, families {gefs, ifs, geps, <blend views such as gefs_ifs_geps>} (+ member lists, blends carry `parts`), products
- *                                              (class edges + ColorBrewer colours), frames[{fh, valid, avail:{family:{..}}}]
- *   data/<run>/<family>/<product>/fNNN.json   GeoJSON FeatureCollection of filled contour bands, plus
- *                                              `lows`: [[lon, lat, hPa, memberIdx], ...]  (memberIdx -> families[f].members)
- *                                              `grid`: value grid for the cursor read-out of that view
- *   data/basemap/{land,lakes,coast,admin0,admin1}.json   Natural Earth vectors
+ * Data contract (written by gefs_pipeline, manifest schema 3):
+ *   data/manifest.json                          run info, families {gefs, ifs, geps, aigefs} (+ member lists), blend weighting,
+ *                                               lows_min parameters, products (class edges + colours), frames[{fh, valid, avail}]
+ *   data/<run>/<system>/mean/fNNN.bin.gz        ensemble mean grid + member lows       (gzip'd, see gefs_pipeline/gridio.py)
+ *   data/<run>/<system>/min/fNNN.bin.gz         member-wise minimum grid + owner member
+ *   data/basemap/{land,lakes,coast,admin0,admin1}.json.gz   Natural Earth vectors
+ *
+ * Only these per-system grids are shipped.  The browser (engine.js) inflates and decodes them and computes everything
+ * else: blends of any systems, the swath (running minimum), minimum-field lows, colour classes, tooltips.
  */
 (() => {
   'use strict';
@@ -57,7 +59,7 @@
   };
   let themeName = readTheme();
   let th = THEMES[themeName];
-  const state = { family: 'gefs', product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [], grid: null, tipGrids: null, lowSize: 24 };
+  const state = { family: 'gefs', product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [], grid: null, when: null, tipGrids: null, lowSize: 24 };
   const fmtCave = (iso) => {
     const d = new Date(iso);
     return `${DOW[d.getUTCDay()]} ${d.getUTCDate()} ${MON[d.getUTCMonth()]} ${d.getUTCFullYear()} ${iso.slice(11, 16)}Z`.toUpperCase();
@@ -81,11 +83,29 @@
     const run = manifest.run;
     const dom = manifest.domain;
     const bounds = L.latLngBounds([dom.south, dom.west], [dom.north, dom.east]);
+    const E = window.MslpEngine;
     const fams = manifest.families;
-    const availableViews = (manifest.views || Object.keys(fams)).filter((k) => frames.some((f) => f.avail[k]));
     const isBlend = (k) => !!(fams[k] && fams[k].parts);
-    const bases = availableViews.filter((k) => !isBlend(k));           // single systems, e.g. gefs, ifs, geps
-    const blendViews = availableViews.filter(isBlend);                  // e.g. gefs_ifs_geps, gefs_ifs, ...
+    const bases = (manifest.views || Object.keys(fams)).filter((k) => fams[k] && !fams[k].parts && frames.some((f) => f.avail[k]));   // single systems
+    // Every combination of two or more systems is a blend (largest first); the browser computes them, so none are pre-built.
+    const combos = (arr, n) => (n === 0 ? [[]] : arr.flatMap((x, i) => combos(arr.slice(i + 1), n - 1).map((c) => [x, ...c])));
+    const weighting = (manifest.blend && manifest.blend.weighting) || 'equal';
+    const blendViews = [];
+    for (let n = bases.length; n >= 2; n--) {
+      for (const c of combos(bases, n)) {
+        if (!frames.some((f) => c.every((k) => f.avail[k]))) continue;
+        const key = c.join('_');
+        fams[key] = { label: 'Blend', name: `${c.map((k) => fams[k].label).join(' + ')} blend`, org: '',
+          note: weighting === 'equal' ? 'Equal-weight mean of the system means (each system counts once)' : 'Mean of all members pooled (each member counts once)',
+          members: c.flatMap((k) => fams[k].members), parts: c, weighting };
+        blendViews.push(key);
+      }
+    }
+    const availableViews = [...bases, ...blendViews];
+    const viewHas = (f, k) => (isBlend(k) ? fams[k].parts.every((p) => f.avail[p]) : !!f.avail[k]);
+    const availOf = (f, k) => (isBlend(k)
+      ? { grid_deg: f.avail[fams[k].parts[0]].grid_deg, members: fams[k].parts.reduce((n, p) => n + f.avail[p].members, 0) }
+      : f.avail[k]);
     const shortOf = (k) => (isBlend(k) ? 'Blend' : ({ gefs: 'GEFS', ifs: 'ECMWF', geps: 'GEPS', aigefs: 'AIGEFS' }[k] || fams[k].label));
     const curParts = () => (isBlend(state.family) ? fams[state.family].parts : null);
     const SYS_FALLBACK = ['#ff3a3a', '#ffd23f', '#37e8cf', '#c792ea'];
@@ -102,7 +122,7 @@
 
     // frames available for the selected family (the ECMWF 06/18Z runs, e.g., stop at F144)
     let vframes = frames;
-    const rebuildViewFrames = () => { vframes = frames.filter((f) => f.avail[state.family]); };
+    const rebuildViewFrames = () => { vframes = frames.filter((f) => viewHas(f, state.family)); };
     rebuildViewFrames();
 
     $('#runline').textContent =
@@ -169,7 +189,13 @@
       return l;
     };
     const layers = {};
-    const loadBase = (n) => fetch(`data/basemap/${n}.json`).then((r) => r.json());
+    const loadBase = async (n) => {                            // *.json.gz inflated here; plain .json still works (dev server)
+      try {
+        const r = await fetch(`data/basemap/${n}.json.gz`);
+        if (r.ok) return JSON.parse(new TextDecoder().decode(await E.inflate(await r.arrayBuffer())));
+      } catch (e) { /* fall through */ }
+      return (await fetch(`data/basemap/${n}.json`)).json();
+    };
     const [land, lakes, coast, admin0, admin1] = await Promise.all(['land', 'lakes', 'coast', 'admin0', 'admin1'].map(loadBase));
 
     const landLayer = L.geoJSON(land, { pane: 'land', interactive: false, smoothFactor: 0.8,
@@ -271,12 +297,12 @@
       const fs = Math.round(size * 0.74);                       // hPa label size
       state.lowSize = size;
       const pts = [];
-      for (const [lon, lat, p, mi] of state.lows) {
+      for (const [lon, lat, p, mi, th_] of state.lows) {
         const pt = map.latLngToContainerPoint([lat, lon]);
         if (pt.x < -40 || pt.y < -60 || pt.x > s.x + 40 || pt.y > s.y + 40) continue;
-        pts.push({ x: pt.x, y: pt.y, p, mi, col: byFamily() ? sysColor(partOfMember(mi)) : th.low });
+        pts.push({ x: pt.x, y: pt.y, p, mi, t: th_, col: byFamily() ? sysColor(partOfMember(mi)) : th.low });
       }
-      state.lowsPx = pts.map((q) => [q.x, q.y, q.p, q.mi]);
+      state.lowsPx = pts.map((q) => [q.x, q.y, q.p, q.mi, q.t]);
       pts.sort((a, b) => b.p - a.p);                            // shallow first -> the deepest lows end up on top
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
@@ -322,21 +348,12 @@
     const tip = $('#tip');
     const tipLabel = () => (state.product === 'mean'
       ? (isBlend(state.family) ? 'Blended ensemble mean' : 'Ensemble-mean MSLP')
-      : (isBlend(state.family) ? 'Lowest of all members' : 'Lowest member MSLP'));
+      : state.product === 'swath'
+        ? (isBlend(state.family) ? 'Swath: lowest of all members so far' : 'Swath: lowest member so far')
+        : (isBlend(state.family) ? 'Lowest of all members' : 'Lowest member MSLP'));
+    const validOf = (fh) => { const fr = frames.find((x) => x.fh === fh); return fr ? fmtValid(fr.valid) : ''; };
     let lastPt = null;                                           // last pointer position {x, y, ll}
-    function valueAt(lat, lon, g) {                              // g = any {lon0, lat0, d, nx, ny, v} read-out grid (default: the view's own)
-      g = g || state.grid;
-      if (!g) return null;
-      const a_ = g.v;
-      const fx = (lon - g.lon0) / g.d, fy = (lat - g.lat0) / g.d;
-      if (fx < 0 || fy < 0 || fx > g.nx - 1 || fy > g.ny - 1) return null;
-      const x0 = Math.min(Math.floor(fx), g.nx - 2), y0 = Math.min(Math.floor(fy), g.ny - 2);
-      const tx = fx - x0, ty = fy - y0;
-      const v = (x, y) => a_[y * g.nx + x];
-      const a = v(x0, y0), b = v(x0 + 1, y0), c = v(x0, y0 + 1), d = v(x0 + 1, y0 + 1);
-      if (a == null || b == null || c == null || d == null) return null;
-      return ((a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty) / 10;
-    }
+    const valueAt = (lat, lon, g) => E.valueAt(g || state.grid, lat, lon);   // g = a field {lon0, lat0, dlon, dlat, nx, ny, v hPa}
     const classColor = (v) => {
       const P = manifest.products[state.product];
       let k = 0;
@@ -346,6 +363,7 @@
     const fmtLat = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'S' : 'N'}`;
     const fmtLon = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'W' : 'E'}`;
     const memberName = (mi) => fams[state.family].members[mi];
+    const PTAG = { mean: 'MEAN', min: 'MIN', swath: 'SWATH' };
     const sb = { pos: $('#sbPos'), val: $('#sbVal'), low: $('#sbLow'), zoom: $('#sbZoom') };
     const updateZoomReadout = () => { sb.zoom.textContent = `ZOOM ${map.getZoom().toFixed(2)}`; };
     function updateTip() {
@@ -358,6 +376,7 @@
       const v = valueAt(ll.lat, ll.lng);
       const blendVals = (isBlend(state.family) && state.tipGrids)
         ? curParts().filter((k) => state.tipGrids[k]).map((k) => [k, valueAt(ll.lat, ll.lng, state.tipGrids[k])]) : null;
+      const reached = (state.product === 'swath' && state.when) ? E.nearestAt(state.grid, state.when, ll.lat, ll.lng) : null;
       const hit = Math.max(16, state.lowSize * 0.75);
       const near = state.lowsPx.filter(([px, py]) => Math.hypot(px - x, py - y - state.lowSize * 0.15) < hit).sort((a, b) => a[2] - b[2]);
       let html = '';
@@ -377,16 +396,17 @@
       } else {
         html += `<div class="tt-sub">No data here</div>`;
       }
+      if (v != null && reached != null && reached >= 0) html += `<div class="tt-sub">Lowest reached at F${pad3(reached)} · ${validOf(reached)}</div>`;
       html += `<div class="tt-ll">${fmtLat(ll.lat)}  ${fmtLon(ll.lng)}</div>`;
       if (near.length) {
-        const who = state.product === 'min' ? 'Envelope low (lowest member)' : 'Member lows here';
+        const who = state.product === 'min' ? 'Envelope low (lowest member)' : state.product === 'swath' ? 'Swath low (deepest so far)' : 'Member lows here';
         html += `<div class="tt-lows"><div class="tt-h">${who}</div>` +
-          near.slice(0, 6).map(([, , p, mi]) => `<div class="tt-row"><b${byFamily() ? ` style="color:${sysColor(partOfMember(mi))}"` : ''}>L ${p.toFixed(1)}</b><span>${memberName(mi)}</span></div>`).join('') +
+          near.slice(0, 6).map(([, , p, mi, t]) => `<div class="tt-row"><b${byFamily() ? ` style="color:${sysColor(partOfMember(mi))}"` : ''}>L ${p.toFixed(1)}</b><span>${memberName(mi)}${t != null ? ` · F${pad3(t)}` : ''}</span></div>`).join('') +
           (near.length > 6 ? `<div class="tt-more">+${near.length - 6} more</div>` : '') + '</div>';
       }
       sb.pos.textContent = `LAT ${fmtLat(ll.lat)}  LON ${fmtLon(ll.lng)}`;
       sb.val.textContent = v != null
-        ? `${shortOf(state.family).toUpperCase()} ${state.product === 'min' ? 'MIN' : 'MEAN'} ${v.toFixed(1)} hPa` +
+        ? `${shortOf(state.family).toUpperCase()} ${PTAG[state.product]} ${v.toFixed(1)} hPa` +
           (blendVals && blendVals.every(([, x]) => x != null) ? `  (${blendVals.map(([k, x]) => `${shortOf(k)} ${x.toFixed(1)}`).join(' | ')})` : '')
         : 'MSLP —';
       sb.low.textContent = near.length ? `L ${near[0][2].toFixed(1)} hPa ${memberName(near[0][3])}${near.length > 1 ? ` (+${near.length - 1})` : ''}` : '';
@@ -408,59 +428,142 @@
     updateZoomReadout();
 
     // ---- data layer ---------------------------------------------------------------------------
-    const cache = new Map();
-    const frameUrl = (fam, prod, fh) => `data/${run.id}/${fam}/${prod}/f${pad3(fh)}.json`;
-    function loadFrame(fam, prod, fh) {
-      const key = `${fam}/${prod}/${fh}`;
-      if (cache.has(key)) return cache.get(key);
-      const p = fetch(frameUrl(fam, prod, fh)).then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
-      cache.set(key, p);
-      p.catch(() => cache.delete(key));
-      if (cache.size > 60) cache.delete(cache.keys().next().value);
+    // The per-system grids are fetched as .bin.gz, inflated and decoded here.  Blends, the swath, the lows of derived
+    // minimum fields and the colour classes are all computed in the browser (engine.js).
+    const gridCache = new Map();                                      // `${system}/${kind}/${fh}` -> Promise<decoded grid>
+    function fetchGrid(sys, kind, fh) {
+      const key = `${sys}/${kind}/${fh}`;
+      if (gridCache.has(key)) return gridCache.get(key);
+      const p = fetch(`data/${run.id}/${sys}/${kind}/f${pad3(fh)}.bin.gz`)
+        .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.arrayBuffer(); })
+        .then(E.inflate).then(E.decodeBin);
+      gridCache.set(key, p);
+      p.catch(() => gridCache.delete(key));
+      if (gridCache.size > 360) gridCache.delete(gridCache.keys().next().value);   // ~0.3 MB each once decoded
       return p;
     }
 
-    // per-system read-out grids for blend views live in a sidecar (data/<run>/tip/<product>/fNNN.json = {system: grid})
-    const tipCache = new Map();
-    function loadTips(prod, fh) {
-      const key = `${prod}/${fh}`;
-      if (tipCache.has(key)) return tipCache.get(key);
-      const p = fetch(`data/${run.id}/tip/${prod}/f${pad3(fh)}.json`).then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
-      tipCache.set(key, p);
-      p.catch(() => tipCache.delete(key));
-      if (tipCache.size > 40) tipCache.delete(tipCache.keys().next().value);
+    // swath = running minimum of each system's member-wise minimum over the forecast hours; one running state per system,
+    // calls are serialised so playback folds in one hour at a time and a jump back restarts from the first hour.
+    const swathRec = new Map(), swathChain = new Map();
+    async function swathStep(sys, fh) {
+      let rec = swathRec.get(sys);
+      if (rec && rec.st.fh > fh) rec = null;
+      const have = rec ? rec.st.fh : -1;
+      const hours = frames.filter((f) => f.avail[sys] && f.fh <= fh && f.fh > have).map((f) => f.fh);
+      const grids = await Promise.all(hours.map((h) => fetchGrid(sys, 'min', h)));
+      let st = rec ? rec.st : null;
+      for (const g of grids) st = st ? E.swathFold(st, g) : E.swathStart(g);
+      swathRec.set(sys, { st });
+      return E.swathCopy(st);
+    }
+    const swathAt = (sys, fh) => {
+      const next = (swathChain.get(sys) || Promise.resolve()).catch(() => {}).then(() => swathStep(sys, fh));
+      swathChain.set(sys, next);
+      return next;
+    };
+
+    /** Everything needed to draw one view / product / hour: {field, lows, tips{system: field}, when?} */
+    async function buildResult(view, prod, fh) {
+      const parts = isBlend(view) ? fams[view].parts : [view];
+      const off = []; let o = 0;
+      for (const k of parts) { off.push(o); o += fams[k].members.length; }   // each system's member indices inside this view's member list
+      const tips = {};
+      if (prod === 'mean') {
+        const gs = await Promise.all(parts.map((k) => fetchGrid(k, 'mean', fh)));
+        const fields = gs.map((g, i) => { const f = E.fieldOf(g, E.toHpa(g.t)); tips[parts[i]] = f; return f; });
+        let field = fields[0];
+        if (parts.length > 1) {
+          const vs = fields.map((f, i) => (i ? E.regridLinear(f.v, E.regridPlan(f, fields[0])) : f.v));
+          field = Object.assign(E.geomOf(fields[0]), { v: E.blendMean(vs, weighting === 'equal' ? parts.map(() => 1) : gs.map((g) => g.members)) });
+        }
+        const lows = gs.flatMap((g, i) => (g.lows || []).map((l) => [l[0], l[1], l[2], l[3] + off[i]]));
+        return { field, lows, tips };
+      }
+      // member-wise minimum ('min') or its running minimum over the forecast ('swath')
+      const srcs = await Promise.all(parts.map(async (k) => {
+        if (prod === 'swath') {
+          const st = await swathAt(k, fh);
+          return { geom: st.geom, v: E.toHpa(st.t), owner: st.owner, when: st.when };
+        }
+        const g = await fetchGrid(k, 'min', fh);
+        return { geom: E.geomOf(g), v: E.toHpa(g.t), owner: g.owner };
+      }));
+      srcs.forEach((s_, i) => { tips[parts[i]] = Object.assign({}, s_.geom, { v: s_.v }); });
+      const ref = srcs[0].geom;
+      const aligned = srcs.map((s_, i) => {
+        if (!i || E.sameGeom(s_.geom, ref)) return Object.assign({ offset: off[i] }, s_);
+        const plan = E.regridPlan(s_.geom, ref);
+        return { offset: off[i], v: E.regridLinear(s_.v, plan), owner: E.regridNearest(s_.owner, plan, 0),
+          when: s_.when ? E.regridNearest(s_.when, plan, -1) : undefined };
+      });
+      const low = E.lowestOf(aligned);
+      const field = Object.assign({}, ref, { v: low.v });
+      const dets = E.detectLows(field, manifest.lows_min, dom);
+      const lows = dets.map((c) => {
+        const row = [+c.lon.toFixed(2), +c.lat.toFixed(2), +c.p.toFixed(1), low.owner[c.j * ref.nx + c.i]];
+        if (prod === 'swath') row.push(low.when[c.j * ref.nx + c.i]);
+        return row;
+      });
+      return { field, lows, tips, when: low.when };
+    }
+    const resultCache = new Map();
+    function computeView(view, prod, fh) {
+      const key = `${view}/${prod}/${fh}`;
+      if (resultCache.has(key)) return resultCache.get(key);
+      const p = buildResult(view, prod, fh).then((R) => { R.disp = E.upsample(R.field, R.field.dlon < 0.4 ? 2 : 4); return R; });
+      resultCache.set(key, p);
+      p.catch(() => resultCache.delete(key));
+      if (resultCache.size > 10) resultCache.delete(resultCache.keys().next().value);
       return p;
     }
 
-    let dataLayer = null, token = 0;
+    // ---- raster layer: the field is classified into the colour bands pixel by pixel on a canvas in the 'data' pane -----
+    const dataCv = document.createElement('canvas');
+    dataCv.className = 'data-cv';
+    map.getPane('data').appendChild(dataCv);
+    let dispField = null, dispImg = null, dispBuf = null;
+    const luts = {};
+    const lutFor = (prod) => luts[prod] || (luts[prod] = E.makeLut(manifest.products[prod].edges, manifest.products[prod].colors));
+    function drawData() {
+      const s = map.getSize();
+      if (dataCv.width !== s.x || dataCv.height !== s.y || !dispImg) {
+        dataCv.width = s.x; dataCv.height = s.y;
+        dispImg = new ImageData(s.x, s.y); dispBuf = new Uint32Array(dispImg.data.buffer);
+      }
+      L.DomUtil.setPosition(dataCv, map.containerPointToLayerPoint([0, 0]));
+      const ctx = dataCv.getContext('2d');
+      if (!dispField) { ctx.clearRect(0, 0, s.x, s.y); return; }
+      const lons = new Float64Array(s.x), lats = new Float64Array(s.y);
+      for (let x = 0; x < s.x; x++) lons[x] = map.containerPointToLatLng([x + 0.5, 0]).lng;
+      for (let y = 0; y < s.y; y++) lats[y] = map.containerPointToLatLng([0, y + 0.5]).lat;
+      E.rasterize(dispField, lons, lats, lutFor(state.product), dispBuf);
+      ctx.putImageData(dispImg, 0, 0);
+    }
+    let rafData = 0;
+    const scheduleData = () => { cancelAnimationFrame(rafData); rafData = requestAnimationFrame(drawData); };
+    map.on('move moveend zoomend viewreset resize', scheduleData);
+
+    let token = 0;
     async function show() {
       const my = ++token;
       const f = vframes[state.idx];
       const prod = state.product, fam = state.family;
-      const P = manifest.products[prod];
       updateTimeline(f);
-      const slow = setTimeout(() => setStatus(`Loading F${pad3(f.fh)}…`), 250);
+      const slow = setTimeout(() => setStatus(prod === 'swath' ? `Accumulating the swath to F${pad3(f.fh)}…` : `Loading F${pad3(f.fh)}…`), 250);
       try {
-        const d = await loadFrame(fam, prod, f.fh);
+        const R = await computeView(fam, prod, f.fh);
         if (my !== token) return;
-        const colors = P.colors;
-        const layer = L.geoJSON(d, {
-          pane: 'data', interactive: false, smoothFactor: 0.6,
-          style: (ft) => { const c = colors[ft.properties.i]; return { fillColor: c, fillOpacity: 1, color: c, weight: 0.8, opacity: 1, lineJoin: 'round' }; },
-        });
-        layer.addTo(map);
-        if (dataLayer) map.removeLayer(dataLayer);
-        dataLayer = layer;
-        state.lows = d.lows || [];
-        state.grid = d.grid || null;
-        state.tipGrids = null;
+        dispField = R.disp;
+        state.lows = R.lows;
+        state.grid = R.field;
+        state.when = R.when || null;
+        state.tipGrids = isBlend(fam) ? R.tips : null;
+        drawData();
         drawLows();
         updateTip();
         setStatus('');
         prefetch();
-        if (isBlend(fam) && manifest.tips) {                              // the per-system values arrive a moment later; not needed to draw
-          loadTips(prod, f.fh).then((t) => { if (my === token) { state.tipGrids = t; updateTip(); } }).catch(() => {});
-        }
       } catch (e) {
         if (my === token) setStatus(`Could not load F${pad3(f.fh)} (${e.message})`, true);
       } finally {
@@ -468,10 +571,10 @@
       }
     }
     function prefetch() {
+      const parts = isBlend(state.family) ? fams[state.family].parts : [state.family];
       for (let k = 1; k <= 2; k++) {
         const nf = vframes[(state.idx + k) % vframes.length];
-        loadFrame(state.family, state.product, nf.fh).catch(() => {});
-        if (isBlend(state.family) && manifest.tips) loadTips(state.product, nf.fh).catch(() => {});
+        parts.forEach((p) => fetchGrid(p, state.product === 'mean' ? 'mean' : 'min', nf.fh).catch(() => {}));
       }
     }
 
@@ -497,7 +600,7 @@
       const bySys = byFamily() ? curParts() : null;
       const lowsRow = P.has_lows
         ? `<div class="lg-lows">${bySys ? bySys.map((k) => `${sample(sysColor(k))}<span>${shortOf(k)}</span>`).join('') + '<span class="lg-sep">·</span>' : sample('')}<span>${
-            state.product === 'min' ? 'Local minimum of the lowest-member field' : (isBlend(state.family) ? 'Low centre of any member' : 'Member low centre')} (hPa)</span></div>` : '';
+            state.product === 'swath' ? 'Deepest point of the swath' : state.product === 'min' ? 'Local minimum of the lowest-member field' : (isBlend(state.family) ? 'Low centre of any member' : 'Member low centre')} (hPa)</span></div>` : '';
       $('#legend').innerHTML =
         `<div class="lg-bar" role="img" aria-label="Colour scale from below ${e[0]} to above ${e[e.length - 1]} hPa">${P.colors.map((c) => `<i style="background:${c}"></i>`).join('')}</div>` +
         `<div class="lg-ticks">${ticks}</div>${lowsRow}`;
@@ -515,7 +618,7 @@
       $('#caveLegend').innerHTML =
         `<div class="cv-1">${who} · ${fmtInit(run.init).toUpperCase()} · ${nm} MEMBERS</div>` +
         `<div class="cv-2">${P.title.toUpperCase()}${suffix} (hPa)</div>` +
-        `<div class="cv-3">F${pad3(f.fh)} · VALID ${fmtCave(f.valid)}</div>`;
+        `<div class="cv-3">${state.product === 'swath' ? `F${pad3(vframes[0].fh)}\u2013F${pad3(f.fh)} · THROUGH` : `F${pad3(f.fh)} · VALID`} ${fmtCave(f.valid)}</div>`;
     }
 
     // ---- timeline / transport ------------------------------------------------------------------
@@ -532,7 +635,7 @@
       $('#vFh').textContent = `F${pad3(f.fh)}`;
       $('#vTime').textContent = `Valid ${fmtValid(f.valid)}`;
       updateCaveLegend(f);
-      const a = f.avail[state.family];
+      const a = availOf(f, state.family);
       const cover = vframes.length < frames.length ? ` · F${pad3(vframes[0].fh)}–F${pad3(vframes[vframes.length - 1].fh)} ONLY` : '';
       const ps = curParts();
       const resNote = [];
@@ -548,7 +651,7 @@
     async function tick() {
       if (!state.playing) return;
       const next = (state.idx + 1) % vframes.length;
-      try { await loadFrame(state.family, state.product, vframes[next].fh); } catch (e) { /* show() reports it */ }
+      try { await computeView(state.family, state.product, vframes[next].fh); } catch (e) { /* show() reports it */ }
       if (!state.playing) return;
       setIdx(next);
       timer = setTimeout(tick, +$('#speed').value);
@@ -572,6 +675,7 @@
       else if (e.key === ' ' && !e.target.matches('button')) { e.preventDefault(); setPlaying(!state.playing); }
       else if (e.key === '1') setProduct('mean');
       else if (e.key === '2') setProduct('min');
+      else if (e.key === '3') setProduct('swath');
       else if (e.key === 'g' || e.key === 'G') setFamily('gefs');
       else if (e.key === 'e' || e.key === 'E') setFamily('ifs');
       else if (e.key === 'c' || e.key === 'C') setFamily('geps');
@@ -637,7 +741,7 @@
       syncFamilyUI();
       buildTicks();
       buildLegend();
-      state.lows = []; state.grid = null; state.tipGrids = null; drawLows(); updateTip();
+      state.lows = []; state.grid = null; state.when = null; state.tipGrids = null; drawLows(); updateTip();
       if (vframes[j].fh !== wantFh) {
         setStatus(`${shortOf(v)} has no F${pad3(wantFh)} on this cycle \u2014 showing F${pad3(vframes[j].fh)}`);
         setTimeout(() => setStatus(''), 3500);
@@ -658,7 +762,7 @@
       state.product = p;
       syncProductUI();
       buildLegend();
-      state.lows = []; state.grid = null; state.tipGrids = null; drawLows(); updateTip();
+      state.lows = []; state.grid = null; state.when = null; state.tipGrids = null; drawLows(); updateTip();
       show();
     }
 

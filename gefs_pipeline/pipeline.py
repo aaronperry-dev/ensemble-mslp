@@ -1,9 +1,10 @@
-"""Orchestration: resolve cycle -> (prefetching) fetch every family's members -> per-family + blended products
--> static files + manifest.
+"""Orchestration: resolve cycle -> (prefetching) fetch every family's members -> per-system grids -> static files + manifest.
 
-Views written for each forecast hour (data/<run>/<view>/<product>/fNNN.json):
-    views    gefs | ifs | blend        (blend only when both families have that hour)
-    products mean (filled contours + member lows) | min (member-wise minimum envelope + its low centres)
+Per forecast hour and system two gzip'd binary grids are written (see gridio.py):
+    data/<run>/<system>/mean/fNNN.bin.gz   ensemble mean + member low centres
+    data/<run>/<system>/min/fNNN.bin.gz    member-wise minimum + which member supplies it
+Everything else (blends of any systems, the swath = running minimum, colouring, minimum-field lows, tooltips)
+is computed in the browser from these.
 """
 from __future__ import annotations
 
@@ -11,7 +12,6 @@ import logging
 import os
 import shutil
 import time
-from itertools import combinations
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -20,14 +20,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
 
 from . import __version__
 from .config import ROOT
 from .decode import DecodeError, Grid
 from .fetcher import FetchError, Http, NotFound
 from .palette import build_scale
-from .products import (contour_bands, detect_lows, ensemble_mean, ensemble_min, sample_grid, upsample, write_json)
+from . import gridio
+from .products import detect_lows, ensemble_mean, ensemble_min, write_json
 from .sources import Family
 
 log = logging.getLogger("gefs.pipeline")
@@ -92,140 +92,26 @@ def _fields(cfg, ff: FamilyFrame) -> SimpleNamespace:
                            n=len(names), res=ref.res, valid=ref.valid_time, source=ff.fam.plan_tag(ff.plan))
 
 
-def _min_lows(cfg, lats, lons, mn, owner, offset: int = 0):
-    """Low centres of a minimum field, each attributed to the member that supplies the minimum there."""
-    d = cfg.domain
-    LM = cfg.lows_min
-    out = []
-    for lon, lat, p in detect_lows(lats, lons, mn, threshold_hpa=LM.threshold_hpa, radius_deg=LM.radius_deg,
-                                   smooth_deg=LM.smooth_deg, min_sep_deg=LM.min_separation_deg,
-                                   domain=(d.west, d.east, d.south, d.north)):
-        j = int(np.argmin(np.abs(lats - lat)))
-        i = int(np.argmin(np.abs(lons - lon)))
-        out.append([round(lon, 2), round(lat, 2), round(p, 1), int(owner[j, i]) + offset])
-    return out
+def build_frame(cfg, frames: dict[str, FamilyFrame], order: list[str], fh: int, out_dir: Path, run_id: str) -> dict:
+    """Write the per-system binary grids of one forecast hour and return its manifest entry.
 
-
-def _to_grid(lats, lons, f: SimpleNamespace, field: np.ndarray, nearest: bool = False) -> np.ndarray:
-    """Resample `field` (on f's grid) onto (lats, lons).  A no-op when the grids already match (the normal case)."""
-    if f.lats.shape == lats.shape and f.lons.shape == lons.shape and np.allclose(f.lats, lats) and np.allclose(f.lons, lons):
-        return field
-    interp = RegularGridInterpolator((f.lats, f.lons), field.astype(np.float64), method="nearest" if nearest else "linear",
-                                     bounds_error=False, fill_value=np.nan)
-    la, lo = np.meshgrid(lats, lons, indexing="ij")
-    return interp((la, lo)).astype(field.dtype)
-
-
-# ---------------------------------------------------------------------------------------------------
-# writing one view
-# ---------------------------------------------------------------------------------------------------
-def _emit(cfg, out_dir: Path, run_id: str, view: str, fh: int, scales: dict, meta: dict, lats, lons,
-          mean, mn, lows, mlows) -> None:
-    d = cfg.domain
-    dom = (d.west, d.east, d.south, d.north)
-    prec = int(cfg.contours.precision)
-    tip = float(cfg.tooltip.grid_deg)
-    f3 = f"f{fh:03d}"
-    for prod, field, lw in (("mean", mean, lows), ("min", mn, mlows)):
-        la, lo, z = upsample(lats, lons, field, float(cfg.contours.upsample_to_deg))
-        feats = contour_bands(la, lo, z, scales[prod][0], prec)
-        grid = sample_grid(lats, lons, field, domain=dom, step_deg=tip)
-        write_json(out_dir / run_id / view / prod / f"{f3}.json",
-                   {"type": "FeatureCollection", "features": feats, "meta": meta, "lows": lw, "grid": grid})
-
-
-def _emit_tips(cfg, out_dir: Path, run_id: str, fh: int, fields: dict) -> None:
-    """One small sidecar per product and hour with every system's own cursor read-out grid (native grid, decimated).
-
-    Blend views need each system's value next to the blended one; keeping these here instead of inside every
-    blend file (there can be a dozen blend views) shrinks the site considerably."""
-    d = cfg.domain
-    dom = (d.west, d.east, d.south, d.north)
-    tip = float(cfg.tooltip.grid_deg)
-    for prod in ("mean", "min"):
-        write_json(out_dir / run_id / "tip" / prod / f"f{fh:03d}.json",
-                   {k: sample_grid(f.lats, f.lons, getattr(f, prod), domain=dom, step_deg=tip) for k, f in fields.items()})
-
-
-def blend_sets(cfg, order: list[str]) -> list[list[str]]:
-    """Family combinations to blend, largest first, each in `order` (e.g. [gefs,ifs,geps], [gefs,ifs], ...).
-
-    [blend] sets: "all" (every combination of two or more), "full" (only everything), or an explicit list of
-    "a+b+c" strings (members not present in this build are skipped)."""
-    if len(order) < 2:
-        return []
-    spec = getattr(cfg.blend, "sets", "all")
-    if spec == "full":
-        return [list(order)]
-    if isinstance(spec, list):
-        out = []
-        for item in spec:
-            parts = [k for k in order if k in {x.strip() for x in str(item).split("+")}]
-            if len(parts) >= 2 and parts not in out and len(parts) == len([x for x in str(item).split("+") if x.strip()]):
-                out.append(parts)
-        return out
-    return [list(c) for n in range(len(order), 1, -1) for c in combinations(order, n)]
-
-
-def blend_key(parts: list[str]) -> str:
-    return "_".join(parts)
-
-
-def build_frame(cfg, frames: dict[str, FamilyFrame], order: list[str], fh: int, scales: dict, out_dir: Path,
-                run_id: str) -> dict:
-    """Write every view available for this hour and return the manifest entry."""
-    fields = {k: _fields(cfg, frames[k]) for k in order if k in frames}
+    Only each system's own ensemble mean (+ member lows) and member-wise minimum (+ owner) are shipped; blends,
+    the swath (running minimum), contour colouring and the lows of minimum fields are computed in the browser."""
     avail = {}
-    for k, f in fields.items():
-        meta = {"fh": fh, "valid": f.valid, "grid_deg": f.res, "members": f.n, "source": f.source, "family": k}
-        _emit(cfg, out_dir, run_id, k, fh, scales, meta, f.lats, f.lons, f.mean, f.min, f.lows,
-              _min_lows(cfg, f.lats, f.lons, f.min, f.owner))
+    valid = None
+    for k in order:
+        if k not in frames:
+            continue
+        f = _fields(cfg, frames[k])
+        valid = valid or f.valid
+        hdr = {"fh": fh, "valid": f.valid, "nx": int(len(f.lons)), "ny": int(len(f.lats)),
+               "lon0": round(float(f.lons[0]), 4), "lat0": round(float(f.lats[0]), 4),
+               "dlon": round(float(f.lons[1] - f.lons[0]), 4), "dlat": round(float(f.lats[1] - f.lats[0]), 4),
+               "members": f.n, "source": f.source}
+        base = out_dir / run_id / k
+        gridio.write(base / "mean" / f"f{fh:03d}.bin.gz", {**hdr, "kind": "mean", "lows": f.lows}, f.mean)
+        gridio.write(base / "min" / f"f{fh:03d}.bin.gz", {**hdr, "kind": "min"}, f.min, f.owner)
         avail[k] = {"members": f.n, "grid_deg": f.res, "source": f.source}
-    valid = next(iter(fields.values())).valid
-    if len(fields) > 1 and blend_sets(cfg, order):
-        _emit_tips(cfg, out_dir, run_id, fh, fields)     # per-system read-out grids shared by every blend view
-
-    # ---- blends: a combination is built only when every family in it has this hour -----------------------
-    todo = [p for p in blend_sets(cfg, order) if all(k in fields for k in p)]
-    if todo and len({f.valid for f in fields.values()}) > 1:
-        log.warning("f%03d: families disagree on the valid time - no blend", fh)
-        todo = []
-    cache: dict[tuple[str, str], np.ndarray] = {}
-    for parts in todo:
-        ref = fields[parts[0]]                              # blend on the first (finest, by config order) grid
-
-        def on_ref(k, name, arr, nearest=False):
-            key = (parts[0], k, name)
-            if key not in cache:
-                cache[key] = _to_grid(ref.lats, ref.lons, fields[k], arr, nearest)
-            return cache[key]
-
-        wt = {k: (1.0 if cfg.blend.weighting == "equal" else float(fields[k].n)) for k in parts}
-        means = {k: on_ref(k, "mean", fields[k].mean) for k in parts}
-        mins = {k: on_ref(k, "min", fields[k].min) for k in parts}
-        num = sum(np.where(np.isfinite(means[k]), means[k], 0.0) * wt[k] for k in parts)
-        den = sum(np.isfinite(means[k]) * wt[k] for k in parts)
-        bmean = np.where(den > 0, num / np.maximum(den, 1e-9), np.nan).astype(np.float32)
-
-        off, offsets = 0, {}                                # member index of each family inside THIS blend's member list
-        for k in parts:
-            offsets[k] = off
-            off += len(frames[k].fam.members)
-        bmin = mins[parts[0]].copy()
-        bowner = on_ref(parts[0], "owner", fields[parts[0]].owner, True).astype(np.int32) + offsets[parts[0]]
-        for k in parts[1:]:                                 # the lowest value wins; its member is the owner there
-            lower = np.isfinite(mins[k]) & (~np.isfinite(bmin) | (mins[k] < bmin))
-            bmin = np.where(lower, mins[k], bmin)
-            own = on_ref(k, "owner", fields[k].owner, True).astype(np.int32) + offsets[k]
-            bowner = np.where(lower, own, bowner)
-        blows = [[lo, la, p, mi + offsets[k]] for k in parts for lo, la, p, mi in fields[k].lows]
-        n = sum(fields[k].n for k in parts)
-        view = blend_key(parts)
-        meta = {"fh": fh, "valid": valid, "grid_deg": ref.res, "members": n, "family": view,
-                "source": "+".join(fields[k].source for k in parts)}
-        _emit(cfg, out_dir, run_id, view, fh, scales, meta, ref.lats, ref.lons, bmean, bmin, blows,
-              _min_lows(cfg, ref.lats, ref.lons, bmin, bowner))
-        avail[view] = {"members": n, "grid_deg": ref.res, "parts": {k: fields[k].n for k in parts}}
     return {"fh": fh, "valid": valid, "avail": avail}
 
 
@@ -237,16 +123,15 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
     site_src = ROOT / "site"
     out.mkdir(parents=True, exist_ok=True)
     shutil.copytree(site_src, out, dirs_exist_ok=True)               # viewer + basemap
+    gridio.gzip_json_tree(out / "data" / "basemap")                  # the viewer inflates *.json.gz itself
     data_dir = out / "data"
     run_id = f"{run:%Y%m%d}_{run:%H}"
     shutil.rmtree(data_dir / run_id, ignore_errors=True)
 
     order = [f.key for f in families]
     fam = {f.key: f for f in families}
-    sets = blend_sets(cfg, order)
 
-    edges, colors, scale_segments = build_scale(cfg.scale)         # ONE scale shared by every view so they compare directly
-    scales = {"mean": (edges, colors), "min": (edges, colors)}
+    edges, colors, scale_segments = build_scale(cfg.scale)         # ONE scale shared by every product so they compare directly
     need = {k: max(1, int(np.ceil(len(fam[k].members) * float(cfg.fetch.min_member_fraction)))) for k in order}
     t0 = time.time()
 
@@ -291,7 +176,7 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
                 ready[k] = ff
             if not ready:
                 continue
-            frames.append(build_frame(cfg, ready, order, fh, scales, data_dir, run_id))
+            frames.append(build_frame(cfg, ready, order, fh, data_dir, run_id))
             log.info("f%03d done  %s   [%d/%d frames, %.0fs, %d req, %.0f MB]", fh,
                      "  ".join(f"{k}:{v['members']}" for k, v in frames[-1]["avail"].items()),
                      len(frames), len(fhs), time.time() - t0, http.stats.requests, http.stats.bytes / 1e6)
@@ -303,36 +188,25 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
     fam_meta = {k: {"label": fam[k].label, "name": fam[k].name, "org": fam[k].org, "note": fam[k].note,
                     "members": list(fam[k].members),
                     "frames": sum(1 for f in frames if k in f["avail"])} for k in order}
-    views = list(order)
-    for parts in sets:
-        key = blend_key(parts)
-        n_frames = sum(1 for f in frames if key in f["avail"])
-        if not n_frames:
-            continue
-        fam_meta[key] = {"label": "Blend", "name": " + ".join(fam[k].label for k in parts) + " blend", "org": "",
-                         "note": ("Equal-weight mean of the family means (each system counts once)"
-                                  if cfg.blend.weighting == "equal"
-                                  else "Mean of all members pooled (each member counts once)"),
-                         "members": [m for k in parts for m in fam[k].members], "parts": list(parts),
-                         "weighting": cfg.blend.weighting, "frames": n_frames}
-        views.append(key)
     init = run.strftime("%Y-%m-%dT%H:%M:%SZ")
     manifest = {
-        "schema": 2,
+        "schema": 3,
         "generator": f"gefs-mslp-viewer {__version__}",
         "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "run": {"id": run_id, "init": init, "cycle": f"{run:%H}", "date": f"{run:%Y%m%d}"},
         "domain": {"west": cfg.domain.west, "east": cfg.domain.east, "south": cfg.domain.south, "north": cfg.domain.north,
                    "initial": list(cfg.domain.initial_view)},
-        "families": fam_meta,
-        "views": views,
-        "tips": any(f.get("parts") for f in fam_meta.values()),      # blend views read per-system values from data/<run>/tip/
+        "families": fam_meta,                                         # single systems only; the viewer builds every blend itself
+        "views": list(order),
+        "blend": {"weighting": cfg.blend.weighting},
         "lows_threshold_hpa": cfg.lows.threshold_hpa,
+        "lows_min": {"threshold_hpa": cfg.lows_min.threshold_hpa, "radius_deg": cfg.lows_min.radius_deg,
+                     "smooth_deg": cfg.lows_min.smooth_deg, "min_separation_deg": cfg.lows_min.min_separation_deg},
         "products": {
             k: {"title": getattr(cfg.products, k).title, "short": getattr(cfg.products, k).short,
                 "has_lows": bool(getattr(cfg.products, k).has_lows), "units": "hPa",
                 "edges": edges, "colors": colors}
-            for k in ("mean", "min")
+            for k in ("mean", "min", "swath")
         },
         "scale": {"segments": scale_segments},
         "frames": frames,
@@ -346,6 +220,5 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
              len(frames), time.time() - t0, http.stats.requests, http.stats.bytes / 1e6, http.stats.retries)
     site_mb = sum(f.stat().st_size for f in out.rglob("*") if f.is_file()) / 1e6
     (log.warning if site_mb > 850 else log.info)(
-        "site size %.0f MB%s", site_mb,
-        "  - close to GitHub Pages' 1 GB limit: set [blend] sets = \"full\" or drop a family" if site_mb > 850 else "")
+        "site size %.0f MB%s", site_mb, "  - close to GitHub Pages' 1 GB limit" if site_mb > 850 else "")
     return manifest

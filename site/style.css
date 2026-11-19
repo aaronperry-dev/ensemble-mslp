@@ -60,7 +60,7 @@ h1{margin:0;font-size:20px;font-weight:700;letter-spacing:.01em;white-space:nowr
 .tgroup:first-child{border-left:0;padding-left:0}
 .tright{margin-left:auto}
 .seg{display:flex;gap:0}
-.seg button{border:1px solid var(--line);background:var(--btn);padding:4px 11px;cursor:pointer;text-align:left;display:flex;flex-direction:column;line-height:1.2;margin-left:-1px}
+.seg button{border:1px solid var(--line);background:var(--btn);padding:4px 9px;cursor:pointer;text-align:left;display:flex;flex-direction:column;line-height:1.2;margin-left:-1px}
 .seg button:first-child{margin-left:0;border-radius:3px 0 0 3px}
 .seg button:last-child{border-radius:0 3px 3px 0}
 .seg button:hover{background:var(--btn-h)}
@@ -78,7 +78,7 @@ h1{margin:0;font-size:20px;font-weight:700;letter-spacing:.01em;white-space:nowr
 .chip:disabled{cursor:not-allowed}
 .chip:disabled[aria-pressed=false]{opacity:.45}
 .chip:disabled[aria-pressed=true]{cursor:default}
-#opacity{width:130px;accent-color:var(--sel)}
+#opacity{width:90px;accent-color:var(--sel)}
 .tbtn{border:1px solid var(--line);background:var(--btn);border-radius:3px;padding:6px 13px;font-size:14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
 .tbtn:hover{background:var(--btn-h)}
 .th-ico::before{content:"☾";font-size:15px}
@@ -181,6 +181,8 @@ dialog p{margin:6px 0;color:var(--ink-2)}
 
 /* the attribution line wraps on narrower windows; keep the legend clear of it */
 @media (max-width:1280px){.legend{bottom:36px}}
+/* five systems + three products: drop the group captions and tighten when the toolbar would wrap */
+@media (max-width:1500px){.toolbar .tgroup > .tlabel:first-child{display:none}.tgroup{padding:0 9px}.tgroup:first-child{padding-left:0}}
 @media (max-width:720px){
   .blendbar{max-width:calc(100% - 64px);flex-wrap:wrap;row-gap:6px}.chip{padding:4px 8px;font-size:14px}.chips{flex-wrap:wrap}
   .lg-lows{flex-wrap:wrap;row-gap:4px}
@@ -206,3 +208,5 @@ dialog p{margin:6px 0;color:var(--ink-2)}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 [hidden]{display:none!important}
+
+.data-cv{position:absolute;left:0;top:0;pointer-events:none}

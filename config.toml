@@ -16,13 +16,10 @@ cycles   = [0, 12]
 # How the blended ensemble MEAN is formed:
 #   "equal"   - average of the family means, each system counts once (the usual multi-system convention)
 #   "members" - mean of all members pooled, so a bigger ensemble weighs more (IFS 51 vs GEFS 31)
-# The blended MINIMUM is always the lowest value over every member of every family, and the blended low
-# markers are every member's lows from both families.
+# The blended MINIMUM is always the lowest value over every member of every system, and the blended low
+# markers are every member's lows from the chosen systems.  Blends of ANY combination of systems, and the swath
+# (running minimum), are computed in the browser from the per-system grids, so they cost nothing in site size.
 weighting = "equal"
-# Which blends to build, so the viewer can switch systems in and out of the blend:
-# "all" = every combination of two or more systems, "full" = only the blend of everything, or an explicit list such as
-# ["gefs+ifs+geps+aigefs", "gefs+ifs"].  Each blend view adds ~40 MB to the site (see the README for the size budget).
-sets      = "all"
 
 [source]                        # ---- NOAA GEFS (AWS Open Data: noaa-gefs-pds) ----
 base_url      = "https://noaa-gefs-pds.s3.amazonaws.com"
@@ -113,13 +110,6 @@ radius_deg    = 3.0             # the envelope is broad, so use a wider search r
 smooth_deg    = 0.5
 min_separation_deg = 3.0
 
-[tooltip]                       # value grid shipped with every frame for the cursor read-out
-grid_deg = 0.5                  # bilinear interpolation in the browser; 0.25 doubles the data size
-
-[contours]
-precision          = 2          # decimals kept in GeoJSON coordinates
-upsample_to_deg    = 0.25       # 0.5-deg frames are cubic-spline upsampled so fills are not blocky
-
 # --- colour scale ----------------------------------------------------------------------------
 # ONE scale shared by both products so they can be compared directly.  Classes are `step` hPa wide between
 # `start` and `stop` (first class is open below, last is open above); each class gets one colour sampled
@@ -158,3 +148,9 @@ has_lows = true
 title    = "Member-wise minimum MSLP"
 short    = "Member minimum"
 has_lows = true
+
+[products.swath]                # running minimum of the member-wise minimum over every forecast hour so far
+title    = "Accumulated member-wise minimum MSLP (swath)"
+short    = "Swath"
+has_lows = true
+
