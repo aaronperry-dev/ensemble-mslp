@@ -1,4 +1,4 @@
-/* Ensemble MSLP viewer - compute engine (no DOM; runs in the browser and under Node for the tests).
+/* Ensemble Blender Tool - compute engine (no DOM; runs in the browser and under Node for the tests).
  *
  * The pipeline ships only per-system grids (data/<run>/<system>/<mean|min>/fNNN.bin.gz, see gefs_pipeline/gridio.py).
  * Everything else happens here, in the visitor's browser:

@@ -1,4 +1,4 @@
-/* Ensemble MSLP viewer (NOAA GEFS, ECMWF IFS ENS, Canadian GEPS, NOAA AIGEFS, and blends of any two or more of them) — Leaflet, no build step, no runtime deps.
+/* Ensemble Blender Tool (NOAA GEFS, ECMWF IFS ENS and AIFS ENS, Canadian GEPS, NOAA AIGEFS, and blends of any two or more of them) — Leaflet, no build step, no runtime deps.
  *
  * Data contract (written by gefs_pipeline, manifest schema 3):
  *   data/manifest.json                          run info, families {gefs, ifs, geps, aigefs} (+ member lists), blend weighting,
@@ -41,7 +41,7 @@
       a0: '#ffffff', a0Case: '#000000', a0CaseOp: 0.65, a0Sea: '#9aa7b6',
       lakeStroke: '#6ea6d9', lakeFill: '#000000', lakeFillOp: 0.18,
       grat: '#ffffff', gratOp: 0.22, gratText: '#d9e1ec', gratHalo: 'rgba(0,0,0,0.85)',
-      low: '#ff3a3a', sys: { gefs: '#ff3a3a', ifs: '#ffd23f', geps: '#37e8cf', aigefs: '#d79bff' }, halo: 'rgba(0,0,0,0.92)', dataOp: 100,
+      low: '#ff3a3a', sys: { gefs: '#ff3a3a', ifs: '#ffd23f', aifs: '#5aa9ff', geps: '#37e8cf', aigefs: '#d79bff' }, halo: 'rgba(0,0,0,0.92)', dataOp: 100,
     },
     light: {
       land: '#e8ebe6', coast: '#222a36', coastOp: 0.85,
@@ -49,7 +49,7 @@
       a0: '#141922', a0Case: '#ffffff', a0CaseOp: 0.55, a0Sea: '#3b4452',
       lakeStroke: '#3d5f7e', lakeFill: '#ffffff', lakeFillOp: 0.22,
       grat: '#141922', gratOp: 0.3, gratText: '#2a3342', gratHalo: 'rgba(255,255,255,0.85)',
-      low: '#cb181d', sys: { gefs: '#cb181d', ifs: '#b85f00', geps: '#007a73', aigefs: '#7b2cbf' }, halo: 'rgba(255,255,255,0.96)', dataOp: 85,
+      low: '#cb181d', sys: { gefs: '#cb181d', ifs: '#b85f00', aifs: '#1f5fbf', geps: '#007a73', aigefs: '#7b2cbf' }, halo: 'rgba(255,255,255,0.96)', dataOp: 85,
     },
   };
   const readTheme = () => {
@@ -104,14 +104,14 @@
     }
     const availableViews = [...bases, ...blendViews];
     // What a system offers at one hour for the selected field: pressure is f.avail[sys]; wind and gust are the sub-records
-    // f.avail[sys].wind / .gust (absent where that system or hour has none, e.g. no gust from GEPS / AIGEFS, or ECMWF gust at F000).
+    // f.avail[sys].wind / .gust (absent where that system or hour has none, e.g. no ECMWF IFS gust at F000).
     const avF = (f, k) => (state.var === 'mslp' ? f.avail[k] : (f.avail[k] && f.avail[k][state.var]) || null);
     const viewHas = (f, k) => (isBlend(k) ? fams[k].parts.every((p) => avF(f, p)) : !!avF(f, k));
     const availOf = (f, k) => (isBlend(k)
       ? { grid_deg: avF(f, fams[k].parts[0]).grid_deg, members: fams[k].parts.reduce((n, p) => n + avF(f, p).members, 0) }
       : avF(f, k));
-    const shortOf = (k) => (isBlend(k) ? 'Blend' : ({ gefs: 'GEFS', ifs: 'ECMWF', geps: 'GEPS', aigefs: 'AIGEFS' }[k] || fams[k].label));
-    // Flat vector flag of the organisation that publishes each system (USA for NOAA's GEFS and AIGEFS, EU for ECMWF, Canada for GEPS).
+    const shortOf = (k) => (isBlend(k) ? 'Blend' : ({ gefs: 'GEFS', ifs: 'IFS', aifs: 'AIFS', geps: 'GEPS', aigefs: 'AIGEFS' }[k] || fams[k].label));
+    // Flat vector flag of the organisation that publishes each system (USA for NOAA's GEFS and AIGEFS, EU for ECMWF's IFS and AIFS, Canada for GEPS).
     // Drawn as inline SVG rather than emoji, so they are flat (no waving) and look the same on every platform.
     const SVG_OPEN = '<svg viewBox="0 0 30 20" aria-hidden="true" focusable="false">';
     const FLAG_SVG = {
@@ -124,11 +124,11 @@
       ca: SVG_OPEN + '<rect width="30" height="20" fill="#fff"/><rect width="7.5" height="20" fill="#d52b1e"/><rect x="22.5" width="7.5" height="20" fill="#d52b1e"/>' +
         '<polygon fill="#d52b1e" transform="translate(15 9.6) scale(.95)" points="0,-6 1.3,-3.5 2.6,-4 2.2,-1.2 5,-2.2 4.4,.2 5.6,1 2.6,2.6 3,3.8 .4,3.2 .4,6.4 -.4,6.4 -.4,3.2 -3,3.8 -2.6,2.6 -5.6,1 -4.4,.2 -5,-2.2 -2.2,-1.2 -2.6,-4 -1.3,-3.5"/></svg>',
     };
-    const FLAGS = { gefs: ['us', 'United States'], aigefs: ['us', 'United States'], ifs: ['eu', 'European Union'], geps: ['ca', 'Canada'] };
+    const FLAGS = { gefs: ['us', 'United States'], aigefs: ['us', 'United States'], ifs: ['eu', 'European Union'], aifs: ['eu', 'European Union'], geps: ['ca', 'Canada'] };
     const flagOf = (k) => (FLAGS[k] ? `<span class="flag" role="img" aria-label="${FLAGS[k][1]} flag">${FLAG_SVG[FLAGS[k][0]]}</span>` : '');
     const keyOf = (k) => flagOf(k) || `<i style="--c:${sysColor(k)}"></i>`;   // legend key: flag (coloured square if a system has none)
     const curParts = () => (isBlend(state.family) ? fams[state.family].parts : null);
-    const SYS_FALLBACK = ['#ff3a3a', '#ffd23f', '#37e8cf', '#c792ea'];
+    const SYS_FALLBACK = ['#ff3a3a', '#ffd23f', '#5aa9ff', '#37e8cf', '#c792ea'];
     const sysColor = (k) => (th.sys && th.sys[k]) || SYS_FALLBACK[Math.max(0, bases.indexOf(k))];
     // which system a member index belongs to inside the CURRENT blend's concatenated member list
     const partOfMember = (mi) => {
@@ -152,9 +152,9 @@
     const KDIR = { mslp: { mean: 'mean', min: 'min', prob: 'prob' }, wind: { mean: 'wmean', min: 'wmax', prob: 'wprob' }, gust: { mean: 'gmean', min: 'gmax', prob: 'gprob' } };
     const FIELDS = [['mslp', 'Pressure'], ['wind', 'Wind'], ['gust', 'Gust']];
     const FIELD_NAME = { mslp: 'MSLP', wind: '10 m wind speed', gust: '10 m wind gust' };
-    // Systems whose gust is a statistical ESTIMATE from their wind speed (GEPS, AIGEFS: they publish none), labelled "est." wherever shown.
+    // Systems whose gust is a statistical ESTIMATE from their wind speed (GEPS, AIGEFS, AIFS ENS: they publish none), labelled "est." wherever shown.
     const ESTG = new Set((WIND && WIND.estimated_gust) || []);
-    const EST_NOTE = 'estimated from the wind speed (land / water gust factor fitted to GEFS and ECMWF), not a model forecast';
+    const EST_NOTE = 'estimated from the wind speed (land / water gust factor fitted to GEFS and the IFS ensemble), not a model forecast';
     const estTag = (k) => (state.var === 'gust' && ESTG.has(k) ? ' (est.)' : '');
     const partsOfView = (k) => (isBlend(k) ? fams[k].parts : [k]);
     const estIn = (k = state.family) => (state.var === 'gust' ? partsOfView(k).filter((p) => ESTG.has(p)) : []);
@@ -205,7 +205,7 @@
     map.attributionControl.setPrefix(false);
     map.attributionControl.addAttribution(
       'NOAA <a href="https://registry.opendata.aws/noaa-gefs/" target="_blank" rel="noopener">GEFS</a> &amp; <a href="https://registry.opendata.aws/noaa-nws-graphcastgfs-pds/" target="_blank" rel="noopener">AIGEFS</a> (AI, CC0) via AWS Open Data · ' +
-      'IFS ENS: © <a href="https://www.ecmwf.int" target="_blank" rel="noopener">ECMWF</a>, <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a> (processed) · ' +
+      'IFS ENS &amp; AIFS ENS: © <a href="https://www.ecmwf.int" target="_blank" rel="noopener">ECMWF</a>, <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a> (processed) · ' +
       'GEPS: Data Source: <a href="https://eccc-msc.github.io/open-data/licence/readme_en/" target="_blank" rel="noopener">Environment and Climate Change Canada</a> · ' +
       'Basemap: <a href="https://www.naturalearthdata.com/" target="_blank" rel="noopener">Natural Earth</a> · ' +
       'Colours: <a href="https://colorbrewer2.org" target="_blank" rel="noopener">ColorBrewer</a> · ' +
@@ -931,7 +931,7 @@
       const sample = (col) => `<span class="lg-low"${col ? ` style="--c:${col}"` : ''}><i>987</i><b>L</b></span>`;
       const bySys = byFamily() ? curParts() : null;
       const lowsRow = P.has_lows
-        ? `<div class="lg-lows">${bySys ? bySys.map((k) => `${sample(sysColor(k))}<span>${shortOf(k)}</span>`).join('') + '<span class="lg-sep">·</span>' : sample('')}<span>${
+        ? `<div class="lg-lows${bySys && bySys.length > 3 ? ' lg-many' : ''}">${bySys ? bySys.map((k) => `${sample(sysColor(k))}<span>${shortOf(k)}</span>`).join('') + '<span class="lg-sep">·</span>' : sample('')}<span class="lg-lnote">${
             state.product === 'swath' ? 'Deepest point of the swath' : state.product === 'min' ? 'Local minimum of the lowest-member field' : (isBlend(state.family) ? 'Low center of any member' : 'Member low center')} (hPa)</span></div>` : '';
       const estRow = estIn().length ? `<div class="lg-est">${estIn().map(shortOf).join(' + ')} gust: ${EST_NOTE}</div>` : '';
       $('#legend').innerHTML =
@@ -1063,6 +1063,7 @@
       else if (e.key === 'k' || e.key === 'K') setTracks(!opts.tracks);
       else if (e.key === 'g' || e.key === 'G') setFamily('gefs');
       else if (e.key === 'e' || e.key === 'E') setFamily('ifs');
+      else if (e.key === 'i' || e.key === 'I') setFamily('aifs');
       else if (e.key === 'c' || e.key === 'C') setFamily('geps');
       else if (e.key === 'a' || e.key === 'A') setFamily('aigefs');
       else if (e.key === 'b' || e.key === 'B') setFamily('blend');
@@ -1111,8 +1112,8 @@
       $('#varSegGroup').hidden = FIELDS.filter(([v]) => hasVar(v)).length < 2;
     }
     // ---- ensemble family (GEFS / ECMWF IFS ENS / Blend) -------------------------------------------
-    const FAM_KEY = { gefs: 'G', ifs: 'E', geps: 'C', aigefs: 'A', blend: 'B' };
-    const seg = bases.map((k) => ({ k, label: fams[k].label, name: fams[k].name, note: fams[k].note, key: FAM_KEY[k] || '' }));
+    const FAM_KEY = { gefs: 'G', ifs: 'E', aifs: 'I', geps: 'C', aigefs: 'A', blend: 'B' };
+    const seg = bases.map((k) => ({ k, label: shortOf(k), name: fams[k].name, note: fams[k].note, key: FAM_KEY[k] || '' }));
     if (blendViews.length) seg.push({ k: 'blend', label: 'Blend', name: 'Blend of selected systems', note: 'Tick the systems to blend', key: 'B' });
     $('#famSeg').innerHTML = seg.map((e) =>
       `<button type="button" role="tab" data-act="family" data-family="${e.k}" aria-selected="false" title="${e.name}${e.note ? ' \u2014 ' + e.note : ''} (${e.key})"><span class="seg-main">${e.label}</span><span class="seg-sub" data-sub="${e.k}"></span></button>`).join('');
@@ -1375,7 +1376,7 @@
         const plan = gifPlan(z.w, z.h, z.sc, withLegend);
         const first = caveParts(vframes[a]), last = caveParts(vframes[b]);
         const enc = MslpGif.createGif(z.w, z.h, { loop: 0,
-          comment: `${first.sys} | ${first.prod} (${first.units}). ${first.init}; F${pad3(vframes[a].fh)} to F${pad3(vframes[b].fh)}; ${first.members}. Ensemble MSLP viewer: ${fieldName()}${estIn().length ? ` (${estIn().map(shortOf).join(' + ')}: ${EST_NOTE})` : ''}.` });
+          comment: `${first.sys} | ${first.prod} (${first.units}). ${first.init}; F${pad3(vframes[a].fh)} to F${pad3(vframes[b].fh)}; ${first.members}. Ensemble Blender Tool: ${fieldName()}${estIn().length ? ` (${estIn().map(shortOf).join(' + ')}: ${EST_NOTE})` : ''}.` });
         for (let i = a; i <= b; i++) {
           if (gif.cancel) throw new Error('cancelled');
           gifEls.msg.textContent = `Rendering frame ${i - a + 1} of ${b - a + 1} (F${pad3(vframes[i].fh)})…`;

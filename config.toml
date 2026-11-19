@@ -1,12 +1,13 @@
 # ---------------------------------------------------------------------------
-# GEFS MSLP viewer - pipeline configuration
+# Ensemble Blender Tool - pipeline configuration
 # ---------------------------------------------------------------------------
 
 [run]
-families = ["gefs", "ifs", "geps", "aigefs"]   # ensemble systems to fetch; blend views are added automatically (see [blend])
+families = ["gefs", "ifs", "aifs", "geps", "aigefs"]   # ensemble systems to fetch; blend views are added automatically (see [blend])
 # Families that never hold a cycle back.  AIGEFS is published irregularly (7.5 h to more than a day after cycle time):
 # the build uses it when it is complete, and a scheduled run rebuilds the already-live cycle when it turns up later.
-optional = ["aigefs"]
+# AIFS ENS is published as soon as it is produced (earlier than the IFS ENS) but is still optional, so an outage on its side never blocks the site.
+optional = ["aifs", "aigefs"]
 # Cycles the build may use.  ECMWF only publishes the full 10-day range (and beyond) on 00/12Z; its 06/18Z runs
 # stop at 144 h.  [0, 12] therefore guarantees 10 days for every view including the blend; use [0, 6, 12, 18]
 # to also build the 06/18Z cycles (the ECMWF and blend views then end at 6 days on those runs).
@@ -54,6 +55,15 @@ full_max_fh       = 360
 short_max_fh      = 144
 requests_per_second = 3         # the ECMWF bucket answers 503 SlowDown above ~4-5 req/s from one client, so it gets its own, gentler cap
 
+[aifs]                          # ---- ECMWF AIFS ENS, ML ensemble (same AWS Open Data bucket and host as the IFS ENS) ----
+base_url          = "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com"
+model             = "aifs-ens"
+resolution        = "0p25"
+n_perturbed       = 50          # ap01..ap50 (file type pf); the control ac00 is in the separate -cf file
+param             = "msl"
+max_fh            = 360         # 6-hourly, all four daily cycles (the build stops at [forecast] stop)
+# no requests_per_second here: ecmwf-forecasts is ONE server with ONE limiter, [ifs] requests_per_second, shared with the IFS ENS
+
 [geps]                          # ---- Canadian GEPS (ECCC MSC Datamart) ----
 # {date} is replaced by the cycle date (YYYYMMDD); the Datamart keeps several recent days.
 base_url            = "https://dd.weather.gc.ca/{date}/WXO-DD/ensemble/geps/grib2/raw"
@@ -95,7 +105,7 @@ merge_gap_kb        = 1024      # one Range request may span up to this much unw
                                 # a few hundred kB more; requests, not bytes, are what the servers' limits count)
 timeout_connect_s   = 10
 timeout_read_s      = 60
-max_retries         = 6
+max_retries         = 9         # 1, 2, 4 ... 60 s backoff: about 4 minutes of patience per request before a member is given up
 backoff_base_s      = 1.0       # exponential backoff with jitter: 1, 2, 4, 8 ... capped at backoff_max_s
 backoff_max_s       = 60
 min_member_fraction = 0.8       # a frame is published only if >= this share of members arrived
@@ -229,11 +239,11 @@ ramp       = "YlGnBu"
 # A system without gust simply has no gust product (and drops out of gust blends).
 #
 # Cost: this adds 3-4 requests and ~2-3 MB per member and hour (the GRIB fields are global; only the bytes of the
-# wanted messages are downloaded).  A full four-system build roughly doubles to triples the download volume, so use
+# wanted messages are downloaded).  A full five-system build roughly doubles to triples the download volume, so use
 # `families`, `max_fh` or `enabled = false` to trim it.
 [wind]
 enabled  = true
-families = ["gefs", "ifs", "geps", "aigefs"]     # systems to fetch wind for (a system without wind is skipped)
+families = ["gefs", "ifs", "aifs", "geps", "aigefs"]     # systems to fetch wind for (a system without wind is skipped)
 max_fh   = 240                                   # wind / gust frames stop here
 speed_levels = [25, 31, 39, 50, 55, 74]          # mph; probability of sustained wind AT OR ABOVE each
 gust_levels  = [35, 46, 58, 74, 90]              # mph; probability of gust AT OR ABOVE each
@@ -255,6 +265,10 @@ u = "10u"
 v = "10v"
 gust = ["10fg", "10fg3", "10fg6"]               # the parameter name depends on the step
 
+[wind.aifs]
+u = "10u"
+v = "10v"                                       # AIFS ENS publishes no gust (estimated, see [wind.estimate])
+
 [wind.geps]
 speed = "WIND_TGL_10"
 
@@ -263,7 +277,7 @@ u = "UGRD"
 v = "VGRD"
 level = "10 m above ground"
 
-# ESTIMATED gust for the systems that publish none (GEPS, AIGEFS): gust = wind speed x factor(speed, land / water), applied to each member
+# ESTIMATED gust for the systems that publish none (GEPS, AIGEFS, AIFS ENS): gust = wind speed x factor(speed, land / water), applied to each member
 # before the ensemble statistics (gefs_pipeline/gustest.py).  The curves are the average of what GEFS and the ECMWF IFS ensemble forecast
 # for the same wind speeds (120 member-fields each: 12 members x 10 hours out to f168 of the 2026-11-19 00Z cycle, 21-53 N / 128-63 W),
 # smoothed.  Re-fit with `python tools/calibrate_gust.py`.  The two systems disagree over water (GEFS gusts are ~1.1-1.2x the wind, IFS
@@ -271,7 +285,7 @@ level = "10 m above ground"
 # calibration sample: that end of the land curve is a physical taper, not a fit.
 [wind.estimate]
 enabled  = true
-families = ["geps", "aigefs"]
+families = ["geps", "aigefs", "aifs"]
 land_speed  = [0,    5,    9,    12,   15,   18,   22,   26,   32,   40,   60]
 land_factor = [2.0,  2.0,  2.0,  1.93, 1.85, 1.76, 1.65, 1.58, 1.48, 1.40, 1.35]
 sea_speed   = [0,    6,    9,    12,   16,   28,   36,   44,   60]

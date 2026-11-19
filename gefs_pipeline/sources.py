@@ -322,6 +322,8 @@ def _idx_wind_blobs(entries_fn, http: Http, url: str, w, base: Path | None) -> d
 class IfsFamily(Family):
     key, label, name, org = "ifs", "ECMWF IFS ENS", "ECMWF IFS ENS", "ECMWF"
     note = "ec00 is the IFS control (= HRES, stream oper); ep01-ep50 are the perturbed members"
+    sec = "ifs"                                       # config sections: [<sec>] and [wind.<sec>]
+    ctrl = "ec00"                                     # name of the control member
 
     def __init__(self, cfg):
         super().__init__(cfg)
@@ -353,10 +355,18 @@ class IfsFamily(Family):
         return all(http.exists(self._url(run, fh, s)[:-5] + "index") for s in ("enfo", "oper"))
 
     # -- index (one per step, shared by all 50 members) -------------------------------------------------
-    def _params(self) -> tuple[str, ...]:
+    def _wcfg(self):
         w = getattr(self.cfg, "wind", None)
-        extra = (w.ifs.u, w.ifs.v, *w.ifs.gust) if w is not None and hasattr(w, "ifs") else ()
-        return (self.cfg.ifs.param, *extra)
+        return getattr(w, self.sec, None) if w is not None else None
+
+    def _params(self) -> tuple[str, ...]:
+        w = self._wcfg()
+        extra = (w.u, w.v, *getattr(w, "gust", [])) if w is not None else ()
+        return (getattr(self.cfg, self.sec).param, *extra)
+
+    def _tag(self, member: str) -> str:
+        """File-name tag of a member's cache entries."""
+        return "oper" if member == "ec00" else "enfo"
 
     def _index(self, http: Http, grib_url: str) -> dict:
         """{param: {(type, number): (offset, length)}} for MSLP and the wind parameters (one download per step)."""
@@ -368,7 +378,7 @@ class IfsFamily(Family):
 
     def _locate(self, http, plan, member, param=None):
         """-> (grib_url, offset, length, stream)"""
-        param = param or self.cfg.ifs.param
+        param = param or getattr(self.cfg, self.sec).param
         if member == "ec00":
             try:                                         # IFS >= 50r1: control = HRES forecast
                 off, ln = self._index(http, plan["oper"])[param][("fc", "")]
@@ -381,7 +391,7 @@ class IfsFamily(Family):
         return plan["enfo"], off, ln, "enfo"
 
     def fetch_grid(self, http, run, plan, member, fh, cache_dir):
-        tag = "oper" if member == "ec00" else "enfo"
+        tag = self._tag(member)
         cache = cache_dir / f"{run:%Y%m%d%H}" / f"{member}.{tag}.f{fh:03d}.grib2" if cache_dir else None
 
         def fetch():
@@ -396,8 +406,8 @@ class IfsFamily(Family):
     def wind_blobs(self, http, run, plan, member, fh, cache_dir):
         """10u and 10v (two ranges, side by side in the result) and the gust.  The gust is the maximum since the previous
         post-processing step, named 10fg (10fg3 at some steps up to 144 h); it is all zeros at step 0, so it is skipped there."""
-        w = self.cfg.wind.ifs
-        tag = "oper" if member == "ec00" else "enfo"
+        w = self._wcfg()
+        tag = self._tag(member)
         base = cache_dir / f"{run:%Y%m%d%H}" / f"{member}.{tag}.f{fh:03d}" if cache_dir else None
 
         def one(param):
@@ -405,7 +415,7 @@ class IfsFamily(Family):
             return http.get_range(url, off, off + ln - 1)
 
         out = {"uv": _cached(_sib(base, "uv"), lambda: one(w.u) + one(w.v))}
-        if fh > 0:
+        if fh > 0 and getattr(w, "gust", None):
             def gust():
                 for param in w.gust:
                     try:
@@ -418,6 +428,52 @@ class IfsFamily(Family):
             except (KeyError, NotFound):
                 pass
         return out
+
+
+# =====================================================================================================
+class AifsFamily(IfsFamily):
+    """ECMWF AIFS ENS (the ML ensemble), open data in the same bucket as the IFS ENS: s3://ecmwf-forecasts/<date>/<HH>z/aifs-ens/0p25/enfo/.
+    One file per step for the control (`-cf`) and one for the 50 perturbed members (`-pf`, ~2.9 GB: byte ranges are essential), each
+    with a JSON `.index` like the IFS one.  Fields: msl, 10u, 10v (no gust: it is estimated from the wind, see gustest.py); 6-hourly to
+    360 h on all four daily cycles.  Shares the ECMWF host's request limiter with the IFS ENS (same server)."""
+    key, label, name, org = "aifs", "ECMWF AIFS ENS", "ECMWF AIFS ENS (AI)", "ECMWF"
+    note = "ac00 is the AIFS ENS control; ap01-ap50 are the perturbed members"
+    sec, ctrl = "aifs", "ac00"
+    has_wind, has_gust = True, False                   # no gust parameter in the open data: estimated from the wind (gustest.py)
+
+    def __init__(self, cfg):
+        Family.__init__(self, cfg)
+        self.members = ["ac00"] + [f"ap{i:02d}" for i in range(1, int(cfg.aifs.n_perturbed) + 1)]
+        self._idx: dict[str, dict] = {}
+        self._idx_lock = threading.Lock()
+
+    def max_fh(self, run):
+        return int(self.cfg.aifs.max_fh)
+
+    def _url(self, run: datetime, step: int, stream: str) -> str:               # stream: "cf" | "pf"
+        c = self.cfg.aifs
+        return (f"{c.base_url}/{run:%Y%m%d}/{run:%H}z/{c.model}/{c.resolution}/enfo/"
+                f"{run:%Y%m%d}{run:%H}0000-{step}h-enfo-{stream}.grib2")
+
+    def plan(self, http, run, fh):
+        cf, pf = self._url(run, fh, "cf"), self._url(run, fh, "pf")
+        return {"cf": cf, "pf": pf} if http.exists(cf[:-5] + "index") and http.exists(pf[:-5] + "index") else None
+
+    def cycle_ready(self, http, run, fhs):
+        fh = self.hours(run, fhs)[-1]
+        return all(http.exists(self._url(run, fh, s)[:-5] + "index") for s in ("cf", "pf"))
+
+    def _tag(self, member):
+        return "cf" if member == "ac00" else "pf"
+
+    def _locate(self, http, plan, member, param=None):
+        """-> (grib_url, offset, length, stream)"""
+        param = param or self.cfg.aifs.param
+        if member == "ac00":
+            off, ln = self._index(http, plan["cf"])[param][("cf", "")]
+            return plan["cf"], off, ln, "cf"
+        off, ln = self._index(http, plan["pf"])[param][("pf", str(int(member[2:])))]
+        return plan["pf"], off, ln, "pf"
 
 
 # =====================================================================================================
@@ -551,7 +607,7 @@ class AigefsFamily(Family):
 
 
 # =====================================================================================================
-FAMILIES = {"gefs": GefsFamily, "ifs": IfsFamily, "geps": GepsFamily, "aigefs": AigefsFamily}
+FAMILIES = {"gefs": GefsFamily, "ifs": IfsFamily, "aifs": AifsFamily, "geps": GepsFamily, "aigefs": AigefsFamily}
 
 
 def make_families(cfg, keys: list[str] | None = None) -> list[Family]:
