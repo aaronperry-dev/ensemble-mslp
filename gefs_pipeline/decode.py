@@ -12,6 +12,10 @@ _ECC_LOCK = threading.Lock()
 
 MSLP_SHORT_NAMES = {"prmsl", "msl"}     # NCEP GEFS: PRMSL, ECMWF: msl
 
+# 10 m wind fields are reported in whatever unit the centre uses; the viewer works in miles per hour
+MPH_PER = {"m s**-1": 2.2369363, "m s-1": 2.2369363, "m/s": 2.2369363, "knot": 1.1507794, "kn": 1.1507794, "kt": 1.1507794,
+           "km h**-1": 0.6213712, "km h-1": 0.6213712, "km/h": 0.6213712, "mph": 1.0}
+
 
 class DecodeError(Exception):
     pass
@@ -24,6 +28,7 @@ class Grid:
     values: np.ndarray    # (nlat, nlon) float32, hPa
     valid_time: str       # ISO-8601 UTC
     step_hours: int
+    short: str = ""       # GRIB shortName of the message
 
     @property
     def res(self) -> float:
@@ -66,7 +71,9 @@ def member_key(raw: bytes) -> tuple[int, int]:
     return (0 if typ in (0, 1) else 1, num)
 
 
-def decode_message(raw: bytes, west: float, east: float, south: float, north: float) -> Grid:
+def decode_message(raw: bytes, west: float, east: float, south: float, north: float, *, field: str = "mslp") -> Grid:
+    """Decode one message and cut it to the domain.  field="mslp" (default): the shortName must be a pressure and the values
+    are returned in hPa; field="speed": any wind speed / gust message, values returned in mph (units read from the file)."""
     import eccodes as ec  # imported lazily so unit tests that do not need GRIB work without ecCodes
 
     if raw[:4] != b"GRIB" or raw[-4:] != b"7777":
@@ -88,14 +95,19 @@ def decode_message(raw: bytes, west: float, east: float, south: float, north: fl
             step = int(ec.codes_get(gid, "endStep"))
         finally:
             ec.codes_release(gid)
-    if short not in MSLP_SHORT_NAMES:
+    if field == "mslp" and short not in MSLP_SHORT_NAMES:
         raise DecodeError(f"unexpected shortName {short!r}")
     if vals.size != ni * nj:
         raise DecodeError("value count does not match grid")
 
     vals = vals.reshape(nj, ni)
     vals[vals > 1e20] = np.nan
-    if units == "Pa":
+    if field == "speed":
+        try:
+            vals *= np.float32(MPH_PER[str(units).strip()])
+        except KeyError:
+            raise DecodeError(f"unexpected wind unit {units!r}") from None
+    elif units == "Pa":
         vals /= 100.0
     lats = np.linspace(la1, la2, nj)
     # Longitudes come from the increment, NOT from first/last point: ECMWF's global grid starts at 180 E and wraps
@@ -115,4 +127,11 @@ def decode_message(raw: bytes, west: float, east: float, south: float, north: fl
     d = str(valid[0]).zfill(8)
     t = str(valid[1]).zfill(4)
     iso = f"{d[:4]}-{d[4:6]}-{d[6:]}T{t[:2]}:{t[2:]}:00Z"
-    return Grid(lats[jm].copy(), lons[im].copy(), np.ascontiguousarray(vals[np.ix_(jm, im)]), iso, step)
+    return Grid(lats[jm].copy(), lons[im].copy(), np.ascontiguousarray(vals[np.ix_(jm, im)]), iso, step, short)
+
+
+def speed_from_uv(u: Grid, v: Grid) -> Grid:
+    """Wind speed (mph) from the two 10 m components (already in mph), on their common grid."""
+    if u.values.shape != v.values.shape or not (np.allclose(u.lats, v.lats) and np.allclose(u.lons, v.lons)):
+        raise DecodeError("u and v components are on different grids")
+    return Grid(u.lats, u.lons, np.hypot(u.values, v.values).astype(np.float32), u.valid_time, u.step_hours, "ws")

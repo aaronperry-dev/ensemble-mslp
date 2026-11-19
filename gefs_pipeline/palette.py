@@ -15,6 +15,7 @@ RAMPS: dict[str, list[str]] = {
     "YlGnBu": ["#ffffd9", "#edf8b1", "#c7e9b4", "#7fcdbb", "#41b6c4", "#1d91c0", "#225ea8", "#253494", "#081d58"],
     "PuBu": ["#fff7fb", "#ece7f2", "#d0d1e6", "#a6bddb", "#74a9cf", "#3690c0", "#0570b0", "#045a8d", "#023858"],
     "RdPu": ["#fff7f3", "#fde0dd", "#fcc5c0", "#fa9fb5", "#f768a1", "#dd3497", "#ae017e", "#7a0177", "#49006a"],
+    "YlGn": ["#ffffe5", "#f7fcb9", "#d9f0a3", "#addd8e", "#78c679", "#41ab5d", "#238443", "#006837", "#004529"],
     "Blues": ["#f7fbff", "#deebf7", "#c6dbef", "#9ecae1", "#6baed6", "#4292c6", "#2171b5", "#08519c", "#08306b"],
     # diverging
     "RdYlBu": ["#d73027", "#f46d43", "#fdae61", "#fee090", "#ffffbf", "#e0f3f8", "#abd9e9", "#74add1", "#4575b4"],   # 9-class (colorbrewer2.org n=9)
@@ -106,5 +107,5 @@ def build_scale(scale_cfg) -> tuple[list[float], list[str], list[dict]]:
             colors[i] = color_at(anchors, t0 if len(idx) == 1 else t0 + (t1 - t0) * k / (len(idx) - 1))
         summary.append({"name": s.name, "label": getattr(s, "label", ""), "phrase": getattr(s, "phrase", ""), "ramp": s.ramp, "classes": len(idx),
                         "from_hpa": None if idx[0] == 0 else edges[idx[0] - 1],
-                        "to_hpa": None if idx[-1] == n - 1 else edges[idx[-1]]})
+                        "to_hpa": None if idx[-1] == n - 1 else edges[idx[-1]]})   # (hPa for pressure scales; the unit of the scale otherwise)
     return edges, colors, summary

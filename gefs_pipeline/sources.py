@@ -26,11 +26,12 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .decode import Grid, decode_message, member_key, split_messages
-from .fetcher import Http, NotFound, find_message, parse_idx, parse_json_index
+from .decode import DecodeError, Grid, decode_message, member_key, speed_from_uv, split_messages
+from .fetcher import FetchError, Http, NotFound, fetch_parts, find_message, find_ranges, parse_idx, parse_json_index, parse_json_index_params
 from .gefs import choose_product, object_url
 
 log = logging.getLogger("gefs.sources")
@@ -53,6 +54,50 @@ def _cached(cache: Path | None, fetch) -> bytes:
         tmp.write_bytes(raw)
         os.replace(tmp, cache)                 # atomic: an interrupted run never leaves a half-written file
     return raw
+
+
+class _Inventories:
+    """Parsed .idx inventories by URL.  MSLP and wind of one member-hour read the same file, so it is fetched once
+    (single-flight: a second worker asking for the same inventory waits for the first instead of requesting it again)."""
+
+    def __init__(self):
+        self._d: dict[str, list] = {}
+        self._locks: dict[str, threading.Lock] = {}
+        self._lock = threading.Lock()
+
+    def get(self, http: Http, url: str) -> list:
+        with self._lock:
+            hit = self._d.get(url)
+            if hit is not None:
+                return hit
+            gate = self._locks.setdefault(url, threading.Lock())
+        with gate:
+            with self._lock:
+                hit = self._d.get(url)
+            if hit is None:
+                hit = parse_idx(http.get_text(url + ".idx"))
+                with self._lock:
+                    if len(self._d) > 4000:                   # a build touches < 5k (member, hour) files; keep it bounded anyway
+                        self._d.clear()
+                        self._locks.clear()
+                    self._d[url] = hit
+        return hit
+
+
+@dataclass
+class MemberResult:
+    """One member-hour: the MSLP grid, plus its wind / gust grids (or why they are missing)."""
+    grid: Grid
+    wind: dict | None = None            # {"wind": Grid mph, "gust": Grid mph}
+    wind_error: Exception | None = None
+
+
+def _store(cache: Path | None, data: bytes) -> None:
+    if cache is not None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, cache)
 
 
 class Family:
@@ -87,6 +132,47 @@ class Family:
     def fetch_grid(self, http: Http, run: datetime, plan, member: str, fh: int, cache_dir: Path | None) -> Grid:
         raise NotImplementedError
 
+    # -- 10 m wind and gust (mph) -----------------------------------------------------------------------
+    has_wind = False                                    # the system publishes 10 m wind
+    has_gust = False                                    # ... and a 10 m gust
+
+    def wind_blobs(self, http: Http, run: datetime, plan, member: str, fh: int, cache_dir: Path | None) -> dict:
+        """Raw GRIB bytes of one member's wind: {"uv": u+v messages | "speed": one speed message, "gust": one gust message}.
+        A missing gust is simply left out; a missing wind raises (the pipeline then publishes no wind for that hour)."""
+        raise NotImplementedError
+
+    def fetch_member(self, http: Http, run: datetime, plan, member: str, fh: int, cache_dir: Path | None,
+                     want_wind: bool = False) -> MemberResult:
+        """MSLP (+ wind and gust when wanted) of one member and hour.  A wind failure never costs the member its MSLP.
+        Systems whose files hold several fields in one inventory (GEFS, AIGEFS) override this to share requests."""
+        grid = self.fetch_grid(http, run, plan, member, fh, cache_dir)
+        if not want_wind:
+            return MemberResult(grid)
+        try:
+            return MemberResult(grid, self.fetch_wind(http, run, plan, member, fh, cache_dir))
+        except (NotFound, FetchError, DecodeError, KeyError) as e:
+            return MemberResult(grid, None, e)
+
+    def fetch_wind(self, http: Http, run: datetime, plan, member: str, fh: int, cache_dir: Path | None) -> dict[str, Grid]:
+        """-> {"wind": Grid mph, "gust": Grid mph (when published)} on the member's native grid, cut to the domain."""
+        return self.decode_wind(self.wind_blobs(http, run, plan, member, fh, cache_dir))
+
+    def decode_wind(self, b: dict) -> dict[str, Grid]:
+        box = _bbox(self.cfg)
+        out: dict[str, Grid] = {}
+        if b.get("speed"):
+            out["wind"] = decode_message(b["speed"], *box, field="speed")
+        elif b.get("uv"):
+            msgs = split_messages(b["uv"])
+            if len(msgs) != 2:
+                raise DecodeError(f"expected the u and v messages, found {len(msgs)}")
+            out["wind"] = speed_from_uv(decode_message(msgs[0], *box, field="speed"), decode_message(msgs[1], *box, field="speed"))
+        else:
+            raise DecodeError("no wind message")
+        if b.get("gust"):
+            out["gust"] = decode_message(b["gust"], *box, field="speed")
+        return out
+
 
 # =====================================================================================================
 class GefsFamily(Family):
@@ -95,6 +181,7 @@ class GefsFamily(Family):
     def __init__(self, cfg):
         super().__init__(cfg)
         self.members = ["gec00"] + [f"gep{i:02d}" for i in range(1, int(cfg.source.n_perturbed) + 1)]
+        self._inv = _Inventories()
 
     def max_fh(self, run):
         return max(p.max_fh for p in self.cfg.source.products)
@@ -124,11 +211,111 @@ class GefsFamily(Family):
         cache = cache_dir / f"{run:%Y%m%d%H}" / f"{member}.{plan.dir}.f{fh:03d}.grib2" if cache_dir else None
 
         def fetch():
-            entries = parse_idx(http.get_text(url + ".idx"))
-            start, end = find_message(entries, self.cfg.source.variable, self.cfg.source.level)
+            start, end = find_message(self._inv.get(http, url), self.cfg.source.variable, self.cfg.source.level)
             return http.get_range(url, start, end)
 
         return decode_message(_cached(cache, fetch), *_bbox(self.cfg))
+
+    has_wind = True
+    has_gust = True
+
+    def fetch_member(self, http, run, plan, member, fh, cache_dir, want_wind=False):
+        url = object_url(self.cfg, run, plan, member, fh)
+        base = cache_dir / f"{run:%Y%m%d%H}" / f"{member}.{plan.dir}.f{fh:03d}" if cache_dir else None
+        raw, blobs, werr = _idx_member(self, http, url, base, want_wind, self.cfg.wind.gefs if want_wind else None,
+                                       self.cfg.source.variable, self.cfg.source.level)
+        return _member_result(self, raw, blobs, werr, want_wind)
+
+    def wind_blobs(self, http, run, plan, member, fh, cache_dir):
+        w = self.cfg.wind.gefs
+        url = object_url(self.cfg, run, plan, member, fh)
+        base = cache_dir / f"{run:%Y%m%d%H}" / f"{member}.{plan.dir}.f{fh:03d}" if cache_dir else None
+        return _idx_wind_blobs(lambda: self._inv.get(http, url), http, url, w, base)
+
+
+def _idx_member(fam, http: Http, url: str, base: Path | None, want_wind: bool, wcfg, pvar: str, plevel: str):
+    """NCEP-style file (GEFS, AIGEFS) with a .idx: ONE inventory read, then the fewest Range requests that cover the MSLP
+    message and, when wanted, the 10 m u / v messages and the gust.  Messages that are adjacent (GEFS u + v) or separated by
+    less than `[fetch] merge_gap_kb` (AIGEFS: u, v, a 2 m temperature, MSLP, all within ~4 MB) share a request; GEFS's
+    gust, winds and MSLP sit tens of MB apart, so they stay separate.  Parts already on disk are not requested again.
+    -> (MSLP message bytes, {"uv", "gust"} wind blobs or None, wind error or None)"""
+    max_gap = int(getattr(fam.cfg.fetch, "merge_gap_kb", 1024)) * 1024
+    pc = base.parent / f"{base.name}.grib2" if base is not None else None
+    uvc, gc = _sib(base, "uv"), _sib(base, "gust")
+    have = lambda c: c is not None and c.exists()
+    gust_cfg = bool(want_wind and getattr(wcfg, "gust", None))
+    wanted: dict[str, tuple[str, str]] = {}
+    if not have(pc):
+        wanted["p"] = (pvar, plevel)
+    if want_wind and not have(uvc):
+        wanted["u"], wanted["v"] = (wcfg.u, wcfg.level), (wcfg.v, wcfg.level)
+    if gust_cfg and not have(gc):
+        wanted["g"] = (wcfg.gust, wcfg.gust_level)
+    got, missing = ({}, [])
+    if wanted:
+        got, missing = fetch_parts(http, url, fam._inv.get(http, url), wanted, max_gap)
+    if "p" in missing:
+        raise KeyError(f"{pvar}:{plevel} not in inventory")
+    if "p" in got:
+        _store(pc, got["p"])
+    raw = got["p"] if "p" in got else pc.read_bytes()
+    if not want_wind:
+        return raw, None, None
+    blobs: dict = {}
+    werr = None
+    if uvc is not None and uvc.exists() and "u" not in got:
+        blobs["uv"] = uvc.read_bytes()
+    elif "u" in got and "v" in got:
+        blobs["uv"] = got["u"] + got["v"]
+        _store(uvc, blobs["uv"])
+    else:
+        werr = KeyError(f"{wcfg.u}/{wcfg.v}:{wcfg.level} not in inventory")
+    if werr is None and gust_cfg:
+        if "g" in got:
+            blobs["gust"] = got["g"]
+            _store(gc, got["g"])
+        elif have(gc):
+            blobs["gust"] = gc.read_bytes()
+    return raw, (blobs if werr is None else None), werr
+
+
+def _member_result(fam, raw: bytes, blobs, werr, want_wind: bool) -> MemberResult:
+    grid = decode_message(raw, *_bbox(fam.cfg))
+    if not want_wind:
+        return MemberResult(grid)
+    if werr is None:
+        try:
+            return MemberResult(grid, fam.decode_wind(blobs))
+        except (DecodeError, KeyError) as e:
+            werr = e
+    return MemberResult(grid, None, werr)
+
+
+def _sib(base: Path | None, tag: str) -> Path | None:
+    """Sibling cache file `<base>.<tag>.grib2` (base already ends in `.fNNN`, so with_suffix() would clobber it)."""
+    return base.parent / f"{base.name}.{tag}.grib2" if base is not None else None
+
+
+def _idx_wind_blobs(entries_fn, http: Http, url: str, w, base: Path | None) -> dict:
+    """NCEP-style .idx + byte ranges (GEFS, AIGEFS): the 10 m u and v components (adjacent messages, so ONE request) and,
+    when configured and present, the gust."""
+    def uv():
+        got = {}
+        for start, end, ks in find_ranges(entries_fn(), [(w.u, w.level), (w.v, w.level)]):
+            for k, m in zip(ks, split_messages(http.get_range(url, start, end))):
+                got[k] = m
+        return got[0] + got[1]                           # u first, then v
+
+    out = {"uv": _cached(_sib(base, "uv"), uv)}
+    if getattr(w, "gust", None):
+        def gust():
+            (start, end, _), = find_ranges(entries_fn(), [(w.gust, w.gust_level)])
+            return http.get_range(url, start, end)
+        try:
+            out["gust"] = _cached(_sib(base, "gust"), gust)
+        except (KeyError, NotFound):
+            pass                                         # this file has no gust
+    return out
 
 
 # =====================================================================================================
@@ -166,24 +353,31 @@ class IfsFamily(Family):
         return all(http.exists(self._url(run, fh, s)[:-5] + "index") for s in ("enfo", "oper"))
 
     # -- index (one per step, shared by all 50 members) -------------------------------------------------
+    def _params(self) -> tuple[str, ...]:
+        w = getattr(self.cfg, "wind", None)
+        extra = (w.ifs.u, w.ifs.v, *w.ifs.gust) if w is not None and hasattr(w, "ifs") else ()
+        return (self.cfg.ifs.param, *extra)
+
     def _index(self, http: Http, grib_url: str) -> dict:
+        """{param: {(type, number): (offset, length)}} for MSLP and the wind parameters (one download per step)."""
         url = grib_url[:-5] + "index"
         with self._idx_lock:                            # fetched once; other workers wait for it instead of repeating it
             if url not in self._idx:
-                self._idx[url] = parse_json_index(http.get_text(url), self.cfg.ifs.param)
+                self._idx[url] = parse_json_index_params(http.get_text(url), self._params())
             return self._idx[url]
 
-    def _locate(self, http, plan, member):
+    def _locate(self, http, plan, member, param=None):
         """-> (grib_url, offset, length, stream)"""
+        param = param or self.cfg.ifs.param
         if member == "ec00":
             try:                                         # IFS >= 50r1: control = HRES forecast
-                off, ln = self._index(http, plan["oper"])[("fc", "")]
+                off, ln = self._index(http, plan["oper"])[param][("fc", "")]
                 return plan["oper"], off, ln, "oper"
             except (NotFound, KeyError):                 # older cycles: control still inside the ENS file (type cf)
-                off, ln = self._index(http, plan["enfo"])[("cf", "")]
+                off, ln = self._index(http, plan["enfo"])[param][("cf", "")]
                 return plan["enfo"], off, ln, "enfo"
         number = str(int(member[2:]))
-        off, ln = self._index(http, plan["enfo"])[("pf", number)]
+        off, ln = self._index(http, plan["enfo"])[param][("pf", number)]
         return plan["enfo"], off, ln, "enfo"
 
     def fetch_grid(self, http, run, plan, member, fh, cache_dir):
@@ -195,6 +389,35 @@ class IfsFamily(Family):
             return http.get_range(url, off, off + ln - 1)
 
         return decode_message(_cached(cache, fetch), *_bbox(self.cfg))
+
+    has_wind = True
+    has_gust = True
+
+    def wind_blobs(self, http, run, plan, member, fh, cache_dir):
+        """10u and 10v (two ranges, side by side in the result) and the gust.  The gust is the maximum since the previous
+        post-processing step, named 10fg (10fg3 at some steps up to 144 h); it is all zeros at step 0, so it is skipped there."""
+        w = self.cfg.wind.ifs
+        tag = "oper" if member == "ec00" else "enfo"
+        base = cache_dir / f"{run:%Y%m%d%H}" / f"{member}.{tag}.f{fh:03d}" if cache_dir else None
+
+        def one(param):
+            url, off, ln, _ = self._locate(http, plan, member, param)
+            return http.get_range(url, off, off + ln - 1)
+
+        out = {"uv": _cached(_sib(base, "uv"), lambda: one(w.u) + one(w.v))}
+        if fh > 0:
+            def gust():
+                for param in w.gust:
+                    try:
+                        return one(param)
+                    except KeyError:
+                        continue
+                raise KeyError("no gust parameter in the index")
+            try:
+                out["gust"] = _cached(_sib(base, "gust"), gust)
+            except (KeyError, NotFound):
+                pass
+        return out
 
 
 # =====================================================================================================
@@ -211,16 +434,17 @@ class GepsFamily(Family):
         c = cfg.geps
         self.members = ["cc00"] + [f"cp{i:02d}" for i in range(1, int(c.n_perturbed) + 1)]
         self._steps: dict[int, dict] = {}              # fh -> {member: Grid}; filled once per step, shared by all member jobs
+        self._wsteps: dict[int, dict] = {}             # fh -> {member: raw wind-speed message}
         self._lock = threading.Lock()
 
     def max_fh(self, run):
         c = self.cfg.geps
         return int(c.max_fh) if run.hour in set(c.cycles) else int(c.short_max_fh)
 
-    def _url(self, run: datetime, fh: int) -> str:
+    def _url(self, run: datetime, fh: int, variable: str | None = None) -> str:
         c = self.cfg.geps
         base = c.base_url.replace("{date}", f"{run:%Y%m%d}").rstrip("/")
-        return (f"{base}/{run:%H}/{fh:03d}/CMC_geps-raw_{c.variable}_{c.grid}_{run:%Y%m%d%H}_P{fh:03d}_allmbrs.grib2")
+        return (f"{base}/{run:%H}/{fh:03d}/CMC_geps-raw_{variable or c.variable}_{c.grid}_{run:%Y%m%d%H}_P{fh:03d}_allmbrs.grib2")
 
     def plan(self, http, run, fh):
         url = self._url(run, fh)
@@ -252,6 +476,18 @@ class GepsFamily(Family):
     def fetch_grid(self, http, run, plan, member, fh, cache_dir):
         return self._step_grids(http, run, plan, fh, cache_dir)[member]
 
+    has_wind = True                                     # WIND_TGL_10 (speed) is in the raw files; there is no raw gust
+
+    def wind_blobs(self, http, run, plan, member, fh, cache_dir):
+        with self._lock:
+            if fh not in self._wsteps:
+                url = self._url(run, fh, self.cfg.wind.geps.speed)
+                cache = cache_dir / f"{run:%Y%m%d%H}" / f"geps.wind.f{fh:03d}.grib2" if cache_dir else None
+                msgs = split_messages(_cached(cache, lambda: http.get_bytes(url)))
+                keyed = sorted(range(len(msgs)), key=lambda i: (member_key(msgs[i]), i))     # same member order as the MSLP file
+                self._wsteps[fh] = {name: msgs[i] for name, i in zip(self.members, keyed)}
+            return {"speed": self._wsteps[fh][member]}
+
 
 # =====================================================================================================
 class AigefsFamily(Family):
@@ -262,6 +498,7 @@ class AigefsFamily(Family):
     def __init__(self, cfg):
         super().__init__(cfg)
         self.members = [f"ai{i:02d}" for i in range(0, int(cfg.aigefs.n_members))]
+        self._inv = _Inventories()
 
     def max_fh(self, run):
         return int(self.cfg.aigefs.max_fh)
@@ -293,11 +530,24 @@ class AigefsFamily(Family):
         cache = cache_dir / f"{run:%Y%m%d%H}" / f"{member}.{self.cfg.aigefs.product}.f{fh:03d}.grib2" if cache_dir else None
 
         def fetch():
-            entries = parse_idx(http.get_text(url + ".idx"))
-            start, end = find_message(entries, self.cfg.aigefs.variable, self.cfg.aigefs.level)
+            start, end = find_message(self._inv.get(http, url), self.cfg.aigefs.variable, self.cfg.aigefs.level)
             return http.get_range(url, start, end)
 
         return decode_message(_cached(cache, fetch), *_bbox(self.cfg))
+
+    has_wind = True                                     # UGRD / VGRD at 10 m are in the sfc file; the AI model has no gust
+
+    def fetch_member(self, http, run, plan, member, fh, cache_dir, want_wind=False):
+        url = self._url(run, member, fh)
+        base = cache_dir / f"{run:%Y%m%d%H}" / f"{member}.{self.cfg.aigefs.product}.f{fh:03d}" if cache_dir else None
+        raw, blobs, werr = _idx_member(self, http, url, base, want_wind, self.cfg.wind.aigefs if want_wind else None,
+                                       self.cfg.aigefs.variable, self.cfg.aigefs.level)
+        return _member_result(self, raw, blobs, werr, want_wind)
+
+    def wind_blobs(self, http, run, plan, member, fh, cache_dir):
+        url = self._url(run, member, fh)
+        base = cache_dir / f"{run:%Y%m%d%H}" / f"{member}.{self.cfg.aigefs.product}.f{fh:03d}" if cache_dir else None
+        return _idx_wind_blobs(lambda: self._inv.get(http, url), http, url, self.cfg.wind.aigefs, base)
 
 
 # =====================================================================================================

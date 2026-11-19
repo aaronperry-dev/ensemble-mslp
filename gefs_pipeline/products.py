@@ -1,4 +1,4 @@
-"""Derived products: ensemble mean / member-wise minimum and per-member low-pressure centres."""
+"""Derived products: ensemble mean / member-wise minimum and per-member low-pressure centers."""
 from __future__ import annotations
 
 import json
@@ -21,8 +21,13 @@ def ensemble_min(stack: np.ndarray) -> np.ndarray:
     return np.nanmin(stack, axis=0)
 
 
+def ensemble_max(stack: np.ndarray) -> np.ndarray:
+    """Member-wise maximum (winds, gusts): at every grid point, the highest value any member forecasts."""
+    return np.nanmax(stack, axis=0)
+
+
 # ---------------------------------------------------------------------------------------------------
-# low-pressure centres (one list per member)
+# low-pressure centers (one list per member)
 # ---------------------------------------------------------------------------------------------------
 def detect_lows(lats, lons, field, *, threshold_hpa: float, radius_deg: float, smooth_deg: float,
                 min_sep_deg: float, domain: tuple[float, float, float, float]) -> list[tuple[float, float, float]]:

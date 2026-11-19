@@ -6,7 +6,8 @@ Layout (little endian), then the whole file is gzip'd:
 
 * header  - {kind, fh, valid, nx, ny, lon0, lat0, dlon, dlat, members, source, lows?}
             lon0/lat0 = first column/row (the grid is ascending in both); `lows` = [[lon, lat, hPa, member], ...]
-* field   - nx*ny Int16 tenths of hPa (-32768 = missing), row-major, south -> north.  Each value is predicted from
+* field   - nx*ny Int16 tenths of hPa (-32768 = missing), row-major, south -> north.  Other quantities (10 m wind, gust,
+            in mph) use the header's "scale" = stored units per unit (default 10 = tenths; wind uses 2 = half-mph steps).  Each value is predicted from
             its neighbours (left + up - up-left, like PNG/LOCO "gradient"), the residual is zig-zag coded and split
             into a low-byte plane followed by a high-byte plane.  Smooth pressure fields become long runs of
             zeros, which gzip squeezes to a few bits per cell.  The browser reverses it exactly (lossless).
@@ -39,9 +40,9 @@ def _pack_ints(v: np.ndarray) -> bytes:
     return (z & 0xFF).astype(np.uint8).tobytes() + (z >> 8).astype(np.uint8).tobytes()
 
 
-def pack_field(values: np.ndarray) -> bytes:
-    """float hPa (ny, nx) -> tenths of hPa (-32768 = missing), then `_pack_ints`."""
-    return _pack_ints(np.where(np.isfinite(values), np.rint(values * 10.0), MISSING))
+def pack_field(values: np.ndarray, scale: float = 10.0) -> bytes:
+    """float (ny, nx) -> Int16 units of 1/scale (hPa tenths by default; -32768 = missing), then `_pack_ints`."""
+    return _pack_ints(np.where(np.isfinite(values), np.clip(np.rint(values * scale), -32767, 32767), MISSING))
 
 
 def _unpack_ints(buf: bytes, nx: int, ny: int, offset: int = 0) -> np.ndarray:
@@ -60,9 +61,10 @@ def unpack_field(buf: bytes, nx: int, ny: int) -> np.ndarray:
     return _unpack_ints(buf, nx, ny)
 
 
-def encode(header: dict, field: np.ndarray, owner: np.ndarray | None = None) -> bytes:
+def encode(header: dict, field: np.ndarray, owner: np.ndarray | None = None, scale: float = 10.0) -> bytes:
+    header = dict(header, scale=scale) if scale != 10.0 else header
     h = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    body = MAGIC + struct.pack("<I", len(h)) + h + pack_field(field)
+    body = MAGIC + struct.pack("<I", len(h)) + h + pack_field(field, scale)
     if owner is not None:
         body += np.clip(owner, 0, 255).astype(np.uint8).tobytes()
     return gzip.compress(body, compresslevel=9, mtime=0)
@@ -94,7 +96,7 @@ def decode(blob: bytes) -> tuple[dict, np.ndarray, np.ndarray | None]:
     off = 8 + hl
     tenths = _unpack_ints(raw, nx, ny, off)
     off += 2 * nx * ny
-    field = np.where(tenths == MISSING, np.nan, tenths / 10.0)
+    field = np.where(tenths == MISSING, np.nan, tenths / float(hdr.get("scale", 10)))
     owner = np.frombuffer(raw, np.uint8, nx * ny, offset=off).reshape(ny, nx) if len(raw) > off else None
     return hdr, field, owner
 
@@ -106,9 +108,9 @@ def write_counts(path: Path, header: dict, planes: np.ndarray) -> int:
     return len(blob)
 
 
-def write(path: Path, header: dict, field: np.ndarray, owner: np.ndarray | None = None) -> int:
+def write(path: Path, header: dict, field: np.ndarray, owner: np.ndarray | None = None, scale: float = 10.0) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
-    blob = encode(header, field, owner)
+    blob = encode(header, field, owner, scale)
     path.write_bytes(blob)
     return len(blob)
 

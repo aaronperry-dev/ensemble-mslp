@@ -26,6 +26,7 @@ def _common(p: argparse.ArgumentParser):
     p.add_argument("--aigefs-base-url", default=None, help="override the AIGEFS bucket URL (testing / mirrors)")
     p.add_argument("--ifs-base-url", default=None, help="override the ECMWF bucket URL (testing / mirrors)")
     p.add_argument("--rps", type=float, default=None, help="override requests-per-second cap")
+    p.add_argument("--no-wind", action="store_true", help="skip the 10 m wind / gust products (much less data to download)")
     p.add_argument("-v", "--verbose", action="store_true")
 
 
@@ -41,6 +42,8 @@ def _setup(args):
         cfg.geps.base_url = args.geps_base_url.rstrip("/")
     if args.aigefs_base_url:
         cfg.aigefs.base_url = args.aigefs_base_url.rstrip("/")
+    if getattr(args, "no_wind", False):
+        cfg.wind.enabled = False
     families = make_families(cfg, [k.strip() for k in args.families.split(",")] if args.families else None)
     if args.members:
         for f in families:

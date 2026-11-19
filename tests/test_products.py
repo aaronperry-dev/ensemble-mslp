@@ -23,7 +23,7 @@ def test_mean_and_min():
     assert ensemble_min(s)[0, 0] == 1000
 
 
-def test_detect_lows_finds_centres_and_respects_threshold():
+def test_detect_lows_finds_centers_and_respects_threshold():
     f = field((-90, 40, 30), (-70, 45, 12))        # 988 and 1006 hPa
     kw = dict(radius_deg=2, smooth_deg=0.5, min_sep_deg=1.5, domain=(-140, -50, 15, 65))
     lows = detect_lows(LATS, LONS, f, threshold_hpa=1005, **kw)
@@ -34,7 +34,7 @@ def test_detect_lows_finds_centres_and_respects_threshold():
 
 
 def test_detect_lows_ignores_border_and_outside_domain():
-    f = field((-139.9, 40, 30))                     # centred on the grid edge -> not provably a minimum
+    f = field((-139.9, 40, 30))                     # centerd on the grid edge -> not provably a minimum
     assert detect_lows(LATS, LONS, f, threshold_hpa=1005, radius_deg=2, smooth_deg=0.5, min_sep_deg=1.5,
                        domain=(-140, -50, 15, 65)) == []
     f = field((-90, 40, 30))

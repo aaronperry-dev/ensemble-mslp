@@ -1,4 +1,4 @@
-"""Link each member's low-pressure centres across forecast hours into tracks.
+"""Link each member's low-pressure centers across forecast hours into tracks.
 
 Input is what the pipeline already detects per frame: rows ``[lon, lat, hPa, member]``.  Within one member, a low at
 hour *h* continues a track from hour *h - dt* when it lies close to where the track was heading (previous position plus

@@ -1,7 +1,8 @@
 """Polite HTTP client for the public NOAA GEFS bucket.
 
 Rate-limit / server-friendliness features
-  * one global token-bucket style limiter (requests per second) shared by all worker threads
+  * one limiter per host (requests per second), shared by all worker threads; each is ADAPTIVE: a 429 / 503 halves that host's
+    rate (never below a floor) and it creeps back up to the configured ceiling after a run of clean replies
   * small, fixed number of keep-alive connections (thread-local sessions)
   * exponential backoff + jitter on 429 / 5xx (S3 "SlowDown" is a 503) and on network errors,
     honouring a Retry-After header when present
@@ -36,23 +37,56 @@ class FetchError(Exception):
 
 
 class RateLimiter:
-    """Spaces request *starts* at least 1/rps seconds apart, across threads."""
+    """Spaces request *starts* at least 1/rate seconds apart, across threads.
 
-    def __init__(self, rps: float):
-        self.interval = 1.0 / rps if rps and rps > 0 else 0.0
+    `rps` is the CEILING.  The rate in force starts there; penalize() (called on HTTP 429 / 503) halves it, at most once per
+    `cooldown` seconds so a burst of simultaneous 503s counts as one signal, never below `floor` x ceiling; after
+    `recover_after` consecutive clean replies ok() raises it by 15 % until the ceiling is reached again (AIMD)."""
+
+    def __init__(self, rps: float, *, floor: float = 0.2, cooldown: float = 2.0, recover_after: int = 25, clock=time.monotonic):
+        self.ceiling = float(rps) if rps and rps > 0 else 0.0
+        self.rate = self.ceiling
+        self.floor = self.ceiling * floor
+        self.cooldown, self.recover_after, self._clock = cooldown, recover_after, clock
         self._lock = threading.Lock()
         self._next = 0.0
+        self._clean = 0
+        self._last_penalty = -1e9
+        self.penalties = 0
+
+    @property
+    def interval(self) -> float:
+        return 1.0 / self.rate if self.rate else 0.0
 
     def wait(self) -> None:
-        if not self.interval:
-            return
         with self._lock:
+            if not self.rate:
+                return
             now = time.monotonic()
             start = max(now, self._next)
-            self._next = start + self.interval
+            self._next = start + 1.0 / self.rate
         delay = start - now
         if delay > 0:
             time.sleep(delay)
+
+    def penalize(self) -> None:
+        with self._lock:
+            now = self._clock()
+            self._clean = 0
+            if not self.rate or now - self._last_penalty < self.cooldown:
+                return
+            self._last_penalty = now
+            self.penalties += 1
+            self.rate = max(self.floor, self.rate / 2)
+
+    def ok(self) -> None:
+        with self._lock:
+            if not self.rate or self.rate >= self.ceiling:
+                return
+            self._clean += 1
+            if self._clean >= self.recover_after:
+                self._clean = 0
+                self.rate = min(self.ceiling, self.rate * 1.15)
 
 
 @dataclass
@@ -64,21 +98,39 @@ class Stats:
 
     def __post_init__(self):
         self._lock = threading.Lock()
+        self.hosts: dict[str, dict[str, int]] = {}       # per-host breakdown: requests, ranged (206), whole (200), bytes, retries
 
     def add(self, **kw):
         with self._lock:
             for k, v in kw.items():
                 setattr(self, k, getattr(self, k) + v)
 
+    def add_host(self, host: str, **kw):
+        with self._lock:
+            h = self.hosts.setdefault(host, {"requests": 0, "ranged": 0, "whole": 0, "bytes": 0, "retries": 0})
+            for k, v in kw.items():
+                h[k] += v
+
+    def summary(self) -> list[str]:
+        """One line per host: requests, how many were byte-range (206) reads, bytes moved, retries."""
+        out = []
+        for host, h in sorted(self.hosts.items()):
+            per = h["bytes"] / max(1, h["ranged"] + h["whole"])
+            out.append(f"{host}: {h['requests']} requests ({h['ranged']} byte-range, {h['whole']} whole-file / inventory), "
+                       f"{h['bytes'] / 1e6:.0f} MB, {per / 1e3:.0f} kB per read, {h['retries']} retries")
+        return out
+
 
 class Http:
     def __init__(self, *, user_agent: str, rps: float = 8, max_retries: int = 6, backoff_base: float = 1.0,
                  backoff_max: float = 60.0, timeout: tuple[float, float] = (10, 60), sleep=time.sleep,
-                 host_rps: dict[str, float] | None = None):
+                 host_rps: dict[str, float] | None = None, adaptive: bool = True):
         self.user_agent = user_agent
         self.limiter = RateLimiter(rps)
         # optional gentler limit for particular hosts (substring of the hostname), e.g. {"ecmwf-forecasts": 3}
-        self.host_limiters = {h: RateLimiter(r) for h, r in (host_rps or {}).items()}
+        self.host_limiters = {h: RateLimiter(r, **({} if adaptive else {"floor": 1.0})) for h, r in (host_rps or {}).items()}
+        if not adaptive:
+            self.limiter = RateLimiter(rps, floor=1.0)
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
@@ -106,28 +158,41 @@ class Http:
         if retry_after and retry_after.isdigit():
             delay = max(delay, float(retry_after))
         self.stats.add(retries=1)
+        self.stats.add_host(self._route(url)[0], retries=1)
         log.warning("%s on %s - retry %d/%d in %.1fs", why, url.rsplit("/", 1)[-1], attempt + 1, self.max_retries, delay)
         self._sleep(delay)
 
     def _limiter_for(self, url: str) -> RateLimiter:
+        return self._route(url)[1]
+
+    def _route(self, url: str) -> tuple[str, RateLimiter]:
+        """(label, limiter) for a URL: the configured host whose name occurs in the hostname, else the default limiter."""
+        netloc = url.split("/", 3)[2]
         for host, lim in self.host_limiters.items():
-            if host in url.split("/", 3)[2]:
-                return lim
-        return self.limiter
+            if host in netloc:
+                return host, lim
+        return netloc, self.limiter
 
     def request(self, method: str, url: str, *, headers: dict | None = None, ok=(200, 206)) -> requests.Response:
+        label, limiter = self._route(url)
         for attempt in range(self.max_retries + 1):
-            self._limiter_for(url).wait()
+            limiter.wait()
             self.stats.add(requests=1)
+            self.stats.add_host(label, requests=1)
             try:
                 r = self._session().request(method, url, headers=headers, timeout=self.timeout, stream=True)
                 if r.status_code in ok:
                     if method != "HEAD":
                         _ = r.content  # read body now (inside the retry scope)
-                    self.stats.add(bytes=len(r.content) if method != "HEAD" else 0)
+                    n = len(r.content) if method != "HEAD" else 0
+                    self.stats.add(bytes=n)
+                    self.stats.add_host(label, bytes=n, **({"ranged": 1} if r.status_code == 206 else {"whole": 1} if method != "HEAD" else {}))
+                    limiter.ok()
                     return r
                 status, retry_after = r.status_code, r.headers.get("Retry-After")
                 r.close()
+                if status in (429, 503):
+                    limiter.penalize()                      # the server is asking us to slow down: halve this host's rate
             except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as e:
                 if attempt >= self.max_retries:
                     raise FetchError(f"{method} {url}: {type(e).__name__}: {e}") from e
@@ -225,3 +290,103 @@ def parse_json_index(text: str, param: str) -> dict[tuple[str, str], tuple[int, 
             continue
         out.setdefault((str(row.get("type", "")), str(row.get("number", ""))), (int(row["_offset"]), int(row["_length"])))
     return out
+
+
+def parse_json_index_params(text: str, params: tuple[str, ...]) -> dict[str, dict[tuple[str, str], tuple[int, int]]]:
+    """Like parse_json_index, for several parameters at once -> {param: {(type, number): (offset, length)}}.
+    One pass over the (2-3 MB) index serves MSLP and the wind fields together."""
+    out: dict[str, dict[tuple[str, str], tuple[int, int]]] = {p: {} for p in params}
+    needles = tuple(f'"{p}"' for p in params)
+    for line in text.splitlines():
+        if not any(n in line for n in needles):
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        p = row.get("param")
+        if p in out and "_offset" in row and "_length" in row:
+            out[p].setdefault((str(row.get("type", "")), str(row.get("number", ""))), (int(row["_offset"]), int(row["_length"])))
+    return out
+
+
+def find_ranges(entries: list[IdxEntry], wanted: list[tuple[str, str]]) -> list[tuple[int, int | None, list[int]]]:
+    """Byte ranges that cover the wanted (var, level) messages with as few requests as possible.
+
+    Messages that sit next to each other in the file (GEFS: UGRD then VGRD at 10 m) are merged into one range.
+    Returns [(start, end, [indices into `wanted` in file order])]; end is None for the last message of the file.
+    Raises KeyError when a wanted message is not in the inventory."""
+    pos = []
+    for w in wanted:
+        for i, e in enumerate(entries):
+            if e.var == w[0] and e.level == w[1]:
+                pos.append(i)
+                break
+        else:
+            raise KeyError(f"{w[0]}:{w[1]} not in inventory")
+    order = sorted(range(len(wanted)), key=lambda k: pos[k])
+    runs: list[list[int]] = []
+    for k in order:
+        if runs and pos[k] == pos[runs[-1][-1]] + 1:
+            runs[-1].append(k)
+        else:
+            runs.append([k])
+    out = []
+    for run in runs:
+        first, last = pos[run[0]], pos[run[-1]]
+        end = entries[last + 1].offset - 1 if last + 1 < len(entries) else None
+        out.append((entries[first].offset, end, run))
+    return out
+
+
+def plan_parts(entries: list[IdxEntry], wanted: dict[str, tuple[str, str]], max_gap: int = 0):
+    """Plan the byte-range requests for several messages of ONE file: `wanted` = {part name: (var, level)}.
+
+    Messages that are next to each other, or separated by at most `max_gap` bytes of messages we do not want, share one request:
+    one request costs far more of the rate limit than a few hundred kB of extra bytes.  Returns
+    (ranges, missing): ranges = [(start, end | None, [(part, offset inside the range, length | None)])], in file order
+    (end / length are None for the last message of the file); missing = parts that are not in the inventory."""
+    pos: dict[str, int] = {}
+    missing: list[str] = []
+    for part, (var, level) in wanted.items():
+        for i, e in enumerate(entries):
+            if e.var == var and e.level == level:
+                pos[part] = i
+                break
+        else:
+            missing.append(part)
+    groups: list[list[str]] = []
+    for part in sorted(pos, key=pos.get):
+        if groups:
+            j = pos[groups[-1][-1]]
+            prev_end = entries[j + 1].offset if j + 1 < len(entries) else None      # first byte after the previous wanted message
+            if prev_end is not None and entries[pos[part]].offset - prev_end <= max_gap:
+                groups[-1].append(part)
+                continue
+        groups.append([part])
+    ranges = []
+    for g in groups:
+        first = entries[pos[g[0]]].offset
+        last = pos[g[-1]]
+        end = entries[last + 1].offset - 1 if last + 1 < len(entries) else None
+        parts = []
+        for part in g:
+            i = pos[part]
+            parts.append((part, entries[i].offset - first, entries[i + 1].offset - entries[i].offset if i + 1 < len(entries) else None))
+        ranges.append((first, end, parts))
+    return ranges, missing
+
+
+def fetch_parts(http: Http, url: str, entries: list[IdxEntry], wanted: dict[str, tuple[str, str]], max_gap: int = 0):
+    """Download the wanted messages of one file with as few Range requests as plan_parts() allows.
+    Returns ({part: raw GRIB message bytes}, [parts missing from the inventory])."""
+    ranges, missing = plan_parts(entries, wanted, max_gap)
+    out: dict[str, bytes] = {}
+    for start, end, parts in ranges:
+        data = http.get_range(url, start, end)
+        for part, off, ln in parts:
+            blob = data[off:] if ln is None else data[off:off + ln]
+            if (ln is not None and len(blob) != ln) or blob[:4] != b"GRIB":
+                raise FetchError(f"bad message slice for {part} in {url}")
+            out[part] = blob
+    return out, missing

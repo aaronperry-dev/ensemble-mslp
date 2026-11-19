@@ -5,7 +5,8 @@
  *   - inflating + decoding the grids                    (inflate, decodeBin)
  *   - blends of any systems: weighted mean, lowest-of-all-members with owner, regridding to the first system's grid
  *   - the swath: running minimum of the member-wise minimum over the forecast hours, with the hour it was reached
- *   - low-pressure centres of any derived minimum field (a port of gefs_pipeline.products.detect_lows)
+ *     (winds and gusts use the same code with dir = +1: highest member, running MAXIMUM)
+ *   - low-pressure centers of any derived minimum field (a port of gefs_pipeline.products.detect_lows)
  *   - smooth upsampling + colour-class rasterisation of a field onto the map canvas
  *   - probability planes (members below a pressure level) and strike probability from member low tracks
  */
@@ -71,10 +72,11 @@
   const sameGeom = (a, b) => a.nx === b.nx && a.ny === b.ny && Math.abs(a.lon0 - b.lon0) < 1e-6 && Math.abs(a.lat0 - b.lat0) < 1e-6 &&
     Math.abs(a.dlon - b.dlon) < 1e-6 && Math.abs(a.dlat - b.dlat) < 1e-6;
 
-  /** Int16 tenths -> Float32 hPa (NaN where missing). */
-  function toHpa(t) {
-    const v = new Float32Array(t.length);
-    for (let k = 0; k < t.length; k++) v[k] = t[k] === MISSING ? NaN : t[k] / 10;
+  /** Int16 stored units -> Float32 values (NaN where missing).  `scale` = stored units per unit: 10 (tenths of hPa) unless the file's
+   *  header says otherwise (wind and gust are stored in half-mph steps: scale 2). */
+  function toHpa(t, scale) {
+    const v = new Float32Array(t.length), s = scale || 10;
+    for (let k = 0; k < t.length; k++) v[k] = t[k] === MISSING ? NaN : t[k] / s;
     return v;
   }
   const fieldOf = (g, v) => Object.assign(geomOf(g), { v });
@@ -138,9 +140,10 @@
     return out;
   }
 
-  /** Lowest value over the parts (all on one grid). parts: [{v, owner, offset, when?}] -> {v, owner:Int32Array, when?:Int16Array}.
-   *  Ties keep the earlier part (like the Python pipeline did). */
-  function lowestOf(parts) {
+  /** Lowest value over the parts (all on one grid); dir = +1 takes the HIGHEST instead (winds, gusts).
+   *  parts: [{v, owner, offset, when?}] -> {v, owner:Int32Array, when?:Int16Array}.  Ties keep the earlier part (like the Python pipeline did). */
+  function lowestOf(parts, dir) {
+    const hi = dir > 0;
     const n = parts[0].v.length, v = new Float32Array(parts[0].v), owner = new Int32Array(n);
     const hasWhen = parts[0].when !== undefined, when = hasWhen ? new Int16Array(parts[0].when) : undefined;
     for (let k = 0; k < n; k++) owner[k] = parts[0].owner[k] + parts[0].offset;
@@ -148,7 +151,7 @@
       const p = parts[s];
       for (let k = 0; k < n; k++) {
         const x = p.v[k];
-        if (x === x && !(v[k] <= x)) {                          // lower than the current value (or the current one is NaN)
+        if (x === x && !(hi ? v[k] >= x : v[k] <= x)) {         // lower (higher) than the current value (or the current one is NaN)
           v[k] = x; owner[k] = p.owner[k] + p.offset;
           if (hasWhen) when[k] = p.when[k];
         }
@@ -164,22 +167,22 @@
   function swathStart(g) {
     const n = g.t.length, when = new Int16Array(n).fill(g.fh);
     for (let k = 0; k < n; k++) if (g.t[k] === MISSING) when[k] = -1;
-    return { fh: g.fh, geom: geomOf(g), t: Int16Array.from(g.t), owner: Uint8Array.from(g.owner), when };
+    return { fh: g.fh, geom: geomOf(g), scale: g.scale || 10, t: Int16Array.from(g.t), owner: Uint8Array.from(g.owner), when };
   }
-  /** Fold the next hour in place: lower (or newly available) cells take the new value, member and hour. */
-  function swathFold(st, g) {
-    const t = st.t, o = st.owner, w = st.when, gt = g.t, go = g.owner;
+  /** Fold the next hour in place: lower (or newly available) cells take the new value, member and hour; dir = +1: higher cells. */
+  function swathFold(st, g, dir) {
+    const t = st.t, o = st.owner, w = st.when, gt = g.t, go = g.owner, hi = dir > 0;
     for (let k = 0; k < t.length; k++) {
       const x = gt[k];
-      if (x !== MISSING && (t[k] === MISSING || x < t[k])) { t[k] = x; o[k] = go[k]; w[k] = g.fh; }
+      if (x !== MISSING && (t[k] === MISSING || (hi ? x > t[k] : x < t[k]))) { t[k] = x; o[k] = go[k]; w[k] = g.fh; }
     }
     st.fh = g.fh;
     return st;
   }
-  const swathCopy = (st) => ({ fh: st.fh, geom: st.geom, t: Int16Array.from(st.t), owner: Uint8Array.from(st.owner), when: Int16Array.from(st.when) });
+  const swathCopy = (st) => ({ fh: st.fh, geom: st.geom, scale: st.scale, t: Int16Array.from(st.t), owner: Uint8Array.from(st.owner), when: Int16Array.from(st.when) });
 
   // ---------------------------------------------------------------------------------------------
-  // low-pressure centres: port of gefs_pipeline.products.detect_lows (gaussian_filter + minimum_filter)
+  // low-pressure centers: port of gefs_pipeline.products.detect_lows (gaussian_filter + minimum_filter)
   // ---------------------------------------------------------------------------------------------
   function gaussSmooth(v, nx, ny, sigma) {
     if (!(sigma > 0)) return v;
@@ -305,12 +308,19 @@
       while (c < edges.length && val >= edges[c]) c++;
       lut[q] = rgba[c];
     }
-    return { lo, lut };
+    // `calm`: every value below it is drawn transparent, so rasterize() can skip a pixel whose four source cells are all below it.
+    // Winds and probabilities start with a transparent class (most of the map is calm / 0 %); MSLP does not (calm = -Infinity).
+    // The margin covers the 0.1 quantisation of the look-up (a value just under an edge rounds up to the edge's class).
+    let k = 0;
+    while (k < rgba.length && rgba[k] === 0 && k < edges.length) k++;
+    const calm = k > 0 ? edges[k - 1] - 0.06 : -Infinity;
+    return { lo, lut, calm };
   }
 
-  /** Rasterise a field into a (w x h) Uint32 RGBA buffer. lons[x], lats[y] = geographic position of each pixel centre. */
+  /** Rasterise a field into a (w x h) Uint32 RGBA buffer. lons[x], lats[y] = geographic position of each pixel center. */
   function rasterize(f, lons, lats, lutObj, buf32) {
     const { nx, ny, v, lon0, lat0, dlon, dlat } = f, w = lons.length, h = lats.length, { lo, lut } = lutObj;
+    const calm = lutObj.calm === undefined ? -Infinity : lutObj.calm;
     buf32.fill(0);
     const ix = new Int32Array(w), wx = new Float32Array(w);
     for (let x = 0; x < w; x++) {
@@ -327,8 +337,10 @@
       for (let x = 0; x < w; x++) {
         const i = ix[x];
         if (i < 0) continue;
+        const a = v[r0 + i], b = v[r0 + i + 1], c = v[r1 + i], d = v[r1 + i + 1];
+        if (a < calm && b < calm && c < calm && d < calm) continue;       // all four below the first colour: bilinear cannot reach it (NaN fails the test)
         const tx = wx[x];
-        const val = (v[r0 + i] * (1 - tx) + v[r0 + i + 1] * tx) * (1 - ty) + (v[r1 + i] * (1 - tx) + v[r1 + i + 1] * tx) * ty;
+        const val = (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty;
         if (val !== val) continue;
         let q = Math.round((val - lo) * 10);
         q = q < 0 ? 0 : q >= nlut ? nlut - 1 : q;
@@ -371,7 +383,7 @@
    * Strike probability from member low tracks.
    *   tracks   [{m, pts: [[fh, lon, lat, hPa], ...]}]  (m = member index; every member counts once per cell)
    *   geom     {nx, ny, lon0, lat0, dlon, dlat}        grid the result lives on
-   *   radiusKm a member "strikes" a cell when one of its lows passes within this distance of the cell centre
+   *   radiusKm a member "strikes" a cell when one of its lows passes within this distance of the cell center
    *   levelHpa only lows deeper than this (hPa, strictly below) count; the pressure is interpolated between hours
    *   frameFhs ascending forecast hours of the frames (a hit at hour t is counted from the first frame with fh >= t)
    * Returns {geom, cum: Uint8Array[frame]} - cum[f][cell] = number of distinct members that have struck the cell by frame f.

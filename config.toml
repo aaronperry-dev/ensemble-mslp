@@ -26,6 +26,7 @@ base_url      = "https://noaa-gefs-pds.s3.amazonaws.com"
 n_perturbed   = 30              # gep01 .. gep30 (control member gec00 is always added)
 variable      = "PRMSL"         # GRIB short name as written in the .idx files
 level         = "mean sea level"
+requests_per_second = 10        # S3 bucket of the NOAA Open Data programme; the limiter backs off by itself on 429 / 503 (see [fetch])
 
 # Products are tried in order, i.e. HIGHEST RESOLUTION FIRST.
 # Verified against the bucket: 0.25-deg ("pgrb2sp25") only exists for f000-f240;
@@ -88,8 +89,10 @@ pad_deg = 3                     # extra data kept around the domain so contours/
 initial_view = [21, -128, 53, -63]   # [south, west, north, east] the viewer opens on (CONUS)
 
 [fetch]                         # --- polite-client settings -------------------------------------
-workers             = 6         # parallel connections (keep small)
-requests_per_second = 8         # global cap across all workers
+workers             = 6         # parallel connections PER HOST (each system has its own pool; keep small)
+requests_per_second = 8         # cap for any host without its own requests_per_second above
+merge_gap_kb        = 1024      # one Range request may span up to this much unwanted data between two wanted messages (fewer requests,
+                                # a few hundred kB more; requests, not bytes, are what the servers' limits count)
 timeout_connect_s   = 10
 timeout_read_s      = 60
 max_retries         = 6
@@ -104,7 +107,7 @@ radius_deg    = 2.0             # a low must be the minimum within this radius
 smooth_deg    = 0.5             # Gaussian smoothing used only to LOCATE minima (reported value is raw)
 min_separation_deg = 1.5
 
-[lows_min]                      # low centres of the member-wise MINIMUM field (one per envelope minimum)
+[lows_min]                      # low centers of the member-wise MINIMUM field (one per envelope minimum)
 threshold_hpa = 1005
 radius_deg    = 3.0             # the envelope is broad, so use a wider search radius than for single members
 smooth_deg    = 0.5
@@ -203,7 +206,7 @@ levels = [925, 950, 965, 975, 990, 1000, 1005, 1010]     # hPa; the intensity th
 edges  = [5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95]     # % class edges (first class, < 5 %, is left transparent)
 ramp   = "YlOrRd"
 
-[tracks]                          # each member's low centres linked across hours (the low markers' own detector settings: [lows])
+[tracks]                          # each member's low centers linked across hours (the low markers' own detector settings: [lows])
 max_speed_kmh = 100               # a low may not move farther than this between two hours
 min_points    = 3                 # drop tracks shorter than this many hours-steps (3 x 6 h = 12-18 h)
 
@@ -212,9 +215,115 @@ radii_km   = [100, 200, 300, 500]
 default_km = 200                  # NHC's strike-probability radius is 120 nautical miles (~220 km)
 ramp       = "YlGnBu"
 
+# --- 10 m wind speed and wind gust (mph) -----------------------------------------------------------
+# Ensemble products for the wind side of coastal storms and Nor'easters.  Per system and hour the pipeline writes, for
+# the sustained 10 m wind ("wind") and the 10 m gust ("gust"): the ensemble MEAN of the members' speeds, the highest
+# value of any member (with the member that supplies it), and the number of members at or above each threshold below.
+# The browser builds blends of systems and the running-maximum swath from those, exactly as for MSLP.
+#
+# Which systems publish what (checked against the buckets / MSC Datamart):
+#   GEFS    UGRD + VGRD 10 m and GUST (instantaneous, at the valid hour)            [pgrb2sp25]
+#   ECMWF   10u + 10v and 10fg (the highest gust since the previous output step, i.e. in the last 1-3 h; none at step 0)
+#   GEPS    WIND_TGL_10 (wind speed); there is NO gust in the raw files
+#   AIGEFS  UGRD + VGRD 10 m; the AI model has no gust
+# A system without gust simply has no gust product (and drops out of gust blends).
+#
+# Cost: this adds 3-4 requests and ~2-3 MB per member and hour (the GRIB fields are global; only the bytes of the
+# wanted messages are downloaded).  A full four-system build roughly doubles to triples the download volume, so use
+# `families`, `max_fh` or `enabled = false` to trim it.
+[wind]
+enabled  = true
+families = ["gefs", "ifs", "geps", "aigefs"]     # systems to fetch wind for (a system without wind is skipped)
+max_fh   = 240                                   # wind / gust frames stop here
+speed_levels = [25, 31, 39, 50, 55, 74]          # mph; probability of sustained wind AT OR ABOVE each
+gust_levels  = [35, 46, 58, 74, 90]              # mph; probability of gust AT OR ABOVE each
+prob_ramp    = "YlOrBr"
+# NWS / marine thresholds the levels refer to (mph; 1 kt = 1.151 mph):
+#   Wind Advisory 31-39 sustained or gusts 46-57 | High Wind Warning 40+ sustained or gusts 58+ |
+#   marine Gale 34-47 kt (39-54 mph) | Storm 48-63 kt (55-73 mph) | Hurricane force 64+ kt (74+ mph)
+level_names = { "31" = "Wind Advisory", "39" = "Gale / High Wind", "55" = "Storm force", "74" = "Hurricane force", "46" = "Advisory gusts", "58" = "High Wind gusts" }
+
+[wind.gefs]
+u = "UGRD"
+v = "VGRD"
+level = "10 m above ground"
+gust = "GUST"
+gust_level = "surface"
+
+[wind.ifs]
+u = "10u"
+v = "10v"
+gust = ["10fg", "10fg3", "10fg6"]               # the parameter name depends on the step
+
+[wind.geps]
+speed = "WIND_TGL_10"
+
+[wind.aigefs]
+u = "UGRD"
+v = "VGRD"
+level = "10 m above ground"
+
+# ESTIMATED gust for the systems that publish none (GEPS, AIGEFS): gust = wind speed x factor(speed, land / water), applied to each member
+# before the ensemble statistics (gefs_pipeline/gustest.py).  The curves are the average of what GEFS and the ECMWF IFS ensemble forecast
+# for the same wind speeds (120 member-fields each: 12 members x 10 hours out to f168 of the 2026-11-19 00Z cycle, 21-53 N / 128-63 W),
+# smoothed.  Re-fit with `python tools/calibrate_gust.py`.  The two systems disagree over water (GEFS gusts are ~1.1-1.2x the wind, IFS
+# 3-hour-maximum gusts ~1.4x), so the water curve sits between them; over land they agree.  Land winds above ~27 mph did not occur in the
+# calibration sample: that end of the land curve is a physical taper, not a fit.
+[wind.estimate]
+enabled  = true
+families = ["geps", "aigefs"]
+land_speed  = [0,    5,    9,    12,   15,   18,   22,   26,   32,   40,   60]
+land_factor = [2.0,  2.0,  2.0,  1.93, 1.85, 1.76, 1.65, 1.58, 1.48, 1.40, 1.35]
+sea_speed   = [0,    6,    9,    12,   16,   28,   36,   44,   60]
+sea_factor  = [1.45, 1.42, 1.32, 1.27, 1.26, 1.26, 1.28, 1.31, 1.34]
+
+# ONE colour scale for wind speed AND gust, so the two can be compared directly.  5 mph classes from 10 mph (the first class,
+# below 10 mph, is left transparent); the segment edges sit on the NWS / marine thresholds (rounded to the 5 mph class).
+[wind_scale]
+edges = { start = 10, stop = 100, step = 5 }
+
+[[wind_scale.segments]]
+name   = "Below 25 mph"
+label  = ""
+phrase = "light to moderate"
+ramp   = "Blues"
+upto   = 25
+t      = [0.2, 0.7]
+
+[[wind_scale.segments]]
+name   = "25-39 mph (Wind Advisory range)"
+label  = "Advisory"
+phrase = "Wind Advisory range"
+ramp   = "YlGn"
+upto   = 40
+t      = [0.25, 0.8]
+
+[[wind_scale.segments]]
+name   = "40-54 mph (gale / High Wind)"
+label  = "Gale"
+phrase = "gale-force / High Wind"
+ramp   = "YlOrRd"
+upto   = 55
+t      = [0.15, 0.5]
+
+[[wind_scale.segments]]
+name   = "55-74 mph (storm force)"
+label  = "Storm"
+phrase = "storm-force"
+ramp   = "YlOrRd"
+upto   = 75
+t      = [0.62, 0.95]
+
+[[wind_scale.segments]]
+name   = "75 mph and above (hurricane force)"
+label  = "Hurricane"
+phrase = "hurricane-force"
+ramp   = "RdPu"
+t      = [0.55, 1.0]
+
 # --- data products ---------------------------------------------------------------------------
 [products.mean]
-title    = "Ensemble mean MSLP with member low centres"
+title    = "Ensemble mean MSLP with member low centers"
 short    = "Mean + lows"
 has_lows = true
 
@@ -236,4 +345,45 @@ has_lows = false
 [products.strike]
 title    = "Strike probability: low below a chosen level within a chosen radius"
 short    = "Strike"
+has_lows = false
+
+# 10 m wind speed (sustained) and gust, in mph - see [wind]
+[products.wmean]
+title    = "Ensemble mean 10 m wind speed"
+short    = "Wind mean"
+has_lows = false
+
+[products.wmax]
+title    = "Highest member 10 m wind speed (any member)"
+short    = "Wind max"
+has_lows = false
+
+[products.wswath]
+title    = "Peak member 10 m wind speed so far (swath)"
+short    = "Wind swath"
+has_lows = false
+
+[products.wprob]
+title    = "Probability of 10 m wind speed at or above a chosen level"
+short    = "Wind prob."
+has_lows = false
+
+[products.gmean]
+title    = "Ensemble mean 10 m wind gust"
+short    = "Gust mean"
+has_lows = false
+
+[products.gmax]
+title    = "Highest member 10 m wind gust (any member)"
+short    = "Gust max"
+has_lows = false
+
+[products.gswath]
+title    = "Peak member 10 m wind gust so far (swath)"
+short    = "Gust swath"
+has_lows = false
+
+[products.gprob]
+title    = "Probability of 10 m wind gust at or above a chosen level"
+short    = "Gust prob."
 has_lows = false

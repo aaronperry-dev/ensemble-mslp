@@ -49,7 +49,7 @@ def test_engine_matches_python(tmp_path):
     assert r.returncode == 0, r.stderr
     js = json.loads(r.stdout)
 
-    # 1. lows of a minimum field: same centres and values as the Python detector
+    # 1. lows of a minimum field: same centers and values as the Python detector
     for k in ("gefs", "geps"):
         hdr, f, _ = gridio.decode((run / k / "min" / "f018.bin.gz").read_bytes())
         lats = hdr["lat0"] + np.arange(hdr["ny"]) * hdr["dlat"]; lons = hdr["lon0"] + np.arange(hdr["nx"]) * hdr["dlon"]
@@ -166,3 +166,49 @@ def test_decoding_one_probability_level_gives_the_same_plane(tmp_path):
     js = json.loads(r.stdout)
     assert js["filled"] == [2] and js["nfull"] == len(cfg.prob.levels)      # only the requested plane is decoded
     assert js["same"] and js["pct"] and js["members"] == 3
+
+
+def test_wind_grids_scale_swath_and_highest_of_systems(tmp_path):
+    """Wind / gust files use half-mph steps: the engine honours the header scale, the swath keeps the running MAXIMUM (with the hour and
+    member that set it) and the highest-of-systems blend picks the larger value; the lowest-of default is unchanged."""
+    cfg = load_config()
+    rng = np.random.default_rng(7)
+
+    def wframe(key, base, fh):
+        ff = mkframe(key, [1010.0, 1004.0, 996.0], LATS, LONS, {})
+        lon, lat = np.meshgrid(LONS, LATS)
+        wg = {}
+        for i, n in enumerate(ff.names):
+            sp = base + 5 * i + 3 * np.sin(lon / 9) * np.cos(lat / 7) + rng.normal(0, 1, lon.shape) + (fh == 12) * 12 * np.exp(-(((lon + 90) / 8) ** 2 + ((lat - 35) / 6) ** 2)) * (i == 1)
+            wg[n] = Grid(LATS, LONS, np.clip(sp, 0, None).astype("f4"), "2026-11-18T12:00:00Z", fh)
+        ff.wind = {"wind": wg}
+        return ff
+
+    build_frame(cfg, {"gefs": wframe("g", 12.0, 6)}, ["gefs"], 6, tmp_path, "a")
+    build_frame(cfg, {"gefs": wframe("g", 14.0, 12)}, ["gefs"], 12, tmp_path, "a")
+    build_frame(cfg, {"gefs": wframe("h", 20.0, 12)}, ["gefs"], 12, tmp_path, "b")
+    r = subprocess.run(["node", str(ROOT / "tests/js/wind_swath.js"), str(tmp_path / "a/gefs/wmax/f006.bin.gz"),
+                        str(tmp_path / "a/gefs/wmax/f012.bin.gz"), str(tmp_path / "b/gefs/wmax/f012.bin.gz")], capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    js = json.loads(r.stdout)
+    assert js["scale"] == 2 and js["stscale"] == 2
+    a6, a12 = np.array(js["a6"]), np.array(js["a12"])
+    assert 5 < a6.mean() < 60                                       # mph, not tenths: a wrong scale would give 5x too large / small values
+    assert np.allclose(np.array(js["swath"]), np.maximum(a6, a12))   # running MAXIMUM
+    w = np.array(js["when"])
+    assert set(np.unique(w)) <= {6, 12} and (w[np.array(js["swath"]) > a6 + 1e-6] == 12).all()
+    hi, lo = np.array(js["hi"]), np.array(js["lo"])
+    assert (hi >= lo).all() and (hi > lo).any()
+    assert set(np.unique(np.array(js["hiOwner"]))) <= set(range(0, 13))   # owners of system b are offset by 10
+    # quantisation: half-mph steps
+    assert np.allclose(a12 * 2, np.round(a12 * 2))
+
+
+def test_rasterize_calm_skip_is_pixel_identical():
+    """Skipping pixels whose four source cells are all in the transparent classes changes no pixel (edges, NaNs, three colour tables)."""
+    r = subprocess.run(["node", str(ROOT / "tests/js/raster_calm.js")], capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    cases = json.loads(r.stdout)["cases"]
+    assert len(cases) == 6 and all(c["diff"] == 0 and c["drawn"] > 0 for c in cases)
+    calm = {c["name"]: c["calm"] for c in cases}
+    assert calm["wind"] == pytest.approx(25 - 0.06) and calm["prob"] == pytest.approx(5 - 0.06) and calm["mslp"] is None   # -Infinity -> null

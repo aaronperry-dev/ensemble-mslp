@@ -59,7 +59,7 @@
   };
   let themeName = readTheme();
   let th = THEMES[themeName];
-  const state = { family: 'gefs', product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [], grid: null, when: null, tipGrids: null, lowSize: 24 };
+  const state = { family: 'gefs', product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [], grid: null, when: null, tipGrids: null, lowSize: 24, var: 'mslp', owner: null };
   const fmtCave = (iso) => {
     const d = new Date(iso);
     const mm = iso.slice(14, 16);                                    // '06Z' like the init time; minutes only if not on the hour
@@ -103,10 +103,13 @@
       }
     }
     const availableViews = [...bases, ...blendViews];
-    const viewHas = (f, k) => (isBlend(k) ? fams[k].parts.every((p) => f.avail[p]) : !!f.avail[k]);
+    // What a system offers at one hour for the selected field: pressure is f.avail[sys]; wind and gust are the sub-records
+    // f.avail[sys].wind / .gust (absent where that system or hour has none, e.g. no gust from GEPS / AIGEFS, or ECMWF gust at F000).
+    const avF = (f, k) => (state.var === 'mslp' ? f.avail[k] : (f.avail[k] && f.avail[k][state.var]) || null);
+    const viewHas = (f, k) => (isBlend(k) ? fams[k].parts.every((p) => avF(f, p)) : !!avF(f, k));
     const availOf = (f, k) => (isBlend(k)
-      ? { grid_deg: f.avail[fams[k].parts[0]].grid_deg, members: fams[k].parts.reduce((n, p) => n + f.avail[p].members, 0) }
-      : f.avail[k]);
+      ? { grid_deg: avF(f, fams[k].parts[0]).grid_deg, members: fams[k].parts.reduce((n, p) => n + avF(f, p).members, 0) }
+      : avF(f, k));
     const shortOf = (k) => (isBlend(k) ? 'Blend' : ({ gefs: 'GEFS', ifs: 'ECMWF', geps: 'GEPS', aigefs: 'AIGEFS' }[k] || fams[k].label));
     // Flat vector flag of the organisation that publishes each system (USA for NOAA's GEFS and AIGEFS, EU for ECMWF, Canada for GEPS).
     // Drawn as inline SVG rather than emoji, so they are flat (no waving) and look the same on every platform.
@@ -140,9 +143,46 @@
     const probLevels = (manifest.prob && manifest.prob.levels) || [];
     const strikeLevels = probLevels.filter((v) => v <= (manifest.lows_threshold_hpa == null ? 1005 : manifest.lows_threshold_hpa));
     const radii = (manifest.strike && manifest.strike.radii_km) || [];
-    state.level = { prob: probLevels.includes(1000) ? 1000 : probLevels[0], strike: strikeLevels.includes(1005) ? 1005 : strikeLevels[strikeLevels.length - 1] };
+    // ---- field: pressure (MSLP, hPa), 10 m wind speed (mph) or 10 m wind gust (mph) ---------------------------------------------
+    // The viewer's products (mean / member extreme / swath / probability) exist for each field; strike probability (low tracks) is
+    // pressure-only. Wind and gust products live under their own manifest keys and file folders (wmean, wmax, wprob, gmean, ...).
+    const WIND = manifest.wind || null;
+    const PKEY = { mslp: { mean: 'mean', min: 'min', swath: 'swath', prob: 'prob', strike: 'strike' },
+      wind: { mean: 'wmean', min: 'wmax', swath: 'wswath', prob: 'wprob' }, gust: { mean: 'gmean', min: 'gmax', swath: 'gswath', prob: 'gprob' } };
+    const KDIR = { mslp: { mean: 'mean', min: 'min', prob: 'prob' }, wind: { mean: 'wmean', min: 'wmax', prob: 'wprob' }, gust: { mean: 'gmean', min: 'gmax', prob: 'gprob' } };
+    const FIELDS = [['mslp', 'Pressure'], ['wind', 'Wind'], ['gust', 'Gust']];
+    const FIELD_NAME = { mslp: 'MSLP', wind: '10 m wind speed', gust: '10 m wind gust' };
+    // Systems whose gust is a statistical ESTIMATE from their wind speed (GEPS, AIGEFS: they publish none), labelled "est." wherever shown.
+    const ESTG = new Set((WIND && WIND.estimated_gust) || []);
+    const EST_NOTE = 'estimated from the wind speed (land / water gust factor fitted to GEFS and ECMWF), not a model forecast';
+    const estTag = (k) => (state.var === 'gust' && ESTG.has(k) ? ' (est.)' : '');
+    const partsOfView = (k) => (isBlend(k) ? fams[k].parts : [k]);
+    const estIn = (k = state.family) => (state.var === 'gust' ? partsOfView(k).filter((p) => ESTG.has(p)) : []);
+    const estAll = (k = state.family) => estIn(k).length > 0 && estIn(k).length === partsOfView(k).length;
+    const fieldName = () => (state.var === 'gust' && estAll() ? 'estimated 10 m wind gust' : FIELD_NAME[state.var]);
+    /** A manifest product title with the "estimated" wording for the current view. */
+    const estTitle = (s) => {
+      if (state.var !== 'gust' || !estIn().length) return s;
+      return estAll() ? s.replace('10 m wind gust', 'estimated 10 m wind gust') : s;           // a mixed blend says "(est.)" after the system name instead
+    };
+    const hasVar = (v) => v === 'mslp' || (!!WIND && !!WIND.have && !!WIND.have[v] && !!manifest.products[PKEY[v].mean]);
+    const pkey = (prod, v) => PKEY[v || state.var][prod || state.product];
+    const curP = () => manifest.products[pkey()];
+    const levelsOf = (v) => (v === 'mslp' ? probLevels : WIND ? (v === 'wind' ? WIND.speed_levels : WIND.gust_levels) || [] : []);
+    const lvKey = (prod, v) => (prod === 'strike' ? 'strike' : (v || state.var) === 'mslp' ? 'prob' : (v || state.var));
+    const curLevel = () => state.level[lvKey(state.product)];
+    const unitOf = (v) => (v || state.var) === 'mslp' ? 'hPa' : 'mph';
+    // the file kind to download for a product (the swath is folded from the member-extreme grids)
+    const kindFor = (prod, v) => (prod === 'strike' ? null : KDIR[v || state.var][prod === 'swath' ? 'min' : prod]);
+    const dirOf = (v) => ((v || state.var) === 'mslp' ? -1 : 1);                          // member extreme: lowest pressure, highest wind
+    const sysHas = (k, v) => v === 'mslp' || frames.some((f) => f.avail[k] && f.avail[k][v]);
+    const viewOkFor = (k, v) => (isBlend(k) ? fams[k].parts.every((p) => sysHas(p, v)) : sysHas(k, v));
+    const pickLevel = (v, want) => { const ls = levelsOf(v); return ls.includes(want) ? want : ls[0]; };
+    state.level = { prob: probLevels.includes(1000) ? 1000 : probLevels[0], strike: strikeLevels.includes(1005) ? 1005 : strikeLevels[strikeLevels.length - 1],
+      wind: pickLevel('wind', 39), gust: pickLevel('gust', 58) };
     state.radius = manifest.strike ? manifest.strike.default_km : 200;
-    const hasProduct = (p) => !!manifest.products[p] && (p === 'prob' ? probLevels.length > 0 : p === 'strike' ? (strikeLevels.length > 0 && !!manifest.tracks) : true);
+    const hasProduct = (p, v) => !!manifest.products[pkey(p, v)] &&
+      (p === 'prob' ? levelsOf(v || state.var).length > 0 : p === 'strike' ? ((v || state.var) === 'mslp' && strikeLevels.length > 0 && !!manifest.tracks) : true);
 
     const HASH_EVERY_MS = 750;                                       // see writeHash(); declared early because map events can reach it during set-up
     let hashTimer = 0, hashLast = 0;
@@ -197,6 +237,9 @@
     const initial = dom.initial
       ? L.latLngBounds([dom.initial[0], dom.initial[1]], [dom.initial[2], dom.initial[3]]) : bounds;
     const hash = parseHash();
+    if (hash.x && hasVar(hash.x)) state.var = hash.x;
+    if (!viewOkFor(state.family, state.var)) state.family = bases.find((k) => viewOkFor(k, state.var)) || state.family;
+    rebuildViewFrames();
     map.setMaxBounds(bounds);
     map.options.maxBoundsViscosity = 1.0;
     const lockZoom = () => map.setMinZoom(map.getBoundsZoom(bounds, true));
@@ -219,9 +262,10 @@
       return n;
     };
     function fetchGrid(sys, kind, fh, level) {
-      const key = `${sys}/${kind}/${fh}${kind === 'prob' ? `/${level}` : ''}`;
+      const isProb = kind.endsWith('prob');
+      const key = `${sys}/${kind}/${fh}${isProb ? `/${level}` : ''}`;
       if (gridCache.has(key)) { const hit = gridCache.get(key); gridCache.delete(key); gridCache.set(key, hit); return hit; }   // LRU refresh
-      const dopt = kind === 'prob' ? { level } : undefined;
+      const dopt = isProb ? { level } : undefined;
       const p = fetch(`data/${run.id}/${sys}/${kind}/f${pad3(fh)}.bin.gz`)
         .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.arrayBuffer(); })
         .then(E.inflate).then((buf) => E.decodeBin(buf, dopt))
@@ -243,12 +287,12 @@
     // parallel with the basemap files, instead of after them
     {
       const hv0 = hash.e === 'blend' ? blendViews[0] : hash.e;
-      const fam0 = hv0 && availableViews.includes(hv0) ? hv0 : state.family;
+      const fam0 = hv0 && availableViews.includes(hv0) && viewOkFor(hv0, state.var) ? hv0 : state.family;
       const prod0 = hash.p && hasProduct(hash.p) ? hash.p : state.product;
       const parts0 = isBlend(fam0) ? fams[fam0].parts : [fam0];
       const fr0 = frames.find((f) => (hash.f != null ? f.fh === hash.f : true) && viewHas(f, fam0)) || frames.find((f) => viewHas(f, fam0));
-      const kind0 = { mean: 'mean', prob: 'prob', strike: null }[prod0] === undefined ? 'min' : { mean: 'mean', prob: 'prob', strike: null }[prod0];
-      const lv0 = hash.l != null && probLevels.includes(hash.l) ? hash.l : state.level.prob;
+      const kind0 = kindFor(prod0);
+      const lv0 = hash.l != null && levelsOf(state.var).includes(hash.l) ? hash.l : state.level[lvKey(prod0)];
       if (fr0 && kind0 && prod0 !== 'swath') parts0.forEach((k) => fetchGrid(k, kind0, fr0.fh, lv0).catch(() => {}));
     }
 
@@ -301,7 +345,7 @@
       lineLayers.forEach(({ l, styleFn }) => l.setStyle((f) => styleFn(f, z)));
     });
 
-    // ---- canvas overlays living above the map pane (graticule + low centres) -------------------
+    // ---- canvas overlays living above the map pane (graticule + low centers) -------------------
     const mkCanvas = (cls) => {
       const c = document.createElement('canvas');
       c.className = `overlay-cv ${cls}`;
@@ -365,7 +409,7 @@
       const s = map.getSize();
       ctx.clearRect(0, 0, s.x, s.y);
       state.lowsPx = [];
-      if (!opts.lows || !manifest.products[state.product].has_lows) return;
+      if (!opts.lows || !curP().has_lows) return;
       const z = map.getZoom();
       const size = clamp(17 + (z - 4) * 2.2, 17, 32);           // "L" height in px (bold)
       const fs = Math.round(size * 0.74);                       // hPa label size
@@ -405,7 +449,7 @@
 
 
     // ---- member low tracks (canvas overlay below the L markers) -----------------------------------
-    // data/<run>/<system>/tracks.json.gz: every member's low centres linked from hour to hour (pipeline: tracks.py).
+    // data/<run>/<system>/tracks.json.gz: every member's low centers linked from hour to hour (pipeline: tracks.py).
     const trackData = new Map(), trackLoaded = new Map();            // system -> Promise / loaded {tracks, members}
     function tracksFor(sys) {
       if (!trackData.has(sys)) {
@@ -499,10 +543,10 @@
     });
 
     // ---- cursor-following read-out (both products) ---------------------------------------------
-    // Shows the interpolated MSLP under the pointer plus every low-centre marker beneath it.  It tracks the
+    // Shows the interpolated MSLP under the pointer plus every low-center marker beneath it.  It tracks the
     // cursor everywhere on the map and is also refreshed when the frame or product changes.
     const tip = $('#tip');
-    const tipLabel = () => (state.product === 'mean'
+    let tipLabel = () => (state.product === 'mean'
       ? (isBlend(state.family) ? 'Blended ensemble mean' : 'Ensemble-mean MSLP')
       : state.product === 'prob'
         ? `Members with MSLP below ${state.level.prob} hPa`
@@ -511,33 +555,46 @@
       : state.product === 'swath'
         ? (isBlend(state.family) ? 'Swath: lowest of all members so far' : 'Swath: lowest member so far')
         : (isBlend(state.family) ? 'Lowest of all members' : 'Lowest member MSLP'));
-    // intensity band (hurricane category / storm / gale) whose pressure range contains v, if any
+    const tipLabelP = tipLabel;
+    tipLabel = () => {
+      const v = state.var, p = state.product, bl = isBlend(state.family);
+      if (v === 'mslp') return tipLabelP();
+      const n = v === 'wind' ? 'wind' : estAll() ? 'estimated gust' : 'gust';
+      return p === 'mean' ? `${bl ? 'Blended ensemble-mean' : 'Ensemble-mean'} ${n}`
+        : p === 'prob' ? `Members with ${n} at or above ${curLevel()} mph`
+        : p === 'swath' ? `Swath: ${bl ? 'highest of all members' : 'highest member'} so far`
+        : `${bl ? 'Highest of all members' : 'Highest member'} ${n}`;
+    };
+    // intensity band (hurricane category / storm / gale; for wind: advisory / gale / storm / hurricane force) whose range contains v, if any
     const catOf = (v) => {
-      const g = ((manifest.scale && manifest.scale.segments) || []).find((x) => x.phrase
-        && (x.from_hpa == null || v >= x.from_hpa) && v < x.to_hpa);
+      const wind = state.var !== 'mslp';
+      const g = ((wind ? (WIND && WIND.segments) : manifest.scale && manifest.scale.segments) || []).find((x) => x.phrase
+        && (x.from_hpa == null ? !wind : v >= x.from_hpa) && (x.to_hpa == null || v < x.to_hpa));
       return g ? g.phrase : '';
     };
     const validOf = (fh) => { const fr = frames.find((x) => x.fh === fh); return fr ? fmtValid(fr.valid) : ''; };
     let lastPt = null;                                           // last pointer position {x, y, ll}
     const valueAt = (lat, lon, g) => E.valueAt(g || state.grid, lat, lon);   // g = a field {lon0, lat0, dlon, dlat, nx, ny, v hPa}
     const classColor = (v) => {
-      const P = manifest.products[state.product];
+      const P = curP();
       let k = 0;
       while (k < P.edges.length && v >= P.edges[k]) k++;
       return P.colors[k] === 'transparent' ? 'rgba(128,128,128,0.25)' : P.colors[k];
     };
-    const isPct = () => manifest.products[state.product].units === '%';
-    const fmtVal = (x) => (isPct() ? x.toFixed(0) : x.toFixed(1));
+    const isPct = () => curP().units === '%';
+    const fmtVal = (x) => (isPct() || state.var !== 'mslp' ? x.toFixed(0) : x.toFixed(1));
     const fmtLat = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'S' : 'N'}`;
     const fmtLon = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'W' : 'E'}`;
     const memberName = (mi) => fams[state.family].members[mi];
     const PTAG = { mean: 'MEAN', min: 'MIN', swath: 'SWATH', prob: 'P(<' + 'LEVEL)', strike: 'STRIKE' };
+    const PTAG_W = { mean: 'MEAN', min: 'MAX', swath: 'SWATH' };
+    const FIELD_SHORT = { mslp: 'MSLP', wind: 'WIND', gust: 'GUST' };
     const sb = { pos: $('#sbPos'), val: $('#sbVal'), low: $('#sbLow'), zoom: $('#sbZoom') };
     const updateZoomReadout = () => { sb.zoom.textContent = `ZOOM ${map.getZoom().toFixed(2)}`; };
     function updateTip() {
       if (!lastPt) {
         tip.hidden = true;
-        sb.pos.textContent = 'LAT —  LON —'; sb.val.textContent = 'MSLP —'; sb.low.textContent = '';
+        sb.pos.textContent = 'LAT —  LON —'; sb.val.textContent = `${FIELD_SHORT[state.var]} —`; sb.low.textContent = '';
         return;
       }
       const { x, y, ll } = lastPt;
@@ -545,29 +602,33 @@
       const blendVals = (isBlend(state.family) && state.tipGrids)
         ? curParts().filter((k) => state.tipGrids[k]).map((k) => [k, valueAt(ll.lat, ll.lng, state.tipGrids[k])]) : null;
       const reached = (state.product === 'swath' && state.when) ? E.nearestAt(state.grid, state.when, ll.lat, ll.lng) : null;
+      const wind = state.var !== 'mslp';
+      const ownerIdx = (wind && (state.product === 'min' || state.product === 'swath') && state.owner) ? E.nearestAt(state.grid, state.owner, ll.lat, ll.lng) : null;
       const hit = Math.max(16, state.lowSize * 0.75);
       const near = state.lowsPx.filter(([px, py]) => Math.hypot(px - x, py - y - state.lowSize * 0.15) < hit).sort((a, b) => a[2] - b[2]);
       let html = '';
       if (v != null) {
         const pct = isPct();
-        html += `<div class="tt-val"><i style="background:${classColor(v)}"></i><b>${fmtVal(v)}</b><span>${pct ? '%' : 'hPa'}</span></div>` +
+        html += `<div class="tt-val"><i style="background:${classColor(v)}"></i><b>${fmtVal(v)}</b><span>${pct ? '%' : unitOf()}</span></div>` +
                 `<div class="tt-sub">${shortOf(state.family)} · ${tipLabel()}</div>` +
-                (!pct && catOf(v) ? `<div class="tt-cat">\u2248 ${catOf(v)} pressure</div>` : '') +
+                (estIn().length ? `<div class="tt-cat">${estAll() ? 'Estimated' : `${estIn().map(shortOf).join(' + ')} estimated`} from wind speed</div>` : '') +
+                (!pct && catOf(v) ? `<div class="tt-cat">\u2248 ${catOf(v)}${wind ? '' : ' pressure'}</div>` : '') +
+                (ownerIdx != null && ownerIdx >= 0 ? `<div class="tt-cat">Highest member: ${memberName(ownerIdx)}${estTag(isBlend(state.family) ? partOfMember(ownerIdx) : state.family)}</div>` : '') +
                 (pct && state.members && !(isBlend(state.family) && fams[state.family].weighting === 'equal') ? `<div class="tt-cat">\u2248 ${Math.round(v * state.members.total / 100)} of ${state.members.total} members</div>` : '');
         if (blendVals && blendVals.every(([, x]) => x != null)) {
           const xs = blendVals.map(([, x]) => x);
-          const sgn = (d) => `${d >= 0 ? '+' : '\u2212'}${pct ? Math.abs(d).toFixed(0) : Math.abs(d).toFixed(1)}`;
+          const sgn = (d) => `${d >= 0 ? '+' : '\u2212'}${fmtVal(Math.abs(d))}`;
           const diff = blendVals.length === 2
-            ? [`${shortOf(blendVals[1][0])} \u2212 ${shortOf(blendVals[0][0])}`, sgn(xs[1] - xs[0])]
+            ? [`${shortOf(blendVals[1][0])}${estTag(blendVals[1][0])} \u2212 ${shortOf(blendVals[0][0])}${estTag(blendVals[0][0])}`, sgn(xs[1] - xs[0])]
             : ['Spread (max \u2212 min)', fmtVal(Math.max(...xs) - Math.min(...xs))];
           html += '<div class="tt-fams">' +
-            blendVals.map(([k, x]) => `<div class="tt-frow">${keyOf(k)}<span>${shortOf(k)}</span><b>${fmtVal(x)}${pct ? '%' : ''}</b></div>`).join('') +
+            blendVals.map(([k, x]) => `<div class="tt-frow">${keyOf(k)}<span>${shortOf(k)}${estTag(k)}</span><b>${fmtVal(x)}${pct ? '%' : ''}</b></div>`).join('') +
             `<div class="tt-frow tt-d"><span></span><span>${diff[0]}</span><b>${diff[1]}</b></div></div>`;
         }
       } else {
         html += `<div class="tt-sub">No data here</div>`;
       }
-      if (v != null && reached != null && reached >= 0) html += `<div class="tt-sub">Lowest reached at F${pad3(reached)} · ${validOf(reached)}</div>`;
+      if (v != null && reached != null && reached >= 0) html += `<div class="tt-sub">${wind ? 'Peak' : 'Lowest'} reached at F${pad3(reached)} · ${validOf(reached)}</div>`;
       html += `<div class="tt-ll">${fmtLat(ll.lat)}  ${fmtLon(ll.lng)}</div>`;
       if (hoverTrack) { const q = trackPx.find((z) => z.t === hoverTrack); if (q) html += `<div class="tt-lows"><div class="tt-h">Member low track</div><div class="tt-row"><span style="color:${q.col}">${trackInfo(q)}</span></div></div>`; }
       if (near.length) {
@@ -578,9 +639,9 @@
       }
       sb.pos.textContent = `LAT ${fmtLat(ll.lat)}  LON ${fmtLon(ll.lng)}`;
       sb.val.textContent = v != null
-        ? `${shortOf(state.family).toUpperCase()} ${state.product === 'prob' ? `P(MSLP<${state.level.prob})` : PTAG[state.product]} ${fmtVal(v)} ${isPct() ? '%' : 'hPa'}` +
+        ? `${shortOf(state.family).toUpperCase()} ${wind ? (state.product === 'prob' ? `P(${FIELD_SHORT[state.var]}\u2265${curLevel()})` : `${FIELD_SHORT[state.var]} ${PTAG_W[state.product]}`) : state.product === 'prob' ? `P(MSLP<${state.level.prob})` : PTAG[state.product]} ${fmtVal(v)} ${isPct() ? '%' : unitOf()}` +
           (blendVals && blendVals.every(([, x]) => x != null) ? `  (${blendVals.map(([k, x]) => `${shortOf(k)} ${fmtVal(x)}`).join(' | ')})` : '')
-        : 'MSLP —';
+        : `${FIELD_SHORT[state.var]} —`;
       sb.low.textContent = near.length ? `L ${near[0][2].toFixed(1)} hPa ${memberName(near[0][3])}${near.length > 1 ? ` (+${near.length - 1})` : ''}` : '';
       tip.innerHTML = html;
       tip.hidden = false;
@@ -612,20 +673,23 @@
     // swath = running minimum of each system's member-wise minimum over the forecast hours; one running state per system,
     // calls are serialised so playback folds in one hour at a time and a jump back restarts from the first hour.
     const swathRec = new Map(), swathChain = new Map();
-    async function swathStep(sys, fh) {
-      let rec = swathRec.get(sys);
+    // (one running state per system AND field: the pressure swath folds the lowest member, the wind / gust swaths the highest)
+    async function swathStep(sys, v, fh) {
+      const rk = `${v}/${sys}`;
+      let rec = swathRec.get(rk);
       if (rec && rec.st.fh > fh) rec = null;
       const have = rec ? rec.st.fh : -1;
-      const hours = frames.filter((f) => f.avail[sys] && f.fh <= fh && f.fh > have).map((f) => f.fh);
-      const grids = await Promise.all(hours.map((h) => fetchGrid(sys, 'min', h)));
+      const hours = frames.filter((f) => (v === 'mslp' ? f.avail[sys] : f.avail[sys] && f.avail[sys][v]) && f.fh <= fh && f.fh > have).map((f) => f.fh);
+      const grids = await Promise.all(hours.map((h) => fetchGrid(sys, KDIR[v].min, h)));
       let st = rec ? rec.st : null;
-      for (const g of grids) st = st ? E.swathFold(st, g) : E.swathStart(g);
-      swathRec.set(sys, { st });
+      for (const g of grids) st = st ? E.swathFold(st, g, dirOf(v)) : E.swathStart(g);
+      swathRec.set(rk, { st });
       return E.swathCopy(st);
     }
-    const swathAt = (sys, fh) => {
-      const next = (swathChain.get(sys) || Promise.resolve()).catch(() => {}).then(() => swathStep(sys, fh));
-      swathChain.set(sys, next);
+    const swathAt = (sys, v, fh) => {
+      const rk = `${v}/${sys}`;
+      const next = (swathChain.get(rk) || Promise.resolve()).catch(() => {}).then(() => swathStep(sys, v, fh));
+      swathChain.set(rk, next);
       return next;
     };
 
@@ -652,11 +716,12 @@
     /** Everything needed to draw one view / product / hour: {field, lows, tips{system: field}, when?, members?} */
     async function buildResult(view, prod, fh, opt) {
       const parts = isBlend(view) ? fams[view].parts : [view];
+      const fv = opt.var, KD = KDIR[fv];
       const off = []; let o = 0;
       for (const k of parts) { off.push(o); o += fams[k].members.length; }   // each system's member indices inside this view's member list
       const tips = {};
       if (prod === 'prob') {
-        const gs = await Promise.all(parts.map((k) => fetchGrid(k, 'prob', fh, opt.level)));
+        const gs = await Promise.all(parts.map((k) => fetchGrid(k, KD.prob, fh, opt.level)));
         const li = gs[0].levels.indexOf(opt.level);
         const fields = gs.map((g, i) => { const f = E.fieldOf(g, E.probPercent(g, li)); tips[parts[i]] = f; return f; });
         let field = fields[0];
@@ -680,8 +745,8 @@
         return { field, lows: [], tips, members: { total: parts.reduce((n, k) => n + fams[k].members.length, 0) } };
       }
       if (prod === 'mean') {
-        const gs = await Promise.all(parts.map((k) => fetchGrid(k, 'mean', fh)));
-        const fields = gs.map((g, i) => { const f = E.fieldOf(g, E.toHpa(g.t)); tips[parts[i]] = f; return f; });
+        const gs = await Promise.all(parts.map((k) => fetchGrid(k, KD.mean, fh)));
+        const fields = gs.map((g, i) => { const f = E.fieldOf(g, E.toHpa(g.t, g.scale)); tips[parts[i]] = f; return f; });
         let field = fields[0];
         if (parts.length > 1) {
           const vs = fields.map((f, i) => (i ? E.regridLinear(f.v, E.regridPlan(f, fields[0])) : f.v));
@@ -693,11 +758,11 @@
       // member-wise minimum ('min') or its running minimum over the forecast ('swath')
       const srcs = await Promise.all(parts.map(async (k) => {
         if (prod === 'swath') {
-          const st = await swathAt(k, fh);
-          return { geom: st.geom, v: E.toHpa(st.t), owner: st.owner, when: st.when };
+          const st = await swathAt(k, fv, fh);
+          return { geom: st.geom, v: E.toHpa(st.t, st.scale), owner: st.owner, when: st.when };
         }
-        const g = await fetchGrid(k, 'min', fh);
-        return { geom: E.geomOf(g), v: E.toHpa(g.t), owner: g.owner };
+        const g = await fetchGrid(k, KD.min, fh);
+        return { geom: E.geomOf(g), v: E.toHpa(g.t, g.scale), owner: g.owner };
       }));
       srcs.forEach((s_, i) => { tips[parts[i]] = Object.assign({}, s_.geom, { v: s_.v }); });
       const ref = srcs[0].geom;
@@ -707,8 +772,9 @@
         return { offset: off[i], v: E.regridLinear(s_.v, plan), owner: E.regridNearest(s_.owner, plan, 0),
           when: s_.when ? E.regridNearest(s_.when, plan, -1) : undefined };
       });
-      const low = E.lowestOf(aligned);
+      const low = E.lowestOf(aligned, dirOf(fv));
       const field = Object.assign({}, ref, { v: low.v });
+      if (fv !== 'mslp') return { field, lows: [], tips, when: low.when, owner: low.owner };   // winds: highest member and who owns it, no L markers
       const dets = E.detectLows(field, manifest.lows_min, dom);
       const lows = dets.map((c) => {
         const row = [+c.lon.toFixed(2), +c.lat.toFixed(2), +c.p.toFixed(1), low.owner[c.j * ref.nx + c.i]];
@@ -724,7 +790,7 @@
     const bytesOf = (R) => {
       const seen = new Set(); let n = 0;
       const add = (a) => { if (a && a.buffer && !seen.has(a.buffer)) { seen.add(a.buffer); n += a.byteLength; } };
-      add(R.field.v); add(R.disp.v); add(R.when); Object.values(R.tips || {}).forEach((f) => add(f.v));
+      add(R.field.v); add(R.disp.v); add(R.when); add(R.owner); Object.values(R.tips || {}).forEach((f) => add(f.v));
       return n;
     };
     function trimResults(keep) {
@@ -736,8 +802,8 @@
         total -= resultBytes.get(k); resultCache.delete(k); resultBytes.delete(k);
       }
     }
-    const optOf = (prod) => ({ level: state.level[prod], radius: state.radius });     // options that change a product's values
-    const optKey = (prod) => (prod === 'prob' ? `${state.level.prob}` : prod === 'strike' ? `${state.level.strike}/${state.radius}` : '');
+    const optOf = (prod) => ({ var: state.var, level: state.level[lvKey(prod)], radius: state.radius });     // options that change a product's values
+    const optKey = (prod) => `${state.var}:${prod === 'prob' ? state.level[lvKey(prod)] : prod === 'strike' ? `${state.level.strike}/${state.radius}` : ''}`;
     function computeView(view, prod, fh) {
       const key = `${view}/${prod}/${optKey(prod)}/${fh}`;
       if (resultCache.has(key)) { const hit = resultCache.get(key); resultCache.delete(key); resultCache.set(key, hit); return hit; }   // refresh its place
@@ -759,7 +825,7 @@
     map.getPane('data').appendChild(dataCv);
     let dispField = null, dispImg = null, dispBuf = null;
     const luts = {};
-    const lutFor = (prod) => luts[prod] || (luts[prod] = E.makeLut(manifest.products[prod].edges, manifest.products[prod].colors));
+    const lutFor = (key) => luts[key] || (luts[key] = E.makeLut(manifest.products[key].edges, manifest.products[key].colors));
     function drawData() {
       const s = map.getSize();
       if (dataCv.width !== s.x || dataCv.height !== s.y || !dispImg) {
@@ -772,13 +838,19 @@
       const lons = new Float64Array(s.x), lats = new Float64Array(s.y);
       for (let x = 0; x < s.x; x++) lons[x] = map.containerPointToLatLng([x + 0.5, 0]).lng;
       for (let y = 0; y < s.y; y++) lats[y] = map.containerPointToLatLng([0, y + 0.5]).lat;
-      E.rasterize(dispField, lons, lats, lutFor(state.product), dispBuf);
+      E.rasterize(dispField, lons, lats, lutFor(pkey()), dispBuf);
       ctx.putImageData(dispImg, 0, 0);
     }
     let rafData = 0;
     const scheduleData = () => { cancelAnimationFrame(rafData); rafData = requestAnimationFrame(drawData); };
     map.on('move moveend zoomend viewreset resize', scheduleData);
 
+    // a short-lived note (e.g. "AIGEFS has no gust - showing ...") survives the status clear that follows each redraw
+    let stickyNote = '';
+    function flashNote(msg, ms) {
+      stickyNote = msg; setStatus(msg);
+      setTimeout(() => { if (stickyNote === msg) { stickyNote = ''; setStatus(''); } }, ms);
+    }
     let token = 0, showLoop = null, showAgain = false;
     // show() = "display whatever state now asks for". While one view is being computed, further calls (dragging the slider, key repeat)
     // only update the time read-out and set a flag: when the running one finishes the loop goes round once more for the LATEST request,
@@ -801,13 +873,14 @@
         state.lows = R.lows;
         state.grid = R.field;
         state.when = R.when || null;
+        state.owner = R.owner || null;
         state.members = R.members || null;
         state.tipGrids = isBlend(fam) ? R.tips : null;
         drawData();
         drawTracks();
         drawLows();
         updateTip();
-        setStatus('');
+        setStatus(stickyNote);
         prefetch();
       } catch (e) {
         if (my === token) setStatus(`Could not load F${pad3(f.fh)} (${e.message})`, true);
@@ -818,21 +891,21 @@
     // start downloading the grids of the frame at index i of the current view (a no-op if they are cached / in flight)
     function warmFrame(i) {
       const nf = vframes[i % vframes.length];
-      const kind = { mean: 'mean', prob: 'prob', strike: null }[state.product];
-      const k = kind === undefined ? 'min' : kind;                    // 'min' and 'swath' both read the member-wise-minimum grids
+      const k = kindFor(state.product);                               // 'min' and 'swath' both read the member-extreme grids
       if (!k) return;
-      (isBlend(state.family) ? fams[state.family].parts : [state.family]).forEach((p) => fetchGrid(p, k, nf.fh, state.level.prob).catch(() => {}));
+      (isBlend(state.family) ? fams[state.family].parts : [state.family]).forEach((p) => fetchGrid(p, k, nf.fh, curLevel()).catch(() => {}));
     }
     function prefetch() { for (let k = 1; k <= 2; k++) warmFrame(state.idx + k); }
 
     // ---- legends --------------------------------------------------------------------------------
     // (1) flat colour bar with numeric labels (bottom-left); (2) CAVE-style three-line header (top-left).
     function buildLegend() {
-      const P = manifest.products[state.product];
+      const P = curP();
       const n = P.colors.length;
       const e = P.edges;
       if (P.units === '%') { buildPctLegend(P); return; }
-      const segs = (manifest.scale && manifest.scale.segments) || [];
+      const wind = state.var !== 'mslp', unit = unitOf();
+      const segs = (wind ? (WIND && WIND.segments) : manifest.scale && manifest.scale.segments) || [];
       const barPx = Math.min(500, window.innerWidth - 20) - 26;
       const hinges = segs.map((g) => g.to_hpa).filter((v) => v != null);          // every intensity threshold, e.g. [925, 950, ..., 1005]
       const at = (v) => ((e.indexOf(v) + 1) / n) * 100;                            // legend position (%) of an edge
@@ -840,15 +913,15 @@
       const pxPerHpa = barPx / n / (e[1] - e[0]);
       const gap = 36 / pxPerHpa;
       const want = [];
-      e.filter((v) => hinges.includes(v) || (v > hinges[hinges.length - 1] && v % 10 === 0))
+      e.filter((v) => hinges.includes(v) || (v > hinges[hinges.length - 1] && v % 10 === 0) || (wind && v === e[0]))
         .forEach((v) => { if (!want.length || v - want[want.length - 1] >= gap) want.push(v); });
       let ticks = '';
       e.forEach((v, k) => {
         const hinge = hinges.includes(v);
         if (!hinge && !want.includes(v)) return;
-        ticks += `<span class="${hinge ? 'hinge' : ''}${v === 1000 ? ' b' : ''}" style="left:${(((k + 1) / n) * 100).toFixed(2)}%">${want.includes(v) ? v : ''}</span>`;
+        ticks += `<span class="${hinge ? 'hinge' : ''}${!wind && v === 1000 ? ' b' : ''}" style="left:${(((k + 1) / n) * 100).toFixed(2)}%">${want.includes(v) ? v : ''}</span>`;
       });
-      // names of the intensity bands, centred under their span of classes (the first one starts at the left edge)
+      // names of the intensity bands, centered under their span of classes (the first one starts at the left edge)
       let cats = '';
       segs.forEach((g, i) => {
         if (!g.label) return;
@@ -859,10 +932,11 @@
       const bySys = byFamily() ? curParts() : null;
       const lowsRow = P.has_lows
         ? `<div class="lg-lows">${bySys ? bySys.map((k) => `${sample(sysColor(k))}<span>${shortOf(k)}</span>`).join('') + '<span class="lg-sep">·</span>' : sample('')}<span>${
-            state.product === 'swath' ? 'Deepest point of the swath' : state.product === 'min' ? 'Local minimum of the lowest-member field' : (isBlend(state.family) ? 'Low centre of any member' : 'Member low centre')} (hPa)</span></div>` : '';
+            state.product === 'swath' ? 'Deepest point of the swath' : state.product === 'min' ? 'Local minimum of the lowest-member field' : (isBlend(state.family) ? 'Low center of any member' : 'Member low center')} (hPa)</span></div>` : '';
+      const estRow = estIn().length ? `<div class="lg-est">${estIn().map(shortOf).join(' + ')} gust: ${EST_NOTE}</div>` : '';
       $('#legend').innerHTML =
-        `<div class="lg-bar" role="img" aria-label="Colour scale from below ${e[0]} to above ${e[e.length - 1]} hPa">${P.colors.map((c) => `<i style="background:${c}"></i>`).join('')}</div>` +
-        `<div class="lg-ticks">${ticks}</div>${cats ? `<div class="lg-cats" title="Typical pressure for each wind-intensity class (NOAA Dvorak wind-pressure table, rounded to 5 hPa) - a rough guide only">${cats}</div>` : ''}${lowsRow}`;
+        `<div class="lg-bar" role="img" aria-label="Colour scale from below ${e[0]} to above ${e[e.length - 1]} ${unit}">${P.colors.map((c) => `<i${c === 'transparent' ? ' class="none"' : ` style="background:${c}"`}></i>`).join('')}</div>` +
+        `<div class="lg-ticks">${ticks}</div>${cats ? `<div class="lg-cats" title="${wind ? 'Wind-speed classes: NWS Wind Advisory / High Wind / Gale, storm-force and hurricane-force (Beaufort 10 / Saffir-Simpson) thresholds - a rough guide only' : 'Typical pressure for each wind-intensity class (NOAA Dvorak wind-pressure table, rounded to 5 hPa) - a rough guide only'}">${cats}</div>` : ''}${lowsRow}${estRow}`;
       updateCaveLegend(vframes[state.idx]);
     }
     // probability products: one class per step of the percentage scale, no pressure bands
@@ -871,12 +945,16 @@
       const barPx = Math.min(500, window.innerWidth - 20) - 26;
       const every = barPx / n < 30 ? 2 : 1;
       const ticks = e.map((v, k) => (k % every ? '' : `<span style="left:${(((k + 1) / n) * 100).toFixed(2)}%">${v}</span>`)).join('');
-      const what = state.product === 'prob'
-        ? `Share of ${isBlend(state.family) ? 'the systems\u2019 members' : 'members'} with MSLP below ${state.level.prob} hPa${levelName(state.level.prob) ? ` (${levelName(state.level.prob)} pressure)` : ''}`
+      const who = isBlend(state.family) ? 'the systems\u2019 members' : 'members';
+      const what = state.product === 'prob' && state.var !== 'mslp'
+        ? `Share of ${who} with ${state.var === 'wind' ? '10 m wind' : estAll() ? 'estimated 10 m gusts' : '10 m gusts'} at or above ${curLevel()} mph${levelName(curLevel()) ? ` (${levelName(curLevel())})` : ''}${estIn().length && !estAll() ? ` \u2014 ${estIn().map(shortOf).join(' + ')} estimated` : ''}`
+        : state.product === 'prob'
+        ? `Share of ${who} with MSLP below ${state.level.prob} hPa${levelName(state.level.prob) ? ` (${levelName(state.level.prob)} pressure)` : ''}`
         : `Share of members with a low below ${state.level.strike} hPa within ${state.radius} km, through the hour shown`;
       $('#legend').innerHTML =
         `<div class="lg-bar" role="img" aria-label="Probability scale from below ${e[0]} % to above ${e[e.length - 1]} %">${P.colors.map((c) => `<i${c === 'transparent' ? ' class="none"' : ` style="background:${c}"`}></i>`).join('')}</div>` +
-        `<div class="lg-ticks">${ticks}</div><div class="lg-note">${what} (%)</div>`;
+        `<div class="lg-ticks">${ticks}</div><div class="lg-note">${what} (%)</div>` +
+        (estIn().length ? `<div class="lg-est">${estIn().map(shortOf).join(' + ')} gust: ${EST_NOTE}</div>` : '');
       updateCaveLegend(vframes[state.idx]);
     }
     // Map header: a two-line title block in the standard model-graphic layout.
@@ -884,27 +962,33 @@
     //   line 2  Init: <run> · F<hh> · Valid: <time> · <n> members
     // Everything is sentence case; the product title says what the map shows, including the chosen level / radius.
     function productTitle() {
-      const P = manifest.products[state.product];
+      const P = curP();
+      if (state.var !== 'mslp') {
+        if (state.product === 'mean' && curParts()) return estTitle(`${fams[state.family].weighting === 'equal' ? 'Equal-weight' : 'Pooled-member'} ensemble mean ${FIELD_NAME[state.var]}`);
+        if (state.product === 'prob') return estTitle(`Probability of ${FIELD_NAME[state.var]} at or above ${curLevel()} mph`);
+        return estTitle(P.title);
+      }
       if (state.product === 'mean' && curParts()) {
-        return `${fams[state.family].weighting === 'equal' ? 'Equal-weight' : 'Pooled-member'} ensemble mean MSLP with member low centres`;
+        return `${fams[state.family].weighting === 'equal' ? 'Equal-weight' : 'Pooled-member'} ensemble mean MSLP with member low centers`;
       }
       if (state.product === 'prob') return `Probability of MSLP below ${state.level.prob} hPa`;
       if (state.product === 'strike') return `Strike probability: low below ${state.level.strike} hPa within ${state.radius} km`;
       return P.title;
     }
+    const nMembers = (f, k) => (state.var === 'mslp' || !avF(f, k) ? fams[k].members.length : avF(f, k).members);
     /** The words of the title block for forecast hour f of the current view/product: used by the on-screen header and the GIF. */
     function caveParts(f) {
-      const P = manifest.products[state.product];
+      const P = curP();
       const F = fams[state.family];
       const ps = curParts();
       const cumulative = state.product === 'swath' || state.product === 'strike';
       return {
-        sys: ps ? `${ps.map((k) => shortOf(k)).join(' + ')} blend` : F.label,
+        sys: ps ? `${ps.map((k) => shortOf(k) + estTag(k)).join(' + ')} blend` : F.label + estTag(state.family),
         prod: productTitle(),
-        units: P.units === '%' ? '% of members' : 'hPa',
+        units: P.units === '%' ? '% of members' : P.units,
         init: `Init: ${fmtInit(run.init)}`,
         when: cumulative ? `F${pad3(vframes[0].fh)}\u2013F${pad3(f.fh)} \u00b7 Valid through: ${fmtCave(f.valid)}` : `F${pad3(f.fh)} \u00b7 Valid: ${fmtCave(f.valid)}`,
-        members: `${ps ? ps.map((k) => fams[k].members.length).join(' + ') : F.members.length} members`,
+        members: `${ps ? ps.map((k) => nMembers(f, k)).join(' + ') : nMembers(f, state.family)} members`,
       };
     }
     function updateCaveLegend(f) {
@@ -934,9 +1018,9 @@
       const cover = vframes.length < frames.length ? ` · F${pad3(vframes[0].fh)}–F${pad3(vframes[vframes.length - 1].fh)} ONLY` : '';
       const ps = curParts();
       const resNote = [];
-      if (ps) for (const k of ps) { const d = f.avail[k].grid_deg; if (d !== a.grid_deg) resNote.push(`${shortOf(k)} ${d}\u00b0\u2192${a.grid_deg}\u00b0`); }
+      if (ps) for (const k of ps) { const d = avF(f, k).grid_deg; if (d !== a.grid_deg) resNote.push(`${shortOf(k)} ${d}\u00b0\u2192${a.grid_deg}\u00b0`); }
       $('#vGrid').textContent = `${a.grid_deg}\u00b0 GRID \u00b7 ${a.members} MEMBERS` +
-        (ps ? ` (${ps.map((k) => f.avail[k].members).join(' + ')})` : '') +
+        (ps ? ` (${ps.map((k) => avF(f, k).members).join(' + ')})` : '') +
         (resNote.length ? ` \u00b7 REGRIDDED: ${resNote.join(', ')}` : '') + cover;
       writeHash();
     }
@@ -964,7 +1048,7 @@
     $('#btnNext').addEventListener('click', () => { setPlaying(false); setIdx(state.idx + 1); });
     slider.addEventListener('input', () => { setPlaying(false); setIdx(+slider.value); });
     window.addEventListener('keydown', (e) => {
-      if (e.target.matches('input[type=text],select')) return;
+      if (e.target.matches('input[type=text],select') || e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.key === 'ArrowRight') { setPlaying(false); setIdx(state.idx + 1); }
       else if (e.key === 'ArrowLeft') { setPlaying(false); setIdx(state.idx - 1); }
       else if (e.key === ' ' && !e.target.matches('button')) { e.preventDefault(); setPlaying(!state.playing); }
@@ -973,6 +1057,9 @@
       else if (e.key === '3') setProduct('swath');
       else if (e.key === '4') setProduct('prob');
       else if (e.key === '5') setProduct('strike');
+      else if (e.key === 'p' || e.key === 'P') setVar('mslp');
+      else if (e.key === 'w' || e.key === 'W') setVar('wind');
+      else if (e.key === 'u' || e.key === 'U') setVar('gust');
       else if (e.key === 'k' || e.key === 'K') setTracks(!opts.tracks);
       else if (e.key === 'g' || e.key === 'G') setFamily('gefs');
       else if (e.key === 'e' || e.key === 'E') setFamily('ifs');
@@ -984,11 +1071,44 @@
     });
 
     // ---- product switch + display options ------------------------------------------------------
+    // product tabs / menu items read differently for each field (pressure: lows, minimum; wind and gust: highest member); the
+    // pressure wording is whatever index.html holds, remembered on first use
+    const WTXT = {
+      mean: ['Ensemble mean', 'average of members', 'Ensemble-mean {f}'],
+      min: ['Highest member', 'strongest member', 'Highest member {f} (any member)'],
+      swath: ['Swath', 'peak so far', 'Accumulated highest member {f} (swath)'],
+      prob: ['Probability', 'at or above a level', 'Probability that {f} reaches a chosen level: share of members'],
+    };
+    const MTXT = { mean: 'Ensemble mean', min: 'Highest member', swath: 'Peak so far (swath)', prob: 'Probability of {f} at or above a level' };
+    const STXT = { mslp: { mean: 'Mean', min: 'Minimum', swath: 'Swath', prob: 'Probability', strike: 'Strike' }, wind: { mean: 'Mean', min: 'Highest', swath: 'Swath', prob: 'Probability' } };
+    const tight = window.matchMedia('(max-width:1500px)');                  // laptops and phones: one-word product tabs keep the toolbar to one row
+    tight.addEventListener('change', () => syncProductUI());
+    const origTxt = new Map();
     function syncProductUI() {
+      const wind = state.var !== 'mslp';
       document.querySelectorAll('[data-act=product]').forEach((b) => {
-        const on = b.dataset.product === state.product;
+        const pr = b.dataset.product, on = pr === state.product;
         b.setAttribute(b.getAttribute('role') === 'tab' ? 'aria-selected' : 'aria-checked', String(on));
+        b.hidden = !hasProduct(pr);
+        const tab = b.getAttribute('role') === 'tab';
+        const main = b.querySelector(tab ? '.seg-main' : '.mi-t'), sub_ = tab ? b.querySelector('.seg-sub') : null;
+        if (!origTxt.has(b)) origTxt.set(b, [main.textContent, sub_ ? sub_.textContent : '', b.title]);
+        const o = origTxt.get(b), fn = state.var === 'wind' ? 'wind speed' : 'wind gust';
+        const short = tab && tight.matches ? STXT[wind ? 'wind' : 'mslp'][pr] : null;
+        if (wind && WTXT[pr]) {
+          main.textContent = tab ? (short || WTXT[pr][0]) : MTXT[pr].replace('{f}', fn);
+          if (sub_) sub_.textContent = WTXT[pr][1];
+          if (tab) b.title = `${WTXT[pr][2].replace('{f}', fn)} (${{ mean: 1, min: 2, swath: 3, prob: 4 }[pr]})`;
+        } else {
+          main.textContent = short || o[0]; if (sub_) sub_.textContent = o[1]; if (tab) b.title = o[2];
+        }
       });
+      document.querySelectorAll('[data-act=var]').forEach((b) => {
+        const on = b.dataset.var === state.var;
+        b.setAttribute(b.getAttribute('role') === 'tab' ? 'aria-selected' : 'aria-checked', String(on));
+        b.hidden = !hasVar(b.dataset.var);
+      });
+      $('#varSegGroup').hidden = FIELDS.filter(([v]) => hasVar(v)).length < 2;
     }
     // ---- ensemble family (GEFS / ECMWF IFS ENS / Blend) -------------------------------------------
     const FAM_KEY = { gefs: 'G', ifs: 'E', geps: 'C', aigefs: 'A', blend: 'B' };
@@ -1006,8 +1126,11 @@
       document.querySelectorAll('[data-act=family]').forEach((b) => {
         const on = b.dataset.family === 'blend' ? inBlend : b.dataset.family === state.family;
         b.setAttribute(b.getAttribute('role') === 'tab' ? 'aria-selected' : 'aria-checked', String(on));
+        const fk = b.dataset.family, ok = fk === 'blend' ? blendViews.some((x) => viewOkFor(x, state.var)) : viewOkFor(fk, state.var);   // e.g. no gust from GEPS / AIGEFS
+        b.disabled = !ok;
+        if (!ok) b.title = `${fk === 'blend' ? 'No blend' : fams[fk].label} has no ${FIELD_NAME[state.var]} data`;
       });
-      bases.forEach((k) => { const el = document.querySelector(`[data-sub="${k}"]`); if (el) el.textContent = `${fams[k].org.replace('/NCEP', '')} \u00b7 ${fams[k].members.length}`; });
+      bases.forEach((k) => { const el = document.querySelector(`[data-sub="${k}"]`); if (el) el.textContent = `${fams[k].org.replace('/NCEP', '')} \u00b7 ${fams[k].members.length}${state.var === 'gust' && ESTG.has(k) ? ' \u00b7 est.' : ''}`; });
       const bs = document.querySelector('[data-sub="blend"]');
       if (bs) {
         const sel = inBlend ? fams[state.family].parts : state.blendSel;
@@ -1019,15 +1142,19 @@
         const k = b.dataset.part, sel = state.blendSel, on = sel.includes(k);
         const next = on ? sel.filter((x) => x !== k) : bases.filter((x) => sel.includes(x) || x === k);
         b.setAttribute('aria-pressed', String(on));
-        b.disabled = !(next.length >= 2 && availableViews.includes(blendKeyFor(next)));
-        b.title = b.disabled ? (on ? 'A blend needs at least two systems' : 'This combination is not available') : (on ? `Remove ${fams[k].label} from the blend` : `Add ${fams[k].label} to the blend`);
+        b.toggleAttribute('data-est', state.var === 'gust' && ESTG.has(k));
+        const hasField = viewOkFor(k, state.var);
+        b.disabled = !(next.length >= 2 && availableViews.includes(blendKeyFor(next)) && viewOkFor(blendKeyFor(next), state.var)) || (!on && !hasField);
+        b.title = b.disabled ? (!hasField ? `${fams[k].label} has no ${FIELD_NAME[state.var]} data` : on ? 'A blend needs at least two systems' : 'This combination is not available') : (on ? `Remove ${fams[k].label} from the blend` : `Add ${fams[k].label} to the blend`) + (state.var === 'gust' && ESTG.has(k) ? ` \u2014 its gust is ${EST_NOTE}` : '');
       });
     }
     // 'blend' = the combination currently ticked; otherwise a concrete view key (a base system or e.g. gefs_ifs)
-    const resolveView = (k) => (k === 'blend' ? (availableViews.includes(blendKeyFor(state.blendSel)) ? blendKeyFor(state.blendSel) : blendViews[0]) : k);
+    const resolveView = (k) => (k === 'blend'
+      ? (availableViews.includes(blendKeyFor(state.blendSel)) && viewOkFor(blendKeyFor(state.blendSel), state.var) ? blendKeyFor(state.blendSel) : blendViews.find((x) => viewOkFor(x, state.var)))
+      : k);
     function setFamily(k) {
       const v = resolveView(k);
-      if (!v || !availableViews.includes(v) || v === state.family) return;
+      if (!v || !availableViews.includes(v) || !viewOkFor(v, state.var) || v === state.family) return;
       const wantFh = vframes[state.idx] ? vframes[state.idx].fh : 0;
       state.family = v;
       if (isBlend(v)) state.blendSel = fams[v].parts.slice();
@@ -1039,10 +1166,9 @@
       syncFamilyUI();
       buildTicks();
       buildLegend();
-      state.lows = []; state.grid = null; state.when = null; state.tipGrids = null; drawLows(); updateTip();
+      state.lows = []; state.grid = null; state.when = null; state.owner = null; state.tipGrids = null; drawLows(); updateTip();
       if (vframes[j].fh !== wantFh) {
-        setStatus(`${shortOf(v)} has no F${pad3(wantFh)} on this cycle \u2014 showing F${pad3(vframes[j].fh)}`);
-        setTimeout(() => setStatus(''), 3500);
+        flashNote(`${shortOf(v)} has no F${pad3(wantFh)} on this cycle \u2014 showing F${pad3(vframes[j].fh)}`, 3500);
       }
       show();
     }
@@ -1050,7 +1176,7 @@
       const sel = state.blendSel;
       const next = sel.includes(k) ? sel.filter((x) => x !== k) : bases.filter((x) => sel.includes(x) || x === k);
       const key = blendKeyFor(next);
-      if (next.length < 2 || !availableViews.includes(key)) return;
+      if (next.length < 2 || !availableViews.includes(key) || !viewOkFor(key, state.var)) return;
       state.blendSel = next;
       setFamily(key);
     }
@@ -1061,7 +1187,7 @@
     // legend.  The title and subtitle are always drawn (on the canvas, in a fixed layout that does not depend on the screen
     // size), per frame, so every GIF names its system, product, units, run, forecast hour and valid time.  For speed the layers
     // that do not change between frames (land, lakes, borders, graticule, the legend) are flattened ONCE into a few cached
-    // canvases; only the data, track and low-centre canvases are drawn per frame.  Frames are stepped through with the normal
+    // canvases; only the data, track and low-center canvases are drawn per frame.  Frames are stepped through with the normal
     // show() path, with the next grids downloading ahead of it.
     const gifdlg = $('#gifdlg');
     const gif = { busy: false, cancel: false };
@@ -1223,9 +1349,9 @@
     }
     // a self-describing file name: system, product (+ level / radius), run and the forecast-hour range
     function gifFileName(a, b) {
-      const lv = state.product === 'prob' || state.product === 'strike' ? `${state.level[state.product]}hPa` : '';
+      const lv = state.product === 'prob' || state.product === 'strike' ? `${state.level[lvKey(state.product)]}${unitOf()}` : '';
       const rad = state.product === 'strike' ? `${state.radius}km` : '';
-      return ['ensemble-mslp', state.family, state.product, lv, rad, run.id, `F${pad3(vframes[a].fh)}-F${pad3(vframes[b].fh)}`].filter((x) => x !== '').join('_').replace(/[^\w.-]+/g, '-') + '.gif';
+      return [`ensemble-${state.var}`, state.family, state.product, lv, rad, run.id, `F${pad3(vframes[a].fh)}-F${pad3(vframes[b].fh)}`].filter((x) => x !== '').join('_').replace(/[^\w.-]+/g, '-') + '.gif';
     }
     async function runGif() {
       if (gif.busy) return;
@@ -1249,7 +1375,7 @@
         const plan = gifPlan(z.w, z.h, z.sc, withLegend);
         const first = caveParts(vframes[a]), last = caveParts(vframes[b]);
         const enc = MslpGif.createGif(z.w, z.h, { loop: 0,
-          comment: `${first.sys} | ${first.prod} (${first.units}). ${first.init}; ${first.when.split(' · ')[0]} to ${last.when.split(' · ')[0]}; ${first.members}. Ensemble MSLP viewer.` });
+          comment: `${first.sys} | ${first.prod} (${first.units}). ${first.init}; F${pad3(vframes[a].fh)} to F${pad3(vframes[b].fh)}; ${first.members}. Ensemble MSLP viewer: ${fieldName()}${estIn().length ? ` (${estIn().map(shortOf).join(' + ')}: ${EST_NOTE})` : ''}.` });
         for (let i = a; i <= b; i++) {
           if (gif.cancel) throw new Error('cancelled');
           gifEls.msg.textContent = `Rendering frame ${i - a + 1} of ${b - a + 1} (F${pad3(vframes[i].fh)})…`;
@@ -1296,24 +1422,26 @@
     // ---- probability / strike options (pressure level, radius) -----------------------------------
     // a level's name = the intensity band whose upper edge it is ("1000" -> Storm+, "975" -> Cat 2+, "925" -> Cat 5)
     function levelName(lv) {
+      if (state.var !== 'mslp') return (WIND && WIND.level_names && WIND.level_names[String(lv)]) || '';
       const g = ((manifest.scale && manifest.scale.segments) || []).find((x) => x.label && x.to_hpa === lv);
       return g ? `${g.label}${g.label === 'Cat 5' ? '' : '+'}` : '';
     }
     function syncOptBar() {
-      const prod = state.product, isP = prod === 'prob', isS = prod === 'strike';
+      const prod = state.product, isP = prod === 'prob', isS = prod === 'strike', v = state.var;
       $('#optGroup').hidden = !(isP || isS);
       if (!(isP || isS)) return;
-      const lvls = isP ? probLevels : strikeLevels, cur = state.level[prod];
-      $('#lvlLabel').textContent = isP ? 'MSLP below' : 'Low deeper than';
+      const lvls = isP ? levelsOf(v) : strikeLevels, cur = state.level[lvKey(prod)];
+      $('#lvlLabel').textContent = isP ? (v === 'mslp' ? 'MSLP below' : v === 'wind' ? 'Wind at or above' : 'Gust at or above') : 'Low deeper than';
+      $('#optLevels').setAttribute('aria-label', v === 'mslp' ? 'Pressure level' : v === 'wind' ? 'Wind speed level' : 'Gust level');
       $('#optLevels').innerHTML = lvls.map((lv) =>
-        `<button type="button" class="chip plain" data-act="level" data-level="${lv}" aria-pressed="${lv === cur}" title="${lv}${levelName(lv) ? ` hPa: ${levelName(lv)} pressure` : ' hPa'}">${lv}${levelName(lv) ? ` <small>${levelName(lv)}</small>` : ''}</button>`).join('');
+        `<button type="button" class="chip plain" data-act="level" data-level="${lv}" aria-pressed="${lv === cur}" title="${v === 'mslp' ? `${lv}${levelName(lv) ? ` hPa: ${levelName(lv)} pressure` : ' hPa'}` : `${lv} mph${levelName(lv) ? `: ${levelName(lv)}` : ''}`}">${lv}${levelName(lv) ? ` <small>${levelName(lv)}</small>` : ''}</button>`).join('');
       $('#radLabel').hidden = !isS; $('#optRadii').hidden = !isS;
       $('#optRadii').innerHTML = isS ? radii.map((r) => `<button type="button" class="chip plain" data-act="radius" data-radius="${r}" aria-pressed="${r === state.radius}">${r} km</button>`).join('') : '';
     }
     function setLevel(lv) {
-      const prod = state.product;
-      if (!(prod === 'prob' || prod === 'strike') || state.level[prod] === lv) return;
-      state.level[prod] = lv;
+      const prod = state.product, lk = lvKey(prod);
+      if (!(prod === 'prob' || prod === 'strike') || state.level[lk] === lv) return;
+      state.level[lk] = lv;
       syncOptBar(); buildLegend(); writeHash(); show();
     }
     function setRadius(r) {
@@ -1327,7 +1455,45 @@
       syncProductUI();
       syncOptBar();
       buildLegend();
-      state.lows = []; state.grid = null; state.when = null; state.tipGrids = null; state.members = null; drawLows(); updateTip();
+      state.lows = []; state.grid = null; state.when = null; state.owner = null; state.tipGrids = null; state.members = null; drawLows(); updateTip();
+      writeHash();
+      show();
+    }
+    // switch the displayed field (pressure / wind / gust). A system without it (no gust from GEPS and AIGEFS) is dropped from the view:
+    // the nearest equivalent is chosen (a blend keeps the systems that have it), and the same forecast hour is kept where possible.
+    function setVar(v) {
+      if (v === state.var || !hasVar(v)) return;
+      let target = state.family, note = '';
+      // systems whose gust is only an estimate are opt-in: switching to Gust keeps the systems with a real gust forecast (unless that
+      // leaves none), and the blend chips add the estimated ones back, labelled "est."
+      const had0 = isBlend(target) ? fams[target].parts : [target];
+      const real0 = v === 'gust' ? had0.filter((k) => !ESTG.has(k)) : had0;
+      if (!viewOkFor(target, v) || (real0.length && real0.length < had0.length)) {
+        const had = had0;
+        const keep = (real0.length ? real0 : had0).filter((k) => sysHas(k, v));
+        const key = blendKeyFor(keep);
+        target = keep.length >= 2 && availableViews.includes(key) ? key : (keep[0] || bases.find((k) => sysHas(k, v)));
+        const dropped = had.filter((k) => !keep.includes(k)).map((k) => shortOf(k));
+        const estDropped = dropped.length && had.filter((k) => !keep.includes(k)).every((k) => ESTG.has(k));
+        note = estDropped
+          ? `${dropped.join(' + ')} ${dropped.length > 1 ? 'have' : 'has'} only an estimated gust \u2014 showing ${isBlend(target) ? fams[target].parts.map(shortOf).join(' + ') + ' blend' : shortOf(target)}; add ${dropped.length > 1 ? 'them' : 'it'} from the blend chips`
+          : `${dropped.join(' + ')} ${dropped.length > 1 ? 'have' : 'has'} no ${FIELD_NAME[v]} \u2014 showing ${isBlend(target) ? fams[target].parts.map(shortOf).join(' + ') + ' blend' : shortOf(target)}`;
+      }
+      if (!target) return;
+      const wantFh = vframes[state.idx] ? vframes[state.idx].fh : 0;
+      state.var = v;
+      state.family = target;
+      if (isBlend(target)) state.blendSel = fams[target].parts.slice();
+      if (!hasProduct(state.product)) state.product = state.product === 'strike' ? 'prob' : 'mean';   // strike probability is pressure-only
+      rebuildViewFrames();
+      let j = 0;
+      vframes.forEach((f, i) => { if (f.fh <= wantFh) j = i; });
+      state.idx = j;
+      syncProductUI(); syncFamilyUI(); syncOptBar();
+      buildTicks(); buildLegend();
+      state.lows = []; state.grid = null; state.when = null; state.owner = null; state.tipGrids = null; state.members = null; drawLows(); updateTip();
+      if (!note && vframes[j] && vframes[j].fh !== wantFh) note = `${FIELD_NAME[v]} has no F${pad3(wantFh)} here \u2014 showing F${pad3(vframes[j].fh)}`;
+      if (note) flashNote(note, 4200);
       writeHash();
       show();
     }
@@ -1387,6 +1553,7 @@
       if (!it) return;
       switch (it.dataset.act) {
         case 'product': setProduct(it.dataset.product); break;
+        case 'var': setVar(it.dataset.var); break;
         case 'level': setLevel(+it.dataset.level); break;
         case 'radius': setRadius(+it.dataset.radius); break;
         case 'gif': openGif(); break;
@@ -1412,8 +1579,10 @@
     function writeHashNow() {
       clearTimeout(hashTimer); hashTimer = 0; hashLast = performance.now();
       const f = vframes[state.idx];
-      const hp = [`e=${state.family}`, `p=${state.product}`, `f=${f ? f.fh : 0}`];
-      if (state.product === 'prob' || state.product === 'strike') hp.push(`l=${state.level[state.product]}`);
+      const hp = [`e=${state.family}`];
+      if (state.var !== 'mslp') hp.push(`x=${state.var}`);
+      hp.push(`p=${state.product}`, `f=${f ? f.fh : 0}`);
+      if (state.product === 'prob' || state.product === 'strike') hp.push(`l=${state.level[lvKey(state.product)]}`);
       if (state.product === 'strike') hp.push(`r=${state.radius}`);
       if (opts.tracks) hp.push('k=1');
       if (state.view) hp.push(`v=${state.view.join(',')}`);
@@ -1427,15 +1596,15 @@
 
     // ---- go ------------------------------------------------------------------------------------
     if (hash.p && hasProduct(hash.p)) state.product = hash.p;
-    if (hash.l != null) { if (probLevels.includes(hash.l)) state.level.prob = hash.l; if (strikeLevels.includes(hash.l)) state.level.strike = hash.l; }
+    if (hash.l != null) { if (levelsOf(state.var).includes(hash.l)) state.level[lvKey('prob')] = hash.l; if (state.var === 'mslp' && strikeLevels.includes(hash.l)) state.level.strike = hash.l; }
     if (hash.r != null && radii.includes(hash.r)) state.radius = hash.r;
     if (hash.k) { opts.tracks = true; $('#optTracks').checked = true; }
     const hv = hash.e === 'blend' ? blendViews[0] : hash.e;                  // '#e=blend' (old links) = blend of everything
-    if (hv && availableViews.includes(hv)) {
+    if (hv && availableViews.includes(hv) && viewOkFor(hv, state.var)) {
       state.family = hv;
       if (isBlend(hv)) state.blendSel = fams[hv].parts.slice();
-      rebuildViewFrames(); buildTicks();
     }
+    rebuildViewFrames(); buildTicks();
     syncProductUI();
     syncOptBar();
     syncFamilyUI();
@@ -1466,6 +1635,7 @@
       const [k, v] = kv.split('=');
       if (k === 'p') h.p = v;
       else if (k === 'e') h.e = v;
+      else if (k === 'x') h.x = v;
       else if (k === 'l' && v !== undefined && !isNaN(+v)) h.l = +v;
       else if (k === 'r' && v !== undefined && !isNaN(+v)) h.r = +v;
       else if (k === 'k') h.k = v === '1';
