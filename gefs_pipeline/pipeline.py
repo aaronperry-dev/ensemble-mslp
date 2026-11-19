@@ -50,9 +50,16 @@ def make_http(cfg, **over) -> Http:
         ua = ua.replace("YOUR-USER/gefs-mslp-viewer", os.environ["GITHUB_REPOSITORY"])
     # one limiter per host (substring of the hostname -> config section); a host without its own cap uses [fetch] requests_per_second
     hosts = (("noaa-gefs-pds", "source"), ("ecmwf-forecasts", "ifs"), ("weather.gc.ca", "geps"), ("graphcastgfs", "aigefs"))
-    return Http(user_agent=ua, rps=over.get("rps", f.requests_per_second),
-                host_rps={h: float(getattr(getattr(cfg, sec), "requests_per_second")) for h, sec in hosts
-                          if hasattr(cfg, sec) and hasattr(getattr(cfg, sec), "requests_per_second")},
+    host_rps = {h: float(getattr(getattr(cfg, sec), "requests_per_second")) for h, sec in hosts
+                if hasattr(cfg, sec) and hasattr(getattr(cfg, sec), "requests_per_second")}
+    # equivalent copies of the ECMWF open data (AWS is often throttled with 503 SlowDown; ECMWF itself recommends the others):
+    # a request that fails on one server is retried on another straight away, and every server has its own limiter
+    ifs = getattr(cfg, "ifs", None)
+    mirrors = [str(m).rstrip("/") for m in getattr(ifs, "mirrors", [])] if ifs is not None else []
+    groups = [[str(ifs.base_url).rstrip("/")] + mirrors] if mirrors else []
+    for m in mirrors:
+        host_rps[m.split("/", 3)[2]] = float(getattr(ifs, "mirror_requests_per_second", 5))
+    return Http(user_agent=ua, rps=over.get("rps", f.requests_per_second), host_rps=host_rps, mirrors=groups,
                 max_retries=f.max_retries,
                 backoff_base=f.backoff_base_s, backoff_max=f.backoff_max_s,
                 timeout=(f.timeout_connect_s, f.timeout_read_s))
@@ -302,6 +309,8 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
                      "  ".join(f"{k}:{v['members']}" for k, v in frames[-1]["avail"].items()),
                      len(frames), len(fhs), time.time() - t0, http.stats.requests, http.stats.bytes / 1e6)
 
+    for g in http.mirror_groups:
+        log.info("ECMWF mirrors %s: %d fail-overs to another server", ", ".join(b.split("/", 3)[2] for b in g.bases), g.failovers)
     for line in http.stats.summary():
         log.info("requests  %s", line)
     if len(frames) < min_frames:

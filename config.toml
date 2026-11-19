@@ -54,6 +54,9 @@ full_range_cycles = [0, 12]     # these cycles publish to full_max_fh; the other
 full_max_fh       = 360
 short_max_fh      = 144
 requests_per_second = 3         # the ECMWF bucket answers 503 SlowDown above ~4-5 req/s from one client, so it gets its own, gentler cap
+mirrors             = ["https://storage.googleapis.com/ecmwf-open-data"]   # same files on Google Cloud (ECMWF recommends the mirrors when AWS answers 503 SlowDown);
+                                # requests rotate over AWS + the mirrors and move away from a server that keeps failing.  [] = AWS only
+mirror_requests_per_second = 5  # ceiling for each mirror server (adaptive like the others)
 
 [aifs]                          # ---- ECMWF AIFS ENS, ML ensemble (same AWS Open Data bucket and host as the IFS ENS) ----
 base_url          = "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com"

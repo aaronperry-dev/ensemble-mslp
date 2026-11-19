@@ -121,16 +121,71 @@ class Stats:
         return out
 
 
+class MirrorGroup:
+    """Several servers that hold byte-identical copies of the same files (e.g. ECMWF open data on AWS and on Google Cloud).
+
+    pick() rotates over the servers that are currently healthy, so the load is shared and each server's own limit is
+    easier to stay under.  A server that answers 429 / 5xx or drops the connection is put on a cool-down (30 s, doubling
+    to `cooldown_max` while it keeps failing, cleared by one success) and the retry goes straight to another server instead
+    of sleeping.  A server that answers 404 for a file is skipped for that request only (a copy may lag behind)."""
+
+    def __init__(self, bases: list[str], *, cooldown: float = 30.0, cooldown_max: float = 600.0, clock=time.monotonic):
+        self.bases = [b.rstrip("/") for b in bases]
+        self.cooldown, self.cooldown_max, self._clock = cooldown, cooldown_max, clock
+        self._lock = threading.Lock()
+        self._until = {b: 0.0 for b in self.bases}
+        self._fails = {b: 0 for b in self.bases}
+        self._rr = 0
+        self.failovers = 0
+
+    def split(self, url: str) -> str | None:
+        """The part of `url` after the matching base, or None when the URL belongs to no server of this group."""
+        for b in self.bases:
+            if url.startswith(b + "/"):
+                return url[len(b):]
+        return None
+
+    def pick(self, avoid: set[str] = frozenset()) -> str:
+        with self._lock:
+            now = self._clock()
+            live = [b for b in self.bases if b not in avoid]
+            if not live:
+                live = list(self.bases)
+            healthy = [b for b in live if self._until[b] <= now]
+            if healthy:
+                self._rr += 1
+                return healthy[self._rr % len(healthy)]
+            return min(live, key=lambda b: self._until[b])      # all cooling: the one that recovers first
+
+    def healthy_alternative(self, base: str) -> bool:
+        with self._lock:
+            now = self._clock()
+            return any(b != base and self._until[b] <= now for b in self.bases)
+
+    def bad(self, base: str) -> None:
+        with self._lock:
+            self._fails[base] += 1
+            self._until[base] = self._clock() + min(self.cooldown_max, self.cooldown * 2 ** (self._fails[base] - 1))
+            self.failovers += 1
+
+    def good(self, base: str) -> None:
+        with self._lock:
+            self._fails[base] = 0
+            self._until[base] = 0.0
+
+
 class Http:
     def __init__(self, *, user_agent: str, rps: float = 8, max_retries: int = 6, backoff_base: float = 1.0,
                  backoff_max: float = 60.0, timeout: tuple[float, float] = (10, 60), sleep=time.sleep,
-                 host_rps: dict[str, float] | None = None, adaptive: bool = True):
+                 host_rps: dict[str, float] | None = None, adaptive: bool = True,
+                 mirrors: list[list[str]] | None = None):
         self.user_agent = user_agent
         self.limiter = RateLimiter(rps)
         # optional gentler limit for particular hosts (substring of the hostname), e.g. {"ecmwf-forecasts": 3}
         self.host_limiters = {h: RateLimiter(r, **({} if adaptive else {"floor": 1.0})) for h, r in (host_rps or {}).items()}
         if not adaptive:
             self.limiter = RateLimiter(rps, floor=1.0)
+        self.mirror_groups = [MirrorGroup(g) for g in (mirrors or []) if len(g) > 1]
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
@@ -173,9 +228,22 @@ class Http:
                 return host, lim
         return netloc, self.limiter
 
+    def _group(self, url: str) -> tuple[MirrorGroup | None, str]:
+        for g in self.mirror_groups:
+            rel = g.split(url)
+            if rel is not None:
+                return g, rel
+        return None, ""
+
     def request(self, method: str, url: str, *, headers: dict | None = None, ok=(200, 206)) -> requests.Response:
-        label, limiter = self._route(url)
+        group, rel = self._group(url)
+        missing: set[str] = set()                    # mirrors that answered 404 for this very request
         for attempt in range(self.max_retries + 1):
+            base = ""
+            if group is not None:
+                base = group.pick(missing)
+                url = base + rel
+            label, limiter = self._route(url)
             limiter.wait()
             self.stats.add(requests=1)
             self.stats.add_host(label, requests=1)
@@ -188,6 +256,8 @@ class Http:
                     self.stats.add(bytes=n)
                     self.stats.add_host(label, bytes=n, **({"ranged": 1} if r.status_code == 206 else {"whole": 1} if method != "HEAD" else {}))
                     limiter.ok()
+                    if group is not None:
+                        group.good(base)
                     return r
                 status, retry_after = r.status_code, r.headers.get("Retry-After")
                 r.close()
@@ -196,12 +266,30 @@ class Http:
             except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as e:
                 if attempt >= self.max_retries:
                     raise FetchError(f"{method} {url}: {type(e).__name__}: {e}") from e
+                if group is not None:
+                    group.bad(base)
+                    if group.healthy_alternative(base):
+                        log.warning("%s on %s - trying another mirror", type(e).__name__, url.rsplit("/", 1)[-1])
+                        self.stats.add(retries=1)
+                        self.stats.add_host(label, retries=1)
+                        continue
                 self._backoff(attempt, None, type(e).__name__, url)
                 continue
             if status == 404:
+                if group is not None:
+                    missing.add(base)
+                    if len(missing) < len(group.bases):     # another copy may already have it: ask that one
+                        continue
                 self.stats.add(not_found=1)
                 raise NotFound(url)
             if status in RETRY_STATUS and attempt < self.max_retries:
+                if group is not None:
+                    group.bad(base)
+                    if group.healthy_alternative(base):     # no need to sleep: another server can take this request now
+                        log.warning("HTTP %d on %s - trying another mirror", status, url.rsplit("/", 1)[-1])
+                        self.stats.add(retries=1)
+                        self.stats.add_host(label, retries=1)
+                        continue
                 self._backoff(attempt, retry_after, f"HTTP {status}", url)
                 continue
             raise FetchError(f"{method} {url}: HTTP {status}")
