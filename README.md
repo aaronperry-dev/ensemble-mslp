@@ -49,7 +49,7 @@ python -m pytest -q                                     # 26 tests, no network n
 # quick smoke test: 6 members, first 24 h (≈ 65 requests, ≈ 16 MB)
 python -m gefs_pipeline build --out dist --max-fh 24 --members 6        # --families gefs  (or ifs) to build one system only
 
-# full production build: GEFS 31 + IFS 51 + AIFS 51 + GEPS 21 + AIGEFS 31 members, f000-f240 = 10 days (pressure only: ≈ 8 000 requests; **with 10 m wind and gust ≈ 22 000 requests and roughly 15 GB, about 80–90 minutes** – the ECMWF bucket's gentler cap of 3 requests/s, shared by IFS ENS and AIFS ENS, is the bottleneck: ≈ 14 700 requests ÷ 3 per second ≈ 80 min, while the other systems download alongside it – add `--no-wind` to skip them; the figures are extrapolated from measured small builds, the first full run will tell; the published site is ~18 MB without and roughly 50–60 MB with wind, see *Browser-side processing* and *10 m wind and gust*)
+# full production build: GEFS 31 + IFS 51 + AIFS 51 + GEPS 21 + AIGEFS 31 members, f000-f240 = 10 days (pressure only: ≈ 8 000 requests; **with 10 m wind and gust ≈ 20 000 requests and roughly 13 GB; a real build of all four available systems took 53 minutes with the Google mirror at 5 requests/s (limited by that ceiling, not by errors: 0 retries), so the default ceiling is now 12** – the ECMWF bucket's gentler cap of 3 requests/s, shared by IFS ENS and AIFS ENS, is the bottleneck: ≈ 14 700 requests ÷ 3 per second ≈ 80 min, while the other systems download alongside it – add `--no-wind` to skip them; the figures are extrapolated from measured small builds, the first full run will tell; the published site is ~18 MB without and roughly 50–60 MB with wind, see *Browser-side processing* and *10 m wind and gust*)
 python -m gefs_pipeline build --out dist
 
 python -m http.server 8000 --directory dist             # open http://localhost:8000
@@ -111,7 +111,7 @@ For every member, MSLP is lightly Gaussian-smoothed (0.5°) *only to locate* min
 
 **Member-minimum product:** the same detector runs on the member-wise minimum field (`[lows_min]`, wider 3° radius because the envelope is broad). Each L is attributed to the member that supplies the minimum at that grid cell.
 
-**Swath product:** the same detector runs on the accumulated minimum; each L also carries the forecast hour at which that minimum was reached.
+**Swath product:** the same detector runs on the accumulated minimum (or, with the *Swath of* switch on *Ensemble mean* / key **M**, on the running extreme of the ensemble mean itself; a blend folds the *blended* mean hour by hour, computed in the browser from the `mean` / `wmean` / `gmean` grids, so it needs no extra files); each L also carries the forecast hour at which that minimum was reached.
 
 **Cursor read-out:** the browser reads the full-resolution grids directly (bilinear), so a popup follows the pointer anywhere on the map for every product, showing the pressure, a colour swatch, each system's own value in a blend, lat/lon and any low-center markers under the cursor (tap on touch screens). For the swath it also gives the hour the minimum was reached.
 

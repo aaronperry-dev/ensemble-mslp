@@ -59,7 +59,7 @@
   };
   let themeName = readTheme();
   let th = THEMES[themeName];
-  const state = { family: 'gefs', product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [], grid: null, when: null, tipGrids: null, lowSize: 24, var: 'mslp', owner: null };
+  const state = { family: 'gefs', product: 'mean', idx: 0, playing: false, lows: [], lowsPx: [], grid: null, when: null, tipGrids: null, lowSize: 24, var: 'mslp', owner: null, swathStat: 'max' };
   const fmtCave = (iso) => {
     const d = new Date(iso);
     const mm = iso.slice(14, 16);                                    // '06Z' like the init time; minutes only if not on the hour
@@ -173,7 +173,9 @@
     const curLevel = () => state.level[lvKey(state.product)];
     const unitOf = (v) => (v || state.var) === 'mslp' ? 'hPa' : 'mph';
     // the file kind to download for a product (the swath is folded from the member-extreme grids)
-    const kindFor = (prod, v) => (prod === 'strike' ? null : KDIR[v || state.var][prod === 'swath' ? 'min' : prod]);
+    // (the swath of the member extreme is folded from the member-extreme grids, the swath of the mean from the mean grids)
+    const swathMean = () => state.product === 'swath' && state.swathStat === 'mean';
+    const kindFor = (prod, v) => (prod === 'strike' ? null : KDIR[v || state.var][prod === 'swath' ? (state.swathStat === 'mean' ? 'mean' : 'min') : prod]);
     const dirOf = (v) => ((v || state.var) === 'mslp' ? -1 : 1);                          // member extreme: lowest pressure, highest wind
     const sysHas = (k, v) => v === 'mslp' || frames.some((f) => f.avail[k] && f.avail[k][v]);
     const viewOkFor = (k, v) => (isBlend(k) ? fams[k].parts.every((p) => sysHas(p, v)) : sysHas(k, v));
@@ -566,7 +568,8 @@
         : state.product === 'strike'
           ? `Low below ${state.level.strike} hPa within ${state.radius} km, through F${pad3(vframes[state.idx].fh)}`
       : state.product === 'swath'
-        ? (isBlend(state.family) ? 'Swath: lowest of all members so far' : 'Swath: lowest member so far')
+        ? (state.swathStat === 'mean' ? `Swath: lowest ${isBlend(state.family) ? 'blended ' : ''}ensemble mean so far`
+          : isBlend(state.family) ? 'Swath: lowest of all members so far' : 'Swath: lowest member so far')
         : (isBlend(state.family) ? 'Lowest of all members' : 'Lowest member MSLP'));
     const tipLabelP = tipLabel;
     tipLabel = () => {
@@ -575,7 +578,7 @@
       const n = v === 'wind' ? 'wind' : estAll() ? 'estimated gust' : 'gust';
       return p === 'mean' ? `${bl ? 'Blended ensemble-mean' : 'Ensemble-mean'} ${n}`
         : p === 'prob' ? `Members with ${n} at or above ${curLevel()} mph`
-        : p === 'swath' ? `Swath: ${bl ? 'highest of all members' : 'highest member'} so far`
+        : p === 'swath' ? (state.swathStat === 'mean' ? `Swath: highest ${bl ? 'blended ' : ''}ensemble-mean ${n} so far` : `Swath: ${bl ? 'highest of all members' : 'highest member'} so far`)
         : `${bl ? 'Highest of all members' : 'Highest member'} ${n}`;
     };
     // intensity band (hurricane category / storm / gale; for wind: advisory / gale / storm / hurricane force) whose range contains v, if any
@@ -600,6 +603,7 @@
     const fmtLon = (v) => `${Math.abs(v).toFixed(2)}°${v < 0 ? 'W' : 'E'}`;
     const memberName = (mi) => fams[state.family].members[mi];
     const PTAG = { mean: 'MEAN', min: 'MIN', swath: 'SWATH', prob: 'P(<' + 'LEVEL)', strike: 'STRIKE' };
+    const ptagOf = (tag, prod) => (prod === 'swath' && state.swathStat === 'mean' ? `${tag} MEAN` : tag);
     const PTAG_W = { mean: 'MEAN', min: 'MAX', swath: 'SWATH' };
     const FIELD_SHORT = { mslp: 'MSLP', wind: 'WIND', gust: 'GUST' };
     const sb = { pos: $('#sbPos'), val: $('#sbVal'), low: $('#sbLow'), zoom: $('#sbZoom') };
@@ -645,17 +649,17 @@
       html += `<div class="tt-ll">${fmtLat(ll.lat)}  ${fmtLon(ll.lng)}</div>`;
       if (hoverTrack) { const q = trackPx.find((z) => z.t === hoverTrack); if (q) html += `<div class="tt-lows"><div class="tt-h">Member low track</div><div class="tt-row"><span style="color:${q.col}">${trackInfo(q)}</span></div></div>`; }
       if (near.length) {
-        const who = state.product === 'min' ? 'Envelope low (lowest member)' : state.product === 'swath' ? 'Swath low (deepest so far)' : 'Member lows here';
+        const who = state.product === 'min' ? 'Envelope low (lowest member)' : state.product === 'swath' ? (state.swathStat === 'mean' ? 'Mean swath low (deepest so far)' : 'Swath low (deepest so far)') : 'Member lows here';
         html += `<div class="tt-lows"><div class="tt-h">${who}</div>` +
-          near.slice(0, 6).map(([, , p, mi, t]) => `<div class="tt-row"><b${byFamily() ? ` style="color:${sysColor(partOfMember(mi))}"` : ''}>L ${p.toFixed(1)}</b><span>${memberName(mi)}${t != null ? ` · F${pad3(t)}` : ''}</span></div>`).join('') +
+          near.slice(0, 6).map(([, , p, mi, t]) => `<div class="tt-row"><b${byFamily() ? ` style="color:${sysColor(partOfMember(mi))}"` : ''}>L ${p.toFixed(1)}</b><span>${swathMean() ? (isBlend(state.family) ? `${shortOf(partOfMember(mi))} mean` : 'Ensemble mean') : memberName(mi)}${t != null ? ` · F${pad3(t)}` : ''}</span></div>`).join('') +
           (near.length > 6 ? `<div class="tt-more">+${near.length - 6} more</div>` : '') + '</div>';
       }
       sb.pos.textContent = `LAT ${fmtLat(ll.lat)}  LON ${fmtLon(ll.lng)}`;
       sb.val.textContent = v != null
-        ? `${shortOf(state.family).toUpperCase()} ${wind ? (state.product === 'prob' ? `P(${FIELD_SHORT[state.var]}\u2265${curLevel()})` : `${FIELD_SHORT[state.var]} ${PTAG_W[state.product]}`) : state.product === 'prob' ? `P(MSLP<${state.level.prob})` : PTAG[state.product]} ${fmtVal(v)} ${isPct() ? '%' : unitOf()}` +
+        ? `${shortOf(state.family).toUpperCase()} ${wind ? (state.product === 'prob' ? `P(${FIELD_SHORT[state.var]}\u2265${curLevel()})` : `${FIELD_SHORT[state.var]} ${ptagOf(PTAG_W[state.product], state.product)}`) : state.product === 'prob' ? `P(MSLP<${state.level.prob})` : ptagOf(PTAG[state.product], state.product)} ${fmtVal(v)} ${isPct() ? '%' : unitOf()}` +
           (blendVals && blendVals.every(([, x]) => x != null) ? `  (${blendVals.map(([k, x]) => `${shortOf(k)} ${fmtVal(x)}`).join(' | ')})` : '')
         : `${FIELD_SHORT[state.var]} —`;
-      sb.low.textContent = near.length ? `L ${near[0][2].toFixed(1)} hPa ${memberName(near[0][3])}${near.length > 1 ? ` (+${near.length - 1})` : ''}` : '';
+      sb.low.textContent = near.length ? `L ${near[0][2].toFixed(1)} hPa ${swathMean() ? (isBlend(state.family) ? `${shortOf(partOfMember(near[0][3]))} mean` : 'ensemble mean') : memberName(near[0][3])}${near.length > 1 ? ` (+${near.length - 1})` : ''}` : '';
       tip.innerHTML = html;
       tip.hidden = false;
       const sz = map.getSize(), tw = tip.offsetWidth, tipH = tip.offsetHeight;
@@ -703,6 +707,36 @@
       const rk = `${v}/${sys}`;
       const next = (swathChain.get(rk) || Promise.resolve()).catch(() => {}).then(() => swathStep(sys, v, fh));
       swathChain.set(rk, next);
+      return next;
+    };
+
+    // swath of the MEAN: the running extreme over the hours of the ensemble mean itself (a system's own mean, or the blended mean of a
+    // blend), one running state per field and view; calls are serialised like the swath above and a jump back restarts from the first hour.
+    // The blend takes the same weighting as the mean product (equal weight per system, or pooled members), regridded onto the first system.
+    const msRec = new Map(), msChain = new Map();
+    async function meanSwathStep(key, parts, v, fh) {
+      let rec = msRec.get(key);
+      if (rec && rec.st.fh > fh) rec = null;
+      const have = rec ? rec.st.fh : -1;
+      const hours = frames.filter((f) => f.fh <= fh && f.fh > have && parts.every((k) => (v === 'mslp' ? f.avail[k] : f.avail[k] && f.avail[k][v]))).map((f) => f.fh);
+      const per = await Promise.all(hours.map((h) => Promise.all(parts.map((k) => fetchGrid(k, KDIR[v].mean, h)))));
+      let st = rec ? rec.st : null;
+      hours.forEach((h, n) => {
+        const gs = per[n], fields = gs.map((g) => E.fieldOf(g, E.toHpa(g.t, g.scale)));
+        let fld = fields[0];
+        if (fields.length > 1) {
+          const vs = fields.map((f, i) => (i ? E.regridLinear(f.v, E.regridPlan(f, fields[0])) : f.v));
+          fld = Object.assign(E.geomOf(fields[0]), { v: E.blendMean(vs, weighting === 'equal' ? parts.map(() => 1) : gs.map((g) => g.members)) });
+        }
+        st = st ? E.fieldSwathFold(st, fld, h, dirOf(v)) : E.fieldSwathStart(fld, h);
+      });
+      if (!st) throw new Error('no data for the swath');
+      msRec.set(key, { st });
+      return E.fieldSwathCopy(st);
+    }
+    const meanSwathAt = (key, parts, v, fh) => {
+      const next = (msChain.get(key) || Promise.resolve()).catch(() => {}).then(() => meanSwathStep(key, parts, v, fh));
+      msChain.set(key, next);
       return next;
     };
 
@@ -768,6 +802,21 @@
         const lows = gs.flatMap((g, i) => (g.lows || []).map((l) => [l[0], l[1], l[2], l[3] + off[i]]));
         return { field, lows, tips };
       }
+      if (prod === 'swath' && opt.stat === 'mean') {
+        // swath of the ensemble mean: every system's own peak of its mean (for the read-out), and the peak of the blended mean
+        const per = await Promise.all(parts.map((k) => meanSwathAt(`${fv}/${k}`, [k], fv, fh)));
+        per.forEach((st_, i) => { tips[parts[i]] = Object.assign({}, st_.geom, { v: st_.v }); });
+        const st = parts.length > 1 ? await meanSwathAt(`${fv}/${view}/${weighting}`, parts, fv, fh) : per[0];
+        const field = Object.assign({}, st.geom, { v: st.v });
+        if (fv !== 'mslp') return { field, lows: [], tips, when: st.when };
+        const lows = E.detectLows(field, manifest.lows_min, dom).map((c) => {
+          // a marker has no member to belong to: it takes the colour of the system whose own mean reaches the lowest value there
+          let best = 0, bv = Infinity;
+          parts.forEach((k, i) => { const x = E.valueAt(tips[k], c.lat, c.lon); if (x != null && x < bv) { bv = x; best = i; } });
+          return [+c.lon.toFixed(2), +c.lat.toFixed(2), +c.p.toFixed(1), off[best], st.when[c.j * st.geom.nx + c.i]];
+        });
+        return { field, lows, tips, when: st.when };
+      }
       // member-wise minimum ('min') or its running minimum over the forecast ('swath')
       const srcs = await Promise.all(parts.map(async (k) => {
         if (prod === 'swath') {
@@ -815,8 +864,8 @@
         total -= resultBytes.get(k); resultCache.delete(k); resultBytes.delete(k);
       }
     }
-    const optOf = (prod) => ({ var: state.var, level: state.level[lvKey(prod)], radius: state.radius });     // options that change a product's values
-    const optKey = (prod) => `${state.var}:${prod === 'prob' ? state.level[lvKey(prod)] : prod === 'strike' ? `${state.level.strike}/${state.radius}` : ''}`;
+    const optOf = (prod) => ({ var: state.var, level: state.level[lvKey(prod)], radius: state.radius, stat: prod === 'swath' ? state.swathStat : 'max' });     // options that change a product's values
+    const optKey = (prod) => `${state.var}:${prod === 'prob' ? state.level[lvKey(prod)] : prod === 'strike' ? `${state.level.strike}/${state.radius}` : prod === 'swath' ? state.swathStat : ''}`;
     function computeView(view, prod, fh) {
       const key = `${view}/${prod}/${optKey(prod)}/${fh}`;
       if (resultCache.has(key)) { const hit = resultCache.get(key); resultCache.delete(key); resultCache.set(key, hit); return hit; }   // refresh its place
@@ -904,7 +953,7 @@
     // start downloading the grids of the frame at index i of the current view (a no-op if they are cached / in flight)
     function warmFrame(i) {
       const nf = vframes[i % vframes.length];
-      const k = kindFor(state.product);                               // 'min' and 'swath' both read the member-extreme grids
+      const k = kindFor(state.product);                               // 'min' and the swath of the extreme read the member-extreme grids
       if (!k) return;
       (isBlend(state.family) ? fams[state.family].parts : [state.family]).forEach((p) => fetchGrid(p, k, nf.fh, curLevel()).catch(() => {}));
     }
@@ -945,7 +994,7 @@
       const bySys = byFamily() ? curParts() : null;
       const lowsRow = P.has_lows
         ? `<div class="lg-lows${bySys && bySys.length > 3 ? ' lg-many' : ''}">${bySys ? bySys.map((k) => `${sample(sysColor(k))}<span>${shortOf(k)}</span>`).join('') + '<span class="lg-sep">·</span>' : sample('')}<span class="lg-lnote">${
-            state.product === 'swath' ? 'Deepest point of the swath' : state.product === 'min' ? 'Local minimum of the lowest-member field' : (isBlend(state.family) ? 'Low center of any member' : 'Member low center')} (hPa)</span></div>` : '';
+            state.product === 'swath' ? (state.swathStat === 'mean' ? 'Deepest point of the mean swath' : 'Deepest point of the swath') : state.product === 'min' ? 'Local minimum of the lowest-member field' : (isBlend(state.family) ? 'Low center of any member' : 'Member low center')} (hPa)</span></div>` : '';
       const estRow = estIn().length ? `<div class="lg-est">${estIn().map(shortOf).join(' + ')} gust: ${EST_NOTE}</div>` : '';
       $('#legend').innerHTML =
         `<div class="lg-bar" role="img" aria-label="Colour scale from below ${e[0]} to above ${e[e.length - 1]} ${unit}">${P.colors.map((c) => `<i${c === 'transparent' ? ' class="none"' : ` style="background:${c}"`}></i>`).join('')}</div>` +
@@ -976,6 +1025,10 @@
     // Everything is sentence case; the product title says what the map shows, including the chosen level / radius.
     function productTitle() {
       const P = curP();
+      if (swathMean()) {
+        const w = curParts() ? `${fams[state.family].weighting === 'equal' ? 'equal-weight ' : 'pooled-member '}` : '';
+        return state.var === 'mslp' ? `Lowest ${w}ensemble-mean MSLP so far (swath)` : estTitle(`Peak ${w}ensemble-mean ${FIELD_NAME[state.var]} so far (swath)`);
+      }
       if (state.var !== 'mslp') {
         if (state.product === 'mean' && curParts()) return estTitle(`${fams[state.family].weighting === 'equal' ? 'Equal-weight' : 'Pooled-member'} ensemble mean ${FIELD_NAME[state.var]}`);
         if (state.product === 'prob') return estTitle(`Probability of ${FIELD_NAME[state.var]} at or above ${curLevel()} mph`);
@@ -1073,6 +1126,7 @@
       else if (e.key === 'p' || e.key === 'P') setVar('mslp');
       else if (e.key === 'w' || e.key === 'W') setVar('wind');
       else if (e.key === 'u' || e.key === 'U') setVar('gust');
+      else if (e.key === 'm' || e.key === 'M') setSwathStat(state.product === 'swath' && state.swathStat === 'mean' ? 'max' : 'mean');
       else if (e.key === 'k' || e.key === 'K') setTracks(!opts.tracks);
       else if (e.key === 'g' || e.key === 'G') setFamily('gefs');
       else if (e.key === 'e' || e.key === 'E') setFamily('ifs');
@@ -1365,7 +1419,7 @@
     function gifFileName(a, b) {
       const lv = state.product === 'prob' || state.product === 'strike' ? `${state.level[lvKey(state.product)]}${unitOf()}` : '';
       const rad = state.product === 'strike' ? `${state.radius}km` : '';
-      return [`ensemble-${state.var}`, state.family, state.product, lv, rad, run.id, `F${pad3(vframes[a].fh)}-F${pad3(vframes[b].fh)}`].filter((x) => x !== '').join('_').replace(/[^\w.-]+/g, '-') + '.gif';
+      return [`ensemble-${state.var}`, state.family, state.product === 'swath' && state.swathStat === 'mean' ? 'swath-mean' : state.product, lv, rad, run.id, `F${pad3(vframes[a].fh)}-F${pad3(vframes[b].fh)}`].filter((x) => x !== '').join('_').replace(/[^\w.-]+/g, '-') + '.gif';
     }
     async function runGif() {
       if (gif.busy) return;
@@ -1440,8 +1494,35 @@
       const g = ((manifest.scale && manifest.scale.segments) || []).find((x) => x.label && x.to_hpa === lv);
       return g ? `${g.label}${g.label === 'Cat 5' ? '' : '+'}` : '';
     }
+    // swath statistic: what the swath accumulates - the lowest / highest member, or the ensemble mean (blend: the blended mean)
+    function syncSwathBar() {
+      const on = state.product === 'swath', v = state.var, ext = v === 'mslp' ? 'Lowest member' : 'Highest member';
+      $('#swathGroup').hidden = !on;
+      if (on) {
+        const bl = isBlend(state.family);
+        $('#swathStat').innerHTML = [['max', ext, v === 'mslp' ? 'Lowest pressure any member forecasts so far' : 'Highest value any member forecasts so far'],
+          ['mean', bl ? 'Blended mean' : 'Ensemble mean', `${v === 'mslp' ? 'Lowest' : 'Highest'} value of the ${bl ? 'blended ' : ''}ensemble mean so far (M)`]]
+          .map(([s, label, tip_]) => `<button type="button" class="chip plain" data-act="swathstat" data-stat="${s}" aria-pressed="${s === state.swathStat}" title="${tip_}">${label}</button>`).join('');
+      }
+      document.querySelectorAll('[data-act=swathstat].mi').forEach((b) => {
+        const s = b.dataset.stat, tt = b.querySelector('.mi-t');
+        b.setAttribute('aria-checked', String(state.product === 'swath' && s === state.swathStat));
+        tt.textContent = s === 'max' ? `Swath of the ${v === 'mslp' ? 'lowest' : 'highest'} member` : `Swath of the ${isBlend(state.family) ? 'blended ' : ''}ensemble mean`;
+      });
+    }
+    function setSwathStat(s) {
+      if (s !== 'max' && s !== 'mean') return;
+      if (state.product !== 'swath') { state.swathStat = s; setProduct('swath'); return; }          // choosing a swath statistic opens the swath
+      if (s === state.swathStat) return;
+      state.swathStat = s;
+      syncSwathBar(); buildLegend();
+      state.lows = []; state.grid = null; state.when = null; state.owner = null; state.tipGrids = null; state.members = null; drawLows(); updateTip();
+      writeHash();
+      show();
+    }
     function syncOptBar() {
       const prod = state.product, isP = prod === 'prob', isS = prod === 'strike', v = state.var;
+      syncSwathBar();
       $('#optGroup').hidden = !(isP || isS);
       if (!(isP || isS)) return;
       const lvls = isP ? levelsOf(v) : strikeLevels, cur = state.level[lvKey(prod)];
@@ -1570,6 +1651,7 @@
         case 'var': setVar(it.dataset.var); break;
         case 'level': setLevel(+it.dataset.level); break;
         case 'radius': setRadius(+it.dataset.radius); break;
+        case 'swathstat': setSwathStat(it.dataset.stat); break;
         case 'gif': openGif(); break;
         case 'family': setFamily(it.dataset.family); break;
         case 'blendpart': toggleBlendPart(it.dataset.part); break;
@@ -1598,6 +1680,7 @@
       hp.push(`p=${state.product}`, `f=${f ? f.fh : 0}`);
       if (state.product === 'prob' || state.product === 'strike') hp.push(`l=${state.level[lvKey(state.product)]}`);
       if (state.product === 'strike') hp.push(`r=${state.radius}`);
+      if (state.product === 'swath' && state.swathStat === 'mean') hp.push('ss=mean');
       if (opts.tracks) hp.push('k=1');
       if (state.view) hp.push(`v=${state.view.join(',')}`);
       try { history.replaceState(null, '', `#${hp.join('&')}`); } catch (e) { /* rate-limited or unavailable: the URL just lags behind */ }
@@ -1612,6 +1695,7 @@
     if (hash.p && hasProduct(hash.p)) state.product = hash.p;
     if (hash.l != null) { if (levelsOf(state.var).includes(hash.l)) state.level[lvKey('prob')] = hash.l; if (state.var === 'mslp' && strikeLevels.includes(hash.l)) state.level.strike = hash.l; }
     if (hash.r != null && radii.includes(hash.r)) state.radius = hash.r;
+    if (hash.ss) state.swathStat = hash.ss;
     if (hash.k) { opts.tracks = true; $('#optTracks').checked = true; }
     const hv = hash.e === 'blend' ? blendViews[0] : hash.e;                  // '#e=blend' (old links) = blend of everything
     if (hv && availableViews.includes(hv) && viewOkFor(hv, state.var)) {
@@ -1653,6 +1737,7 @@
       else if (k === 'l' && v !== undefined && !isNaN(+v)) h.l = +v;
       else if (k === 'r' && v !== undefined && !isNaN(+v)) h.r = +v;
       else if (k === 'k') h.k = v === '1';
+      else if (k === 'ss' && (v === 'mean' || v === 'max')) h.ss = v;
       else if (k === 'f' && v !== undefined && !isNaN(+v)) h.f = +v;
       else if (k === 'v' && v) { const a = v.split(',').map(Number); if (a.length === 3 && a.every(Number.isFinite)) h.v = a; }
     });

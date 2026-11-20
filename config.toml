@@ -64,7 +64,7 @@ short_max_fh      = 144
 requests_per_second = 3         # the ECMWF bucket answers 503 SlowDown above ~4-5 req/s from one client, so it gets its own, gentler cap
 mirrors             = ["https://storage.googleapis.com/ecmwf-open-data"]   # same files on Google Cloud (ECMWF recommends the mirrors when AWS answers 503 SlowDown);
                                 # requests rotate over AWS + the mirrors and move away from a server that keeps failing.  [] = AWS only
-mirror_requests_per_second = 5  # ceiling for each mirror server (adaptive like the others)
+mirror_requests_per_second = 12 # ceiling for each mirror server (adaptive like the others: halves on 503/429, creeps back up). 5 gave 0 errors over 14 600 requests in a real build
 last_resort         = ["https://data.ecmwf.int/forecasts"]   # ECMWF's own server: used only while AWS and every mirror are cooling down from errors
 last_resort_requests_per_second = 2      # (it is limited to 500 simultaneous connections for the whole world and is often slow)
 

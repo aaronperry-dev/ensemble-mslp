@@ -297,7 +297,7 @@ class Http:
                 if group is not None:
                     group.bad(base)
                     if group.healthy_alternative(base):
-                        log.warning("%s on %s - trying another mirror", type(e).__name__, url.rsplit("/", 1)[-1])
+                        log.warning("%s on %s (%s) - trying another mirror", type(e).__name__, url.rsplit("/", 1)[-1], url.split("/", 3)[2].split(".")[0])
                         self.stats.add(retries=1)
                         self.stats.add_host(label, retries=1)
                         continue
@@ -314,7 +314,7 @@ class Http:
                 if group is not None:
                     group.bad(base)
                     if group.healthy_alternative(base):     # no need to sleep: another server can take this request now
-                        log.warning("HTTP %d on %s - trying another mirror", status, url.rsplit("/", 1)[-1])
+                        log.warning("HTTP %d on %s (%s) - trying another mirror", status, url.rsplit("/", 1)[-1], url.split("/", 3)[2].split(".")[0])
                         self.stats.add(retries=1)
                         self.stats.add_host(label, retries=1)
                         continue

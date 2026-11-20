@@ -212,3 +212,24 @@ def test_rasterize_calm_skip_is_pixel_identical():
     assert len(cases) == 6 and all(c["diff"] == 0 and c["drawn"] > 0 for c in cases)
     calm = {c["name"]: c["calm"] for c in cases}
     assert calm["wind"] == pytest.approx(25 - 0.06) and calm["prob"] == pytest.approx(5 - 0.06) and calm["mslp"] is None   # -Infinity -> null
+
+
+def test_field_swath_runs_an_extreme_over_the_hourly_mean_fields():
+    """The swath of a mean field keeps the lowest (pressure) / highest (wind) value of the mean at every cell and the hour it was reached."""
+    r = subprocess.run(["node", str(ROOT / "tests/js/field_swath.js")], capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    js = json.loads(r.stdout)
+    nan = float("nan")
+    f = np.array([[1000, 1010, nan, 990, 5, 6, 7, 8], [1005, 1000, 1001, nan, 9, 2, 7, nan], [995, 1020, 999, 980, 4, 12, 7.5, 1]])
+    for key, fn in (("low", np.fmin.reduce), ("high", np.fmax.reduce)):                # fmin / fmax skip NaN like the fold does
+        got = np.array(js[key]["v"])
+        assert np.allclose(got, fn(f, axis=0), equal_nan=True)
+        # the hour: the first hour that holds the final value (a tie keeps the earlier hour)
+        when = np.array(js[key]["when"])
+        for c in range(8):
+            hours = [h for h, row in zip((0, 6, 12), f) if row[c] == got[c]]
+            assert when[c] == hours[0]
+        assert js[key]["fh"] == 12
+        assert js[key]["copyIndependent"]                                          # a copy taken mid-way is not changed by later folds
+    assert js["low"]["firstWhen"][2] == -1 and js["low"]["midWhen"][2] == 6        # a cell missing at the start is picked up later
+    assert np.array(js["low"]["mid"])[0] == 1000 and np.array(js["high"]["mid"])[0] == 1005

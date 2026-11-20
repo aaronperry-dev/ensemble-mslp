@@ -181,6 +181,26 @@
   }
   const swathCopy = (st) => ({ fh: st.fh, geom: st.geom, scale: st.scale, t: Int16Array.from(st.t), owner: Uint8Array.from(st.owner), when: Int16Array.from(st.when) });
 
+  // ---- swath of a MEAN field (an ensemble or blended mean, one grid per hour): the running extreme over the hours of the mean itself,
+  // with the hour it was reached.  No member owns a cell here, unlike the swath of the member-wise extreme above.
+  /** Start from the first hour's field {nx, ny, lon0, lat0, dlon, dlat, v: Float32Array (NaN = missing)}. */
+  function fieldSwathStart(fld, fh) {
+    const n = fld.v.length, when = new Int16Array(n).fill(fh);
+    for (let k = 0; k < n; k++) if (!(fld.v[k] === fld.v[k])) when[k] = -1;
+    return { fh, geom: geomOf(fld), v: Float32Array.from(fld.v), when };
+  }
+  /** Fold the next hour in place (dir = -1: lower cells win, e.g. pressure; +1: higher cells win, e.g. wind and gust). */
+  function fieldSwathFold(st, fld, fh, dir) {
+    const v = st.v, w = st.when, x = fld.v, hi = dir > 0;
+    for (let k = 0; k < v.length; k++) {
+      const y = x[k];
+      if (y === y && (!(v[k] === v[k]) || (hi ? y > v[k] : y < v[k]))) { v[k] = y; w[k] = fh; }
+    }
+    st.fh = fh;
+    return st;
+  }
+  const fieldSwathCopy = (st) => ({ fh: st.fh, geom: st.geom, v: Float32Array.from(st.v), when: Int16Array.from(st.when) });
+
   // ---------------------------------------------------------------------------------------------
   // low-pressure centers: port of gefs_pipeline.products.detect_lows (gaussian_filter + minimum_filter)
   // ---------------------------------------------------------------------------------------------
@@ -439,6 +459,6 @@
   }
 
   return { MISSING, probPercent, strikeCounts, strikePercent, KM_PER_DEG, inflate, unpackField, decodeBin, geomOf, sameGeom, toHpa, fieldOf, regridPlan, regridLinear, regridNearest,
-    blendMean, lowestOf, swathStart, swathFold, swathCopy, gaussSmooth, minSquare, detectLows, upsample, makeLut, rasterize,
+    blendMean, lowestOf, swathStart, swathFold, swathCopy, fieldSwathStart, fieldSwathFold, fieldSwathCopy, gaussSmooth, minSquare, detectLows, upsample, makeLut, rasterize,
     valueAt, nearestAt };
 });
