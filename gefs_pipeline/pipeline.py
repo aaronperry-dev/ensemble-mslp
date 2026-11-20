@@ -18,9 +18,10 @@ import os
 import gzip
 import json
 import shutil
+import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,7 +33,7 @@ import numpy as np
 from . import __version__
 from .config import ROOT
 from .decode import DecodeError, Grid
-from .fetcher import FetchError, Http, NotFound
+from .fetcher import FetchError, Http, MirrorGroup, NotFound
 from .palette import RAMPS, build_scale, color_at
 from .tracks import link_tracks
 from . import gridio
@@ -56,9 +57,12 @@ def make_http(cfg, **over) -> Http:
     # a request that fails on one server is retried on another straight away, and every server has its own limiter
     ifs = getattr(cfg, "ifs", None)
     mirrors = [str(m).rstrip("/") for m in getattr(ifs, "mirrors", [])] if ifs is not None else []
-    groups = [[str(ifs.base_url).rstrip("/")] + mirrors] if mirrors else []
+    last = [str(m).rstrip("/") for m in getattr(ifs, "last_resort", [])] if ifs is not None else []
+    groups = [MirrorGroup([str(ifs.base_url).rstrip("/")] + mirrors + last, fallback=last)] if (mirrors or last) else []
     for m in mirrors:
         host_rps[m.split("/", 3)[2]] = float(getattr(ifs, "mirror_requests_per_second", 5))
+    for m in last:
+        host_rps[m.split("/", 3)[2]] = float(getattr(ifs, "last_resort_requests_per_second", 2))
     return Http(user_agent=ua, rps=over.get("rps", f.requests_per_second), host_rps=host_rps, mirrors=groups,
                 max_retries=f.max_retries,
                 backoff_base=f.backoff_base_s, backoff_max=f.backoff_max_s,
@@ -249,10 +253,58 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
     need = {k: max(1, int(np.ceil(len(fam[k].members) * float(cfg.fetch.min_member_fraction)))) for k in order}
     t0 = time.time()
 
+    # ---- time budget: one slow data source must not hold the whole build hostage ------------------------------------------
+    #   frame_timeout   a system that has not delivered enough members of an hour within this time is skipped for that hour
+    #                   (members that did arrive are used when they are enough); the downloads of that hour are abandoned
+    #   strikes         that many hours in a row timing out drops the system for the rest of the build
+    #   family_minutes  a system whose own downloading has taken this many minutes in total (idle time excluded, so a system that
+    #                   keeps up is never penalised for waiting on a slower one) is dropped; its hours so far are kept
+    #   build_minutes   at this point every download stops and the hours built so far are published (the forecast ends earlier)
+    # The viewer shows exactly the hours each system has, so a dropped system simply is not part of the later hours.
+    bc = getattr(cfg, "budget", None)
+    frame_timeout = float(getattr(bc, "frame_timeout_minutes", 0)) * 60
+    strikes_max = max(1, int(getattr(bc, "strikes", 2)))
+    family_budget = float(getattr(bc, "family_minutes", 0)) * 60
+    build_budget = float(getattr(bc, "build_minutes", 0)) * 60
+    mono0 = time.monotonic()
+    strikes = {k: 0 for k in order}
+    busy = {k: 0.0 for k in order}                                    # seconds each system has spent downloading (sum over hours)
+    span: dict[tuple[str, int], list[float]] = {}                     # (system, hour) -> [first member started, last member finished]
+    span_lock = threading.Lock()
+    last_fh: dict[str, int] = {}
+    dropped: dict[str, dict] = {}
+    truncated: dict = {}
+
+    def drop(k: str, why: str) -> None:
+        if k in dropped:
+            return
+        dropped[k] = {"reason": why, "after_fh": last_fh.get(k)}
+        http.abort(k)                                                 # its running downloads stop at their next request
+        log.error("%s DROPPED for the rest of this build: %s. Its hours up to %s are kept; the other systems continue.", k, why,
+                  "none" if last_fh.get(k) is None else f"F{last_fh[k]:03d}")
+
+    def abandon(futs: dict) -> None:
+        for fu in futs.values():
+            fu.cancel()                                               # queued jobs never start; running ones stop via http.abort
+
+    def job(f, k, fh, m, plan, want_wind):
+        http.set_context((k, fh))                                     # lets http.abort((k, fh)) / http.abort(k) stop this download
+        t_in = time.monotonic()
+        with span_lock:
+            span.setdefault((k, fh), [t_in, t_in])
+        try:
+            return f.fetch_member(http, run, plan, m, fh, cache_dir, want_wind)
+        finally:
+            http.set_context(None)
+            with span_lock:
+                span[(k, fh)][1] = max(span[(k, fh)][1], time.monotonic())
+
     def submit(pools, fh):
         jobs = {}
         for k in order:
             f = fam[k]
+            if k in dropped:
+                continue
             if fh > f.max_fh(run):
                 continue                                              # e.g. IFS 06/18Z runs stop at 144 h
             plan = f.plan(http, run, fh)
@@ -261,7 +313,7 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
                 continue
             want_wind = bool(wind_on and f.has_wind and k in wind_fams and fh <= wind_max)
             # one job per member returns its MSLP and (when wanted) wind / gust, so the requests of a file can be shared
-            futs = {m: pools[k].submit(f.fetch_member, http, run, plan, m, fh, cache_dir, want_wind) for m in f.members}
+            futs = {m: pools[k].submit(job, f, k, fh, m, plan, want_wind) for m in f.members}
             jobs[k] = (plan, futs, want_wind)
         return fh, jobs
 
@@ -278,20 +330,57 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
         for _ in range(min(2, len(todo))):
             queue.append(submit(pools, todo.popleft()))
         while queue:
+            if build_budget and time.monotonic() - mono0 > build_budget:
+                nxt = queue[0][0]
+                truncated = {"after_fh": frames[-1]["fh"] if frames else None,
+                             "reason": f"the {build_budget / 60:.0f}-minute time budget of the build was used up"}
+                log.error("build time budget (%.0f min) used up before f%03d - publishing the %d frame(s) built so far",
+                          build_budget / 60, nxt, len(frames))
+                http.abort_all = True
+                for _, pending in queue:
+                    for _, futs_, _ in pending.values():
+                        abandon(futs_)
+                break
             fh, jobs = queue.popleft()
             if todo:
                 queue.append(submit(pools, todo.popleft()))
             ready: dict[str, FamilyFrame] = {}
+            frame_deadline = time.monotonic() + frame_timeout if frame_timeout else None
             for k, (plan, futs, want_wind) in jobs.items():
+                if family_budget and k not in dropped and busy[k] > family_budget:
+                    drop(k, f"its downloads have taken {busy[k] / 60:.0f} minutes (limit {family_budget / 60:.0f})")
+                if k in dropped:
+                    abandon(futs)
+                    continue
                 grids: dict[str, Grid] = {}
                 wres: dict[str, MemberResult] = {}
+                timed_out = False
                 for m, fut in futs.items():
                     try:
-                        res = fut.result()
+                        wait = None if frame_deadline is None else max(0.0, frame_deadline - time.monotonic())
+                        res = fut.result(timeout=wait)
                         grids[m] = res.grid
                         wres[m] = res
+                    except FuturesTimeout:
+                        timed_out = True                              # keep looking: members that are already done still count
+                    except CancelledError:
+                        pass
                     except (NotFound, FetchError, DecodeError, KeyError) as e:
                         log.warning("f%03d %s %s: %s", fh, k, m, repr(e) if not str(e) else e)
+                with span_lock:
+                    s0, s1 = span.get((k, fh), (None, None))
+                if s0 is not None:
+                    busy[k] += (time.monotonic() if timed_out else s1) - s0
+                if timed_out:
+                    abandon(futs)
+                    http.abort((k, fh))
+                    strikes[k] += 1
+                    log.error("f%03d %s: not complete after %.0f min - %d/%d members arrived (strike %d/%d)",
+                              fh, k, frame_timeout / 60, len(grids), len(fam[k].members), strikes[k], strikes_max)
+                    if strikes[k] >= strikes_max:
+                        drop(k, f"{strikes[k]} hours in a row took longer than {frame_timeout / 60:.0f} minutes")
+                else:
+                    strikes[k] = 0
                 ff = _usable(fam[k], grids, fh)
                 if ff is None or len(ff.names) < need[k]:
                     log.error("f%03d %s: only %d/%d members (need %d) - family skipped for this hour",
@@ -302,6 +391,7 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
                     ff.wind = _collect_wind(fam[k], wres, fh, need[k])
                     ff.wind, ff.gust_estimated = _with_estimated_gust(cfg, fam[k], ff.wind)
                 ready[k] = ff
+                last_fh[k] = fh
             if not ready:
                 continue
             frames.append(build_frame(cfg, ready, order, fh, data_dir, run_id, lows_by_sys))
@@ -309,6 +399,8 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
                      "  ".join(f"{k}:{v['members']}" for k, v in frames[-1]["avail"].items()),
                      len(frames), len(fhs), time.time() - t0, http.stats.requests, http.stats.bytes / 1e6)
 
+    for k, d in dropped.items():
+        log.error("SUMMARY %s was dropped: %s", k, d["reason"])
     for g in http.mirror_groups:
         log.info("ECMWF mirrors %s: %d fail-overs to another server", ", ".join(b.split("/", 3)[2] for b in g.bases), g.failovers)
     for line in http.stats.summary():
@@ -339,7 +431,8 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
                     "members": list(fam[k].members),
                     "frames": sum(1 for f in frames if k in f["avail"]),
                     "wind_frames": sum(1 for f in frames if "wind" in f["avail"].get(k, {})),
-                    "gust_frames": sum(1 for f in frames if "gust" in f["avail"].get(k, {}))} for k in order}
+                    "gust_frames": sum(1 for f in frames if "gust" in f["avail"].get(k, {}))} for k in order
+                if any(k in f["avail"] for f in frames)}                # a system that delivered nothing is not offered at all
     # 10 m wind speed / gust products: only those some system actually published
     wind_products, wind_meta = {}, None
     have = {var: any(var in f["avail"].get(k, {}) for f in frames for k in order) for var, _ in WIND_VARS}
@@ -370,7 +463,7 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
         "domain": {"west": cfg.domain.west, "east": cfg.domain.east, "south": cfg.domain.south, "north": cfg.domain.north,
                    "initial": list(cfg.domain.initial_view)},
         "families": fam_meta,                                         # single systems only; the viewer builds every blend itself
-        "views": list(order),
+        "views": list(fam_meta),
         "blend": {"weighting": cfg.blend.weighting},
         "lows_threshold_hpa": cfg.lows.threshold_hpa,
         "lows_min": {"threshold_hpa": cfg.lows_min.threshold_hpa, "radius_deg": cfg.lows_min.radius_deg,
@@ -390,6 +483,9 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
         "tracks": tracks_meta,
         "scale": {"segments": scale_segments},
         "wind": wind_meta,
+        # what the time budget cut short (absent = nothing): {"dropped": {system: {reason, after_fh}}, "truncated": {after_fh, reason}}
+        **({"incomplete": {**({"dropped": dropped} if dropped else {}), **({"truncated": truncated} if truncated else {})}}
+           if dropped or truncated else {}),
         "frames": frames,
     }
     write_json(data_dir / "manifest.json", manifest)

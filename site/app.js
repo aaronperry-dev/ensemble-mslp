@@ -193,6 +193,19 @@
 
     $('#runline').textContent =
       `Init: ${fmtInit(run.init)} · ${bases.map((k) => `${shortOf(k)} ${fams[k].members.length}`).join(' + ')} members · ${gridSummary(frames, bases)}`;
+    {   // a build that gave up on a slow data source says so (manifest.incomplete, see [budget] in config.toml)
+      const inc = manifest.incomplete || {}, notes = [], why = [];
+      for (const [k, d] of Object.entries(inc.dropped || {})) {
+        if (!fams[k]) continue;
+        const last = Math.max(-1, ...frames.filter((f) => f.avail[k]).map((f) => f.fh));
+        notes.push(`${shortOf(k)} ends at F${pad3(last)}`); why.push(`${shortOf(k)}: ${d.reason}`);
+      }
+      if (inc.truncated) { notes.push(`forecast cut at F${pad3(Math.max(...frames.map((f) => f.fh)))}`); why.push(inc.truncated.reason); }
+      if (notes.length) {
+        $('#runline').textContent += ` \u00b7 \u26a0 ${notes.join(', ')} (data download too slow)`;
+        $('#runline').title = why.join('\n');
+      }
+    }
 
     // ---- map ----------------------------------------------------------------------------------
     const map = L.map('map', {

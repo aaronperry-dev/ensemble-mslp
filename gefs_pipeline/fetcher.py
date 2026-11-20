@@ -129,8 +129,12 @@ class MirrorGroup:
     to `cooldown_max` while it keeps failing, cleared by one success) and the retry goes straight to another server instead
     of sleeping.  A server that answers 404 for a file is skipped for that request only (a copy may lag behind)."""
 
-    def __init__(self, bases: list[str], *, cooldown: float = 30.0, cooldown_max: float = 600.0, clock=time.monotonic):
-        self.bases = [b.rstrip("/") for b in bases]
+    def __init__(self, bases: list[str], *, fallback: list[str] = (), cooldown: float = 30.0, cooldown_max: float = 600.0,
+                 clock=time.monotonic):
+        """`fallback` servers (a subset of `bases`, or extra ones) are the last resort: used only while every other server is
+        cooling down."""
+        self.bases = [b.rstrip("/") for b in bases] + [b.rstrip("/") for b in fallback if b.rstrip("/") not in bases]
+        self.fallback = {b.rstrip("/") for b in fallback}
         self.cooldown, self.cooldown_max, self._clock = cooldown, cooldown_max, clock
         self._lock = threading.Lock()
         self._until = {b: 0.0 for b in self.bases}
@@ -152,9 +156,11 @@ class MirrorGroup:
             if not live:
                 live = list(self.bases)
             healthy = [b for b in live if self._until[b] <= now]
-            if healthy:
+            main = [b for b in healthy if b not in self.fallback]
+            pool = main or healthy                              # a last-resort server is used only when no other one is healthy
+            if pool:
                 self._rr += 1
-                return healthy[self._rr % len(healthy)]
+                return pool[self._rr % len(pool)]
             return min(live, key=lambda b: self._until[b])      # all cooling: the one that recovers first
 
     def healthy_alternative(self, base: str) -> bool:
@@ -185,7 +191,9 @@ class Http:
         self.host_limiters = {h: RateLimiter(r, **({} if adaptive else {"floor": 1.0})) for h, r in (host_rps or {}).items()}
         if not adaptive:
             self.limiter = RateLimiter(rps, floor=1.0)
-        self.mirror_groups = [MirrorGroup(g) for g in (mirrors or []) if len(g) > 1]
+        self.mirror_groups = [g if isinstance(g, MirrorGroup) else MirrorGroup(g) for g in (mirrors or []) if len(g if not isinstance(g, MirrorGroup) else g.bases) > 1]
+        self.aborted: set = set()                  # job contexts (family, hour) or families (str) whose requests must stop
+        self.abort_all = False
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
@@ -215,7 +223,13 @@ class Http:
         self.stats.add(retries=1)
         self.stats.add_host(self._route(url)[0], retries=1)
         log.warning("%s on %s - retry %d/%d in %.1fs", why, url.rsplit("/", 1)[-1], attempt + 1, self.max_retries, delay)
-        self._sleep(delay)
+        if self._sleep is not time.sleep:
+            self._sleep(delay)
+            return
+        end = time.monotonic() + delay                     # sleep in slices so that an abandoned job stops waiting at once
+        while (left := end - time.monotonic()) > 0:
+            self._check_abort()
+            time.sleep(min(1.0, left))
 
     def _limiter_for(self, url: str) -> RateLimiter:
         return self._route(url)[1]
@@ -228,6 +242,19 @@ class Http:
                 return host, lim
         return netloc, self.limiter
 
+    def set_context(self, ctx) -> None:
+        """Tag the calling thread's requests with a job context, e.g. ("aifs", 120), so abort() can stop them."""
+        self._local.ctx = ctx
+
+    def abort(self, ctx) -> None:
+        """Make requests of that job context (a (family, hour) pair) or of that whole family (a string) fail at once."""
+        self.aborted.add(ctx)
+
+    def _check_abort(self) -> None:
+        ctx = getattr(self._local, "ctx", None)
+        if ctx is not None and (self.abort_all or ctx in self.aborted or ctx[0] in self.aborted):
+            raise FetchError(f"abandoned: {ctx[0]} f{ctx[1]:03d} was skipped (too slow)")
+
     def _group(self, url: str) -> tuple[MirrorGroup | None, str]:
         for g in self.mirror_groups:
             rel = g.split(url)
@@ -239,6 +266,7 @@ class Http:
         group, rel = self._group(url)
         missing: set[str] = set()                    # mirrors that answered 404 for this very request
         for attempt in range(self.max_retries + 1):
+            self._check_abort()
             base = ""
             if group is not None:
                 base = group.pick(missing)
@@ -291,6 +319,10 @@ class Http:
                         self.stats.add_host(label, retries=1)
                         continue
                 self._backoff(attempt, retry_after, f"HTTP {status}", url)
+                continue
+            if group is not None and attempt < self.max_retries and group.healthy_alternative(base):
+                group.bad(base)                              # e.g. a server that ignores Range or refuses us: use another one
+                log.warning("HTTP %d on %s from %s - trying another mirror", status, url.rsplit("/", 1)[-1], url.split("/", 3)[2])
                 continue
             raise FetchError(f"{method} {url}: HTTP {status}")
         raise FetchError(f"{method} {url}: retries exhausted")

@@ -137,5 +137,64 @@ def test_config_builds_the_mirror_group_and_a_limiter_per_mirror():
     assert h.mirror_groups and h.mirror_groups[0].bases[0] == cfg.ifs.base_url.rstrip("/")
     assert any("storage.googleapis.com" in b for b in h.mirror_groups[0].bases)
     assert "storage.googleapis.com" in h.host_limiters and "ecmwf-forecasts" in h.host_limiters
-    cfg.ifs.mirrors = []
+    cfg.ifs.mirrors, cfg.ifs.last_resort = [], []
     assert make_http(cfg).mirror_groups == []
+
+
+def test_last_resort_server_is_used_only_while_the_others_are_failing(servers):
+    a, hits_a, _ = servers("throttle")
+    b, hits_b, _ = servers("throttle")
+    c, hits_c, _ = servers("ok")
+    h = Http(user_agent="t", rps=0, max_retries=6, sleep=lambda s: None, mirrors=[MirrorGroup([a, b], fallback=[c])])
+    for i in range(12):
+        assert h.get_range(a + "/x", i, i + 4) == BLOB[i:i + 5]
+    assert len(hits_c) == 12 and len(hits_a) <= 2 and len(hits_b) <= 2
+
+
+def test_last_resort_is_not_touched_when_a_main_server_is_healthy(servers):
+    a, _, _ = servers("ok")
+    c, hits_c, _ = servers("ok")
+    h = Http(user_agent="t", rps=0, sleep=lambda s: None, mirrors=[MirrorGroup([a], fallback=[c])])
+    for _ in range(10):
+        h.get_range(a + "/x", 0, 9)
+    assert hits_c == []
+
+
+def test_a_server_that_ignores_range_is_abandoned_not_downloaded_in_full(servers):
+    class Whole(http.server.BaseHTTPRequestHandler):                       # answers 200 with the whole body, whatever was asked
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(BLOB)))
+            self.end_headers()
+            self.wfile.write(BLOB)
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Whole)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        w = f"http://127.0.0.1:{srv.server_address[1]}/data"
+        b, _, _ = servers("ok")
+        h = client(w, b)
+        for i in range(6):
+            assert h.get_range(w + "/x", i, i + 2) == BLOB[i:i + 3]
+    finally:
+        srv.shutdown()
+
+
+def test_aborted_job_stops_at_its_next_request(servers):
+    from gefs_pipeline.fetcher import FetchError
+    a, hits_a, _ = servers("ok")
+    h = Http(user_agent="t", rps=0, sleep=lambda s: None)
+    h.set_context(("fam", 6))
+    h.get_range(a + "/x", 0, 3)
+    h.abort(("fam", 6))
+    with pytest.raises(FetchError, match="abandoned"):
+        h.get_range(a + "/x", 0, 3)
+    h.set_context(("fam", 12))
+    h.get_range(a + "/x", 0, 3)                                            # another hour of the same system is unaffected
+    h.abort("fam")                                                         # the whole system
+    with pytest.raises(FetchError, match="abandoned"):
+        h.get_range(a + "/x", 0, 3)
+    assert len(hits_a) == 2

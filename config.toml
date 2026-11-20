@@ -13,6 +13,14 @@ optional = ["aifs", "aigefs"]
 # to also build the 06/18Z cycles (the ECMWF and blend views then end at 6 days on those runs).
 cycles   = [0, 12]
 
+[budget]                        # ---- keep a build from hanging on one slow data source (0 turns a rule off) ----
+# A system that is much too slow is skipped and the data that WAS available is published; the viewer shows exactly the hours each system has.
+frame_timeout_minutes = 12      # a system that has not delivered an hour's members after this long is skipped for that hour
+                                # (members that did arrive are used when they are enough, the rest of that hour's downloads are abandoned)
+strikes               = 2       # this many hours in a row timing out drops that system for the rest of the build
+family_minutes        = 110     # a system whose own downloading has taken this many minutes in total is dropped (its hours so far are kept)
+build_minutes         = 150     # after this many minutes everything stops and the hours built so far are published (the forecast ends earlier)
+
 [blend]
 # How the blended ensemble MEAN is formed:
 #   "equal"   - average of the family means, each system counts once (the usual multi-system convention)
@@ -57,6 +65,8 @@ requests_per_second = 3         # the ECMWF bucket answers 503 SlowDown above ~4
 mirrors             = ["https://storage.googleapis.com/ecmwf-open-data"]   # same files on Google Cloud (ECMWF recommends the mirrors when AWS answers 503 SlowDown);
                                 # requests rotate over AWS + the mirrors and move away from a server that keeps failing.  [] = AWS only
 mirror_requests_per_second = 5  # ceiling for each mirror server (adaptive like the others)
+last_resort         = ["https://data.ecmwf.int/forecasts"]   # ECMWF's own server: used only while AWS and every mirror are cooling down from errors
+last_resort_requests_per_second = 2      # (it is limited to 500 simultaneous connections for the whole world and is often slow)
 
 [aifs]                          # ---- ECMWF AIFS ENS, ML ensemble (same AWS Open Data bucket and host as the IFS ENS) ----
 base_url          = "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com"
