@@ -109,3 +109,27 @@ def build_scale(scale_cfg) -> tuple[list[float], list[str], list[dict]]:
                         "from_hpa": None if idx[0] == 0 else edges[idx[0] - 1],
                         "to_hpa": None if idx[-1] == n - 1 else edges[idx[-1]]})   # (hPa for pressure scales; the unit of the scale otherwise)
     return edges, colors, summary
+
+
+def explicit_scale(scale_cfg) -> tuple[list[float], list[str], list[dict]]:
+    """Scale with every class colour given outright (wind speed and gust follow supplied legends colour for colour).
+
+    `scale_cfg.edges` is the ascending list of class edges; `scale_cfg.colors` holds len(edges) + 1 colours, lowest class first, each
+    "#rrggbb" or "transparent".  Class i is [edges[i-1], edges[i]); the first is open below and the last open above.
+    `scale_cfg.categories` (optional) are intensity bands for the cursor read-out: {name, label, phrase, from_mph?, to_mph?}.  They follow
+    real thresholds and need not coincide with class edges.  Returns (edges, colours, segments) like `build_scale`; the segments reuse its
+    from_hpa / to_hpa keys ("the unit of the scale otherwise", here mph) so the browser reads both the same way.
+    """
+    edges = list(scale_cfg.edges)
+    colors = [str(c).lower() for c in scale_cfg.colors]
+    if any(b <= a for a, b in zip(edges, edges[1:])):
+        raise ValueError(f"scale edges must be strictly ascending: {edges}")
+    if len(colors) != len(edges) + 1:
+        raise ValueError(f"{len(edges)} edges make {len(edges) + 1} classes but {len(colors)} colours are given")
+    bad = [c for c in colors if c != "transparent" and not (len(c) == 7 and c[0] == "#" and all(ch in "0123456789abcdef" for ch in c[1:]))]
+    if bad:
+        raise ValueError(f"colours must be '#rrggbb' or 'transparent': {bad}")
+    segs = [{"name": g.name, "label": getattr(g, "label", ""), "phrase": getattr(g, "phrase", ""),
+             "from_hpa": getattr(g, "from_mph", None), "to_hpa": getattr(g, "to_mph", None)}
+            for g in getattr(scale_cfg, "categories", [])]
+    return edges, colors, segs

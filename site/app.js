@@ -978,14 +978,24 @@
       e.filter((v) => hinges.includes(v) || (v > hinges[hinges.length - 1] && v % 10 === 0) || (wind && v === e[0]))
         .forEach((v) => { if (!want.length || v - want[want.length - 1] >= gap) want.push(v); });
       let ticks = '';
-      e.forEach((v, k) => {
+      if (wind) {
+        // wind speed and gust follow supplied legends: classes of unequal width (5 mph, then 10 and 20), one tick per class edge, a number
+        // wherever the previous number is far enough away (every edge on a desktop bar, every second one on a phone)
+        let lastPx = -Infinity;
+        e.forEach((v, k) => {
+          const px = ((k + 1) / n) * barPx, lab = px - lastPx >= 25;
+          if (lab) lastPx = px;
+          ticks += `<span style="left:${(((k + 1) / n) * 100).toFixed(2)}%">${lab ? v : ''}</span>`;
+        });
+      } else e.forEach((v, k) => {
         const hinge = hinges.includes(v);
         if (!hinge && !want.includes(v)) return;
         ticks += `<span class="${hinge ? 'hinge' : ''}${!wind && v === 1000 ? ' b' : ''}" style="left:${(((k + 1) / n) * 100).toFixed(2)}%">${want.includes(v) ? v : ''}</span>`;
       });
-      // names of the intensity bands, centered under their span of classes (the first one starts at the left edge)
+      // names of the intensity bands, centered under their span of classes (the first one starts at the left edge).  Pressure only: the wind
+      // and gust colour classes do not break at the NWS thresholds (the cursor read-out still names the band)
       let cats = '';
-      segs.forEach((g, i) => {
+      if (!wind) segs.forEach((g, i) => {
         if (!g.label) return;
         const lo = g.from_hpa == null ? 0 : at(g.from_hpa), hi = g.to_hpa == null ? 100 : at(g.to_hpa);
         cats += `<span style="left:${i === 0 ? 0 : ((lo + hi) / 2).toFixed(2)}%"${i === 0 ? ' class="first"' : ''} title="${g.name}">${g.label}</span>`;

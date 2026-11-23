@@ -304,49 +304,67 @@ land_factor = [2.0,  2.0,  2.0,  1.93, 1.85, 1.76, 1.65, 1.58, 1.48, 1.40, 1.35]
 sea_speed   = [0,    6,    9,    12,   16,   28,   36,   44,   60]
 sea_factor  = [1.45, 1.42, 1.32, 1.27, 1.26, 1.26, 1.28, 1.31, 1.34]
 
-# ONE colour scale for wind speed AND gust, so the two can be compared directly.  5 mph classes from 10 mph (the first class,
-# below 10 mph, is left transparent); the segment edges sit on the NWS / marine thresholds (rounded to the 5 mph class).
-[wind_scale]
-edges = { start = 10, stop = 100, step = 5 }
+# COLOUR SCALES for wind speed and gust.  Both follow the legends supplied for the project, class for class, colour for colour (the hex values
+# were sampled from the legend images), so they are listed explicitly here instead of being interpolated from a ColorBrewer ramp.
+#   edges  = class edges in mph, ascending.  N edges -> N+1 classes: class 0 is everything below edges[0], class i is [edges[i-1], edges[i]),
+#            the last class is open above (a value above the legend's top class keeps its colour).
+#   colors = N+1 colours, lowest class first; "transparent" leaves the map visible (and lets the browser skip those cells).
+# Wind speed and gust now have their own scales (the gust legend runs to 150 mph, the wind legend to 70), so a colour means a different
+# speed on the two fields: read the legend, not the colour alone.
 
-[[wind_scale.segments]]
+# 10 m WIND SPEED (legend: "5 to 10 MPH" ... "60 to 70 MPH").  Below 5 mph is not in the legend and is left transparent; 60 mph and above
+# keeps the top colour (legend class 60-70).
+[wind_scale]
+edges  = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60]
+colors = ["transparent",                                             # < 5
+          "#225ea8", "#2193c1", "#41b6c4", "#7fcdbb", "#b4d79e",     # 5-10, 10-15, 15-20, 20-25, 25-30
+          "#e0ffa2", "#ffffbb", "#ffe97b", "#ffc400", "#ffaa00",     # 30-35, 35-40, 40-45, 45-50, 50-60
+          "#ff600a"]                                                 # 60 and above (legend: 60-70)
+
+# Intensity wording for the cursor read-out ("~ Wind Advisory range" ...).  These follow the real NWS / marine thresholds and are independent
+# of the colour classes above (the legend has no class edge at 55 or 75 mph, so the legend bar no longer names them).
+[[wind_scale.categories]]
 name   = "Below 25 mph"
 label  = ""
 phrase = "light to moderate"
-ramp   = "Blues"
-upto   = 25
-t      = [0.2, 0.7]
+to_mph = 25
 
-[[wind_scale.segments]]
-name   = "25-39 mph (Wind Advisory range)"
-label  = "Advisory"
-phrase = "Wind Advisory range"
-ramp   = "YlGn"
-upto   = 40
-t      = [0.25, 0.8]
+[[wind_scale.categories]]
+name     = "25-39 mph (Wind Advisory range)"
+label    = "Advisory"
+phrase   = "Wind Advisory range"
+from_mph = 25
+to_mph   = 40
 
-[[wind_scale.segments]]
-name   = "40-54 mph (gale / High Wind)"
-label  = "Gale"
-phrase = "gale-force / High Wind"
-ramp   = "YlOrRd"
-upto   = 55
-t      = [0.15, 0.5]
+[[wind_scale.categories]]
+name     = "40-54 mph (gale / High Wind)"
+label    = "Gale"
+phrase   = "gale-force / High Wind"
+from_mph = 40
+to_mph   = 55
 
-[[wind_scale.segments]]
-name   = "55-74 mph (storm force)"
-label  = "Storm"
-phrase = "storm-force"
-ramp   = "YlOrRd"
-upto   = 75
-t      = [0.62, 0.95]
+[[wind_scale.categories]]
+name     = "55-74 mph (storm force)"
+label    = "Storm"
+phrase   = "storm-force"
+from_mph = 55
+to_mph   = 75
 
-[[wind_scale.segments]]
-name   = "75 mph and above (hurricane force)"
-label  = "Hurricane"
-phrase = "hurricane-force"
-ramp   = "RdPu"
-t      = [0.55, 1.0]
+[[wind_scale.categories]]
+name     = "75 mph and above (hurricane force)"
+label    = "Hurricane"
+phrase   = "hurricane-force"
+from_mph = 75
+
+# 10 m WIND GUST (legend: "0 - 5" ... "141 - 150" MPH, 17 classes).  The legend's first class (0-5, dark navy) is drawn; 140 mph and above
+# keeps the top colour (legend class 141-150).
+[gust_scale]
+edges  = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 100, 120, 140]
+colors = ["#1c4577",                                                 # 0-5
+          "#225ea8", "#258db8", "#41b6c4", "#7fcdbb", "#afd09b",     # 6-10, 11-15, 16-20, 21-25, 26-30
+          "#dfff9e", "#f9f9a4", "#fae473", "#ffc400", "#feaa01",     # 31-35, 36-40, 41-45, 46-50, 51-60
+          "#ff5900", "#ff0000", "#a80000", "#6e0000",                # 61-70, 71-80, 81-100, 101-120
+          "#ffbee8", "#ff73df"]                                      # 121-140, 141-150 (and above)
 
 # --- data products ---------------------------------------------------------------------------
 [products.mean]

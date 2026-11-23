@@ -445,3 +445,51 @@ def test_estimate_applied_only_to_listed_systems_without_gust_and_flagged_in_the
     entry = build_frame(cfg, {"geps": ff}, ["geps"], 6, tmp_path, "r")
     assert entry["avail"]["geps"]["gust"]["estimated"] is True and "estimated" not in entry["avail"]["geps"]["wind"]
     assert (tmp_path / "r" / "geps" / "gmax" / "f006.bin.gz").exists()
+
+
+def test_manifest_gives_wind_and_gust_their_own_legend_colours(tmp_path):
+    """End to end through build(): wind products carry the wind legend, gust products the gust legend, probability its own % scale."""
+    import json
+    from datetime import datetime, timezone
+    from gefs_pipeline.fetcher import Http
+    from gefs_pipeline.pipeline import build
+    from gefs_pipeline.sources import Family, MemberResult
+    from gefs_pipeline.palette import explicit_scale
+
+    cfg = load_config()
+    cfg.wind.families = ["ff"]                                                            # wind is only fetched for the systems listed in [wind]
+    run = datetime(2026, 11, 19, 0, tzinfo=timezone.utc)
+    lats, lons = np.arange(30.0, 40.01, 2.5), np.arange(-80.0, -69.99, 2.5)
+
+    class Fake(Family):
+        key, label, name, org, note = "ff", "FF", "FF", "T", ""
+        has_wind, has_gust = True, True
+
+        def __init__(self, c):
+            super().__init__(c)
+            self.members = ["ff00", "ff01", "ff02"]
+
+        def max_fh(self, r):
+            return 240
+
+        def plan(self, http, r, fh):
+            return "p"
+
+        def plan_tag(self, plan):
+            return "fake"
+
+        def fetch_member(self, http, r, plan, member, fh, cache_dir, want_wind=False):
+            g = lambda v: Grid(lats, lons, np.full((len(lats), len(lons)), v, np.float32), f"2026-11-19T{fh % 24:02d}:00:00Z", fh)
+            return MemberResult(g(1010.0), {"wind": g(30.0), "gust": g(45.0)} if want_wind else None)
+
+    out = tmp_path / "site"
+    build(cfg, run=run, out=out, cache_dir=None, http=Http(user_agent="t", rps=0), workers=2, families=[Fake(cfg)], fhs=[0, 6])
+    prods = json.loads((out / "data" / "manifest.json").read_text())["products"]
+    we, wc, _ = explicit_scale(cfg.wind_scale)
+    ge, gc, _ = explicit_scale(cfg.gust_scale)
+    for k in ("wmean", "wmax", "wswath"):
+        assert prods[k]["edges"] == we and prods[k]["colors"] == wc and prods[k]["units"] == "mph"
+    for k in ("gmean", "gmax", "gswath"):
+        assert prods[k]["edges"] == ge and prods[k]["colors"] == gc and prods[k]["units"] == "mph"
+    assert prods["wprob"]["units"] == "%" and prods["wprob"]["colors"] == prods["gprob"]["colors"]
+    assert prods["wmean"]["colors"][0] == "transparent" and prods["gmean"]["colors"][0] == "#1c4577"

@@ -5,7 +5,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 from gefs_pipeline.config import load_config
-from gefs_pipeline.palette import RAMPS, build_scale, color_at, edges_from_spec, hex_to_oklab, oklab_to_hex
+from gefs_pipeline.palette import RAMPS, build_scale, color_at, edges_from_spec, explicit_scale, hex_to_oklab, oklab_to_hex
 
 
 def test_ramps_are_valid_hex_and_official_lengths():
@@ -88,3 +88,64 @@ def test_storm_and_gale_blues_get_darker_downwards():
 
 def test_edges_inclusive():
     assert edges_from_spec(NS(start=988, stop=1004, step=4)) == [988, 992, 996, 1000, 1004]
+
+
+# ---- wind speed and gust follow the supplied legends, class for class ---------------------------------------
+# (class label as printed on the legend image, lower edge in mph, sampled colour)
+WIND_LEGEND = [("5 to 10", 5, "#225ea8"), ("10 to 15", 10, "#2193c1"), ("15 to 20", 15, "#41b6c4"), ("20 to 25", 20, "#7fcdbb"),
+               ("25 to 30", 25, "#b4d79e"), ("30 to 35", 30, "#e0ffa2"), ("35 to 40", 35, "#ffffbb"), ("40 to 45", 40, "#ffe97b"),
+               ("45 to 50", 45, "#ffc400"), ("50 to 60", 50, "#ffaa00"), ("60 to 70", 60, "#ff600a")]
+GUST_LEGEND = [("0-5", None, "#1c4577"), ("6-10", 5, "#225ea8"), ("11-15", 10, "#258db8"), ("16-20", 15, "#41b6c4"), ("21-25", 20, "#7fcdbb"),
+               ("26-30", 25, "#afd09b"), ("31-35", 30, "#dfff9e"), ("36-40", 35, "#f9f9a4"), ("41-45", 40, "#fae473"), ("46-50", 45, "#ffc400"),
+               ("51-60", 50, "#feaa01"), ("61-70", 60, "#ff5900"), ("71-80", 70, "#ff0000"), ("81-100", 80, "#a80000"), ("101-120", 100, "#6e0000"),
+               ("121-140", 120, "#ffbee8"), ("141-150", 140, "#ff73df")]
+
+
+def _class_of(edges, v):
+    k = 0
+    while k < len(edges) and v >= edges[k]:
+        k += 1
+    return k
+
+
+def test_wind_scale_is_the_supplied_wind_legend():
+    edges, colors, _ = explicit_scale(load_config().wind_scale)
+    assert colors[0] == "transparent" and edges[0] == 5                         # the legend starts at 5 mph: calm stays see-through
+    assert colors[1:] == [c for _, _, c in WIND_LEGEND]
+    for _, lo, col in WIND_LEGEND:
+        assert colors[_class_of(edges, lo)] == col and colors[_class_of(edges, lo + 4.9)] == col
+    assert colors[_class_of(edges, 4.9)] == "transparent" and colors[_class_of(edges, 71)] == "#ff600a"   # above the top class: top colour stays
+
+
+def test_gust_scale_is_the_supplied_gust_legend():
+    edges, colors, _ = explicit_scale(load_config().gust_scale)
+    assert colors == [c for _, _, c in GUST_LEGEND] and len(edges) == 16
+    assert colors[_class_of(edges, 0)] == "#1c4577" and colors[_class_of(edges, 4.9)] == "#1c4577"        # 0-5 is drawn (dark navy)
+    for _, lo, col in GUST_LEGEND[1:]:
+        assert colors[_class_of(edges, lo)] == col
+    assert colors[_class_of(edges, 150)] == colors[_class_of(edges, 200)] == "#ff73df"
+    assert colors[_class_of(edges, 49.9)] == "#ffc400" and colors[_class_of(edges, 50)] == "#feaa01"     # the unequal classes: 51-60, 61-70, 71-80, 81-100 ...
+    assert [e for e in edges if e >= 50] == [50, 60, 70, 80, 100, 120, 140]
+
+
+def test_wind_and_gust_scales_are_different_scales():
+    cfg = load_config()
+    assert explicit_scale(cfg.wind_scale)[:2] != explicit_scale(cfg.gust_scale)[:2]
+
+
+def test_wind_categories_keep_the_nws_thresholds_for_the_read_out():
+    _, _, segs = explicit_scale(load_config().wind_scale)
+    bands = [(g["phrase"], g["from_hpa"], g["to_hpa"]) for g in segs]
+    assert bands == [("light to moderate", None, 25), ("Wind Advisory range", 25, 40), ("gale-force / High Wind", 40, 55),
+                     ("storm-force", 55, 75), ("hurricane-force", 75, None)]
+
+
+def test_explicit_scale_rejects_bad_input():
+    ok = NS(edges=[5, 10], colors=["transparent", "#112233", "#AABBCC"])
+    assert explicit_scale(ok)[1] == ["transparent", "#112233", "#aabbcc"]
+    with pytest.raises(ValueError, match="3 classes"):
+        explicit_scale(NS(edges=[5, 10], colors=["#112233", "#445566"]))
+    with pytest.raises(ValueError, match="ascending"):
+        explicit_scale(NS(edges=[10, 5], colors=["#112233", "#445566", "#778899"]))
+    with pytest.raises(ValueError, match="rrggbb"):
+        explicit_scale(NS(edges=[5], colors=["red", "#445566"]))

@@ -233,3 +233,23 @@ def test_field_swath_runs_an_extreme_over_the_hourly_mean_fields():
         assert js[key]["copyIndependent"]                                          # a copy taken mid-way is not changed by later folds
     assert js["low"]["firstWhen"][2] == -1 and js["low"]["midWhen"][2] == 6        # a cell missing at the start is picked up later
     assert np.array(js["low"]["mid"])[0] == 1000 and np.array(js["high"]["mid"])[0] == 1005
+
+
+def test_browser_colour_lookup_gives_the_legend_colours_for_wind_and_gust():
+    """makeLut on the real [wind_scale] / [gust_scale]: every sample speed gets its legend colour (unequal class widths, open top class)."""
+    from gefs_pipeline.palette import explicit_scale
+    cfg = load_config()
+    for name, samples in (("wind_scale", [0, 4.9, 5, 7.5, 12, 24.9, 25, 47, 49.9, 50, 59.9, 60, 69, 120]),
+                          ("gust_scale", [0, 4.9, 5, 9.9, 10, 47, 50, 55, 65, 75, 90, 110, 130, 145, 200])):
+        edges, colors, _ = explicit_scale(getattr(cfg, name))
+        r = subprocess.run(["node", str(ROOT / "tests/js/wind_lut.js")], input=json.dumps({"edges": edges, "colors": colors, "values": samples}),
+                           capture_output=True, text=True, cwd=ROOT)
+        assert r.returncode == 0, r.stderr
+        js = json.loads(r.stdout)
+        want = []
+        for v in samples:
+            k = sum(1 for e in edges if v >= e)
+            want.append(colors[k])
+        assert js["got"] == want, (name, [(v, g, w) for v, g, w in zip(samples, js["got"], want) if g != w])
+        # wind starts with a transparent class (cells below the first edge are skipped); the gust legend's first class is a colour
+        assert (js["calm"] == pytest.approx(5 - 0.06)) if name == "wind_scale" else js["calm"] is None

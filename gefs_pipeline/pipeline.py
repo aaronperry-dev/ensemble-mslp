@@ -34,7 +34,7 @@ from . import __version__
 from .config import ROOT
 from .decode import DecodeError, Grid
 from .fetcher import FetchError, Http, MirrorGroup, NotFound
-from .palette import RAMPS, build_scale, color_at
+from .palette import RAMPS, build_scale, color_at, explicit_scale
 from .tracks import link_tracks
 from . import gridio
 from .products import detect_lows, ensemble_max, ensemble_mean, ensemble_min, write_json
@@ -437,8 +437,10 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
     wind_products, wind_meta = {}, None
     have = {var: any(var in f["avail"].get(k, {}) for f in frames for k in order) for var, _ in WIND_VARS}
     if wind_on and any(have.values()):
-        wedges, wcolors, wsegs = build_scale(cfg.wind_scale)
-        wcolors = ["transparent"] + wcolors[1:]                      # below the first edge (calm): leave the map visible
+        # wind speed and gust each have their own scale (config.toml [wind_scale] / [gust_scale]); the "transparent" class below calm is in the config
+        wedges, wcolors, wsegs = explicit_scale(cfg.wind_scale)
+        gedges, gcolors, _ = explicit_scale(cfg.gust_scale)
+        wscales = {"wind": (wedges, wcolors), "gust": (gedges, gcolors)}
         wpe, wpc = pct_scale(wcfg.prob_ramp)
         for var, pre in WIND_VARS:
             if not have[var]:
@@ -448,7 +450,7 @@ def build(cfg, *, run: datetime, out: Path, cache_dir: Path | None, http: Http, 
                 P = getattr(cfg.products, key)
                 prob = kind == "prob"
                 wind_products[key] = {"title": P.title, "short": P.short, "has_lows": False, "units": "%" if prob else "mph", "var": var,
-                                      "edges": wpe if prob else wedges, "colors": wpc if prob else wcolors}
+                                      "edges": wpe if prob else wscales[var][0], "colors": wpc if prob else wscales[var][1]}
         wind_meta = {"units": "mph", "scale": WIND_SCALE, "speed_levels": [float(x) for x in wcfg.speed_levels],
                      "gust_levels": [float(x) for x in wcfg.gust_levels], "level_names": dict(vars(wcfg.level_names)),
                      "segments": wsegs, "have": have,
