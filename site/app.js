@@ -1272,9 +1272,13 @@
     const gifEls = { from: $('#gifFrom'), to: $('#gifTo'), size: $('#gifSize'), prog: $('#gifProg'), msg: $('#gifMsg'), go: $('#gifGo'), close: $('#gifCancel'), what: $('#gifWhat') };
     const macroTask = () => new Promise((r) => setTimeout(r, 0));     // lets the progress bar repaint (rAF would stall in a background tab)
     const mapPx = () => { const r = map.getContainer().getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height) }; };
+    // Output widths: the screen's real pixels (CSS pixels x device pixel ratio, at most 1600 wide) are the sharpest the map can give,
+    // then 1000 / 750 / 500 / 350.  A width is never larger than the real pixels, and two within 8 % of each other are one choice.
     function gifSizes() {
-      const m = mapPx(), base = Math.min(1, 1000 / m.w);
-      return [1, 0.75, 0.5, 0.35].map((k) => { const sc = base * k; return { sc, w: Math.max(2, Math.round(m.w * sc)), h: Math.max(2, Math.round(m.h * sc)) }; });
+      const m = mapPx(), native = Math.min(1600, Math.round(m.w * Math.max(window.devicePixelRatio || 1, 1)));
+      const widths = [];
+      for (const w of [native, 1000, 750, 500, 350]) if (w <= native && !widths.some((x) => Math.abs(x - w) / x < 0.08)) widths.push(w);
+      return widths.map((w) => { const sc = w / m.w; return { sc, w, h: Math.max(2, Math.round(m.h * sc)) }; });
     }
     const gifSummary = () => `${caveParts(vframes[state.idx]).sys} \u00b7 ${productTitle()}`;
     function openGif() {
@@ -1284,8 +1288,8 @@
       gifEls.from.innerHTML = opt; gifEls.to.innerHTML = opt;
       gifEls.from.value = 0; gifEls.to.value = vframes.length - 1;
       const sizes = gifSizes();
-      gifEls.size.innerHTML = sizes.map((z, i) => `<option value="${i}">${z.w} × ${z.h} px</option>`).join('');
-      gifEls.size.value = Math.max(0, sizes.findIndex((z) => z.w <= 800));
+      gifEls.size.innerHTML = sizes.map((z, i) => `<option value="${i}">${z.w} × ${z.h} px${i === 0 && z.w > 1000 ? ' (sharpest, largest file)' : ''}</option>`).join('');
+      gifEls.size.value = Math.max(0, sizes.findIndex((z) => z.w <= 1000 && z.w * z.h <= 700000));   // sharp but modest: the largest size up to 1000 px wide and 0.7 megapixels (a tall phone map gets ~750 px)
       gifEls.what.textContent = `${gifSummary()} — the map as currently shown (view, layers, theme and opacity), with a title and subtitle on every frame.`;
       gifEls.msg.textContent = ''; gifEls.prog.hidden = true; gifEls.go.disabled = false;
       if (!gifdlg.open) gifdlg.showModal();
@@ -1464,17 +1468,29 @@
           if ((i - a) % 2 === 1) await macroTask();                    // keep the page (progress bar, Cancel) responsive without waiting on a paint
         }
         gifEls.prog.value = b - a + 1;
-        gifEls.msg.textContent = 'Optimising colours and compressing…';
-        await macroTask();
-        const bytes = enc.finish();
+        // Best quality first (exact colours, lossless frame differencing).  Only when that is larger than the chosen limit does the encoder
+        // give up detail, in small steps (a few colours fewer, changes smaller than the tolerance ignored) until the file fits.
+        const limit = +$('#gifMax').value * 1048576;
+        const ladder = [{}, { maxColors: 255, tolerance: 4 }, { maxColors: 192, tolerance: 8 }, { maxColors: 128, tolerance: 12 }, { maxColors: 96, tolerance: 16 }, { maxColors: 64, tolerance: 22 }];
+        let bytes = null, reduced = 0;
+        for (let t = 0; t < ladder.length; t++) {
+          gifEls.msg.textContent = t === 0 ? 'Optimising colours and compressing…' : `Over ${$('#gifMax').selectedOptions[0].textContent} - reducing detail (step ${t}) …`;
+          await macroTask();
+          bytes = enc.finish(ladder[t]); reduced = t;
+          if (!limit || bytes.length <= limit) break;
+        }
+        const stats = enc.stats;
+        enc.dispose();
         const blob = new Blob([bytes], { type: 'image/gif' });
         const nm = gifFileName(a, b);
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a'); link.href = url; link.download = nm; document.body.appendChild(link); link.click(); link.remove();
         setTimeout(() => URL.revokeObjectURL(url), 60000);
         const mb = bytes.length / 1048576;
-        gifEls.msg.textContent = `Done: ${b - a + 1} frames, ${z.w} × ${z.h} px, ${mb >= 1 ? mb.toFixed(1) + ' MB' : Math.round(bytes.length / 1024) + ' kB'} — saved as ${nm}`;
-        window.gifLast = { frames: b - a + 1, width: z.w, height: z.h, bytes: bytes.length, name: nm };
+        const over = limit && bytes.length > limit;
+        gifEls.msg.textContent = `Done: ${b - a + 1} frames, ${z.w} × ${z.h} px, ${mb >= 1 ? mb.toFixed(1) + ' MB' : Math.round(bytes.length / 1024) + ' kB'}` +
+          (reduced ? (over ? ` — still over the ${$('#gifMax').selectedOptions[0].textContent} limit at the lowest detail: choose a smaller size or fewer hours` : ' — detail reduced slightly to fit the limit') : stats.exact ? ' — exact colours' : '') + ` — saved as ${nm}`;
+        window.gifLast = { frames: b - a + 1, width: z.w, height: z.h, bytes: bytes.length, name: nm, colors: stats.colors, exact: stats.exact, reduced, stored: stats.frames };
       } catch (e) {
         gifEls.msg.textContent = e.message === 'cancelled' ? 'Cancelled.' : `Could not create the GIF: ${e.message}`;
       } finally {
